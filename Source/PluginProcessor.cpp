@@ -1,35 +1,65 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include <nts/diagnostics/ProcessMemory.h>
+
+#include <filesystem>
+#include <string_view>
+
 namespace ParameterIds
 {
 constexpr auto input = "input";
-constexpr auto drive = "drive";
-constexpr auto bass = "bass";
-constexpr auto mid = "mid";
-constexpr auto treble = "treble";
-constexpr auto presence = "presence";
-constexpr auto mix = "mix";
 constexpr auto output = "output";
 constexpr auto bypass = "bypass";
 } // namespace ParameterIds
+
+namespace
+{
+std::filesystem::path logPath()
+{
+    return std::filesystem::path(juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                                     .getChildFile("TubeForge")
+                                     .getChildFile("logs")
+                                     .getChildFile("tubeforge.jsonl")
+                                     .getFullPathName()
+                                     .toStdString());
+}
+} // namespace
 
 TubeForgeAudioProcessor::TubeForgeAudioProcessor()
     : AudioProcessor(BusesProperties()
                          .withInput("Input", juce::AudioChannelSet::stereo(), true)
                          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-      parameters(*this, nullptr, "TubeForgeState", createParameterLayout())
+      parameterState(*this, nullptr, "TubeForgeParameters", createParameterLayout()),
+      engine(runtimeParameters, meters),
+      logger(logPath(), &diagnostics)
 {
+    logger.log({ std::chrono::system_clock::now(), nts::diagnostics::LogSeverity::info,
+                 "runtime", "processor-created", "TubeForge processor created", modeName().toStdString() });
 }
 
 void TubeForgeAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-    ampEngine.prepare(sampleRate, samplesPerBlock, getTotalNumOutputChannels());
+    currentSampleRate = sampleRate;
+    currentBlockSize = samplesPerBlock;
+    absoluteSamplePosition = 0;
+    engine.prepare(sampleRate,
+                   static_cast<std::size_t>(samplesPerBlock),
+                   static_cast<std::size_t>(getTotalNumInputChannels()),
+                   static_cast<std::size_t>(getTotalNumOutputChannels()));
+    diagnostics.prepare(sampleRate, static_cast<std::uint32_t>(samplesPerBlock));
+    latencyBudget.hostSamples = samplesPerBlock;
+    diagnostics.setLatencyBudget(latencyBudget);
+    updateReportedLatency();
+
+    logger.log({ std::chrono::system_clock::now(), nts::diagnostics::LogSeverity::info,
+                 "audio", "prepared", "Audio engine prepared",
+                 "sampleRate=" + std::to_string(sampleRate) + ",blockSize=" + std::to_string(samplesPerBlock) });
 }
 
 void TubeForgeAudioProcessor::releaseResources()
 {
-    ampEngine.reset();
+    engine.reset();
 }
 
 bool TubeForgeAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -45,24 +75,35 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
 {
     juce::ignoreUnused(midi);
     juce::ScopedNoDenormals noDenormals;
+    const auto startedAt = diagnostics.beginCallback();
 
-    for (auto channel = getTotalNumInputChannels(); channel < getTotalNumOutputChannels(); ++channel)
-        buffer.clear(channel, 0, buffer.getNumSamples());
+    runtimeParameters.inputGainDb.store(valueOf(parameterState, ParameterIds::input), std::memory_order_relaxed);
+    runtimeParameters.outputGainDb.store(valueOf(parameterState, ParameterIds::output), std::memory_order_relaxed);
+    runtimeParameters.bypass.store(valueOf(parameterState, ParameterIds::bypass) >= 0.5f, std::memory_order_relaxed);
 
-    if (valueOf(parameters, ParameterIds::bypass) >= 0.5f)
-        return;
+    constexpr auto maximumChannels = nts::audio::MeterState::maximumChannels;
+    std::array<const float*, maximumChannels> inputs {};
+    std::array<float*, maximumChannels> outputs {};
+    const auto inputCount = std::min(getTotalNumInputChannels(), static_cast<int>(maximumChannels));
+    const auto outputCount = std::min(getTotalNumOutputChannels(), static_cast<int>(maximumChannels));
 
-    tubeforge::dsp::AmpParameters values;
-    values.inputDb = valueOf(parameters, ParameterIds::input);
-    values.driveDb = valueOf(parameters, ParameterIds::drive);
-    values.bassDb = valueOf(parameters, ParameterIds::bass);
-    values.midDb = valueOf(parameters, ParameterIds::mid);
-    values.trebleDb = valueOf(parameters, ParameterIds::treble);
-    values.presenceDb = valueOf(parameters, ParameterIds::presence);
-    values.mix = valueOf(parameters, ParameterIds::mix) * 0.01f;
-    values.outputDb = valueOf(parameters, ParameterIds::output);
-    ampEngine.setParameters(values);
-    ampEngine.process(buffer);
+    for (int channel = 0; channel < inputCount; ++channel)
+        inputs[static_cast<std::size_t>(channel)] = buffer.getReadPointer(channel);
+    for (int channel = 0; channel < outputCount; ++channel)
+        outputs[static_cast<std::size_t>(channel)] = buffer.getWritePointer(channel);
+
+    nts::audio::AudioProcessContext context {
+        std::span<const float* const>(inputs.data(), static_cast<std::size_t>(inputCount)),
+        std::span<float* const>(outputs.data(), static_cast<std::size_t>(outputCount)),
+        static_cast<std::size_t>(buffer.getNumSamples()),
+        currentSampleRate,
+        absoluteSamplePosition
+    };
+
+    diagnostics.verifySampleRate(context.sampleRate, absoluteSamplePosition);
+    engine.process(context);
+    diagnostics.endCallback(startedAt, static_cast<std::uint32_t>(buffer.getNumSamples()), absoluteSamplePosition);
+    absoluteSamplePosition += static_cast<std::uint64_t>(buffer.getNumSamples());
 }
 
 juce::AudioProcessorEditor* TubeForgeAudioProcessor::createEditor()
@@ -87,15 +128,75 @@ void TubeForgeAudioProcessor::changeProgramName(int index, const juce::String& n
 
 void TubeForgeAudioProcessor::getStateInformation(juce::MemoryBlock& destinationData)
 {
-    if (auto xml = parameters.copyState().createXml())
-        copyXmlToBinary(*xml, destinationData);
+    const auto json = nts::state::serialize(makeProjectState(), false);
+    destinationData.replaceAll(json.data(), json.size());
 }
 
 void TubeForgeAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
-    if (auto xml = getXmlFromBinary(data, sizeInBytes))
-        if (xml->hasTagName(parameters.state.getType()))
-            parameters.replaceState(juce::ValueTree::fromXml(*xml));
+    if (data == nullptr || sizeInBytes <= 0)
+        return;
+
+    const auto parsed = nts::state::deserialize(
+        std::string_view(static_cast<const char*>(data), static_cast<std::size_t>(sizeInBytes)));
+    if (! parsed || ! applyProjectState(*parsed.state))
+    {
+        logger.log({ std::chrono::system_clock::now(), nts::diagnostics::LogSeverity::warning,
+                     "state", "state-rejected", "Plugin state was rejected",
+                     parsed ? "validation or parameter activation failed" : parsed.error });
+        return;
+    }
+}
+
+juce::Result TubeForgeAudioProcessor::saveProject(const juce::File& file) const
+{
+    if (file.replaceWithText(nts::state::serialize(makeProjectState(), true)))
+        return juce::Result::ok();
+    return juce::Result::fail("Unable to write the project file");
+}
+
+juce::Result TubeForgeAudioProcessor::loadProject(const juce::File& file)
+{
+    if (! file.existsAsFile())
+        return juce::Result::fail("Project file does not exist");
+
+    const auto parsed = nts::state::deserialize(file.loadFileAsString().toStdString());
+    if (! parsed)
+        return juce::Result::fail(parsed.error);
+    if (! applyProjectState(*parsed.state))
+        return juce::Result::fail("Project parameters could not be applied");
+    return juce::Result::ok();
+}
+
+nts::diagnostics::DiagnosticsSnapshot TubeForgeAudioProcessor::diagnosticsSnapshot() const noexcept
+{
+    return diagnostics.snapshot();
+}
+
+juce::String TubeForgeAudioProcessor::modeName() const
+{
+    if (standaloneApplicationMode)
+        return "Standalone";
+
+    switch (wrapperType)
+    {
+        case wrapperType_Standalone: return "Standalone";
+        case wrapperType_VST3: return "VST3";
+        default: return "Host plugin";
+    }
+}
+
+juce::String TubeForgeAudioProcessor::deviceStatusText() const
+{
+    if (standaloneApplicationMode || wrapperType == wrapperType_Standalone)
+        return "Device managed by the embedded Audio settings panel";
+    return "Audio device managed by the host";
+}
+
+void TubeForgeAudioProcessor::refreshNonRealtimeDiagnostics() noexcept
+{
+    const auto memory = nts::diagnostics::sampleProcessMemory();
+    diagnostics.setProcessMemory(memory.workingSetBytes, memory.privateBytes);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout TubeForgeAudioProcessor::createParameterLayout()
@@ -106,23 +207,65 @@ juce::AudioProcessorValueTreeState::ParameterLayout TubeForgeAudioProcessor::cre
     using FloatAttributes = juce::AudioParameterFloatAttributes;
 
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
-    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::input, 1 }, "Input", Range { -24.0f, 24.0f, 0.1f }, 0.0f, FloatAttributes {}.withLabel("dB")));
-    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::drive, 1 }, "Drive", Range { 0.0f, 36.0f, 0.1f }, 12.0f, FloatAttributes {}.withLabel("dB")));
-    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::bass, 1 }, "Bass", Range { -12.0f, 12.0f, 0.1f }, 0.0f, FloatAttributes {}.withLabel("dB")));
-    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::mid, 1 }, "Mid", Range { -12.0f, 12.0f, 0.1f }, 0.0f, FloatAttributes {}.withLabel("dB")));
-    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::treble, 1 }, "Treble", Range { -12.0f, 12.0f, 0.1f }, 0.0f, FloatAttributes {}.withLabel("dB")));
-    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::presence, 1 }, "Presence", Range { -12.0f, 12.0f, 0.1f }, 0.0f, FloatAttributes {}.withLabel("dB")));
-    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::mix, 1 }, "Mix", Range { 0.0f, 100.0f, 0.1f }, 100.0f, FloatAttributes {}.withLabel("%")));
-    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::output, 1 }, "Output", Range { -30.0f, 12.0f, 0.1f }, -6.0f, FloatAttributes {}.withLabel("dB")));
+    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::input, 1 }, "Input",
+                                       Range { -60.0f, 24.0f, 0.1f }, 0.0f,
+                                       FloatAttributes {}.withLabel("dB")));
+    layout.add(std::make_unique<Float>(juce::ParameterID { ParameterIds::output, 1 }, "Output",
+                                       Range { -60.0f, 24.0f, 0.1f }, 0.0f,
+                                       FloatAttributes {}.withLabel("dB")));
     layout.add(std::make_unique<Bool>(juce::ParameterID { ParameterIds::bypass, 1 }, "Bypass", false));
     return layout;
 }
 
-float TubeForgeAudioProcessor::valueOf(const juce::AudioProcessorValueTreeState& state, const char* parameterId) noexcept
+float TubeForgeAudioProcessor::valueOf(const juce::AudioProcessorValueTreeState& state,
+                                       const char* parameterId) noexcept
 {
     if (const auto* value = state.getRawParameterValue(parameterId))
-        return value->load();
+        return value->load(std::memory_order_relaxed);
     return 0.0f;
+}
+
+void TubeForgeAudioProcessor::setParameterValue(juce::AudioProcessorValueTreeState& state,
+                                                const char* parameterId,
+                                                float plainValue)
+{
+    if (auto* parameter = state.getParameter(parameterId))
+    {
+        parameter->beginChangeGesture();
+        parameter->setValueNotifyingHost(parameter->convertTo0to1(plainValue));
+        parameter->endChangeGesture();
+    }
+}
+
+nts::state::ProjectState TubeForgeAudioProcessor::makeProjectState() const
+{
+    nts::state::ProjectState state;
+    state.engine.inputGainDb = valueOf(parameterState, ParameterIds::input);
+    state.engine.outputGainDb = valueOf(parameterState, ParameterIds::output);
+    state.engine.bypass = valueOf(parameterState, ParameterIds::bypass) >= 0.5f;
+    state.device.sampleRate = currentSampleRate;
+    state.device.bufferSize = currentBlockSize;
+    state.graph.latencySamples = latencyBudget.processingSamples();
+    return state;
+}
+
+bool TubeForgeAudioProcessor::applyProjectState(const nts::state::ProjectState& state)
+{
+    std::string validationError;
+    if (! nts::state::validate(state, validationError))
+        return false;
+
+    setParameterValue(parameterState, ParameterIds::input, state.engine.inputGainDb);
+    setParameterValue(parameterState, ParameterIds::output, state.engine.outputGainDb);
+    setParameterValue(parameterState, ParameterIds::bypass, state.engine.bypass ? 1.0f : 0.0f);
+    return true;
+}
+
+void TubeForgeAudioProcessor::updateReportedLatency()
+{
+    const auto processingLatency = latencyBudget.processingSamples();
+    if (getLatencySamples() != processingLatency)
+        setLatencySamples(processingLatency);
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()

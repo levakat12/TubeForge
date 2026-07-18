@@ -1,0 +1,51 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 4 * * 1"
+
+jobs:
+  windows-vst3:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build VST3, standalone, and tests
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Configure ASIO compile validation
+        run: cmake -S . -B build-asio -G "Visual Studio 17 2022" -A x64 -DTUBEFORGE_ENABLE_ASIO=ON -DFETCHCONTENT_SOURCE_DIR_JUCE="${{ github.workspace }}/build/_deps/juce-src"
+      - name: Compile ASIO-enabled standalone and probe (not packaged)
+        run: cmake --build build-asio --config Release --target nts_standalone nts_asio_tests --parallel
+      - name: Test ASIO registration
+        run: ctest --test-dir build-asio -C Release -R nts_asio_tests --output-on-failure
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: TubeForge-Windows-VST3
+          path: build/TubeForge_artefacts/Release/VST3/TubeForge.vst3
+      - name: Upload standalone
+        uses: actions/upload-artifact@v4
+        with:
+          name: TubeForge-Windows-Standalone
+          path: build/nts_standalone_app_artefacts/Release/TubeForge.exe
+
+  windows-hour-soak:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure soak test
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DTUBEFORGE_ENABLE_HOUR_SOAK_TEST=ON
+      - name: Build soak test
+        run: cmake --build build --config Release --target nts_soak_tests --parallel
+      - name: Run one-hour wall-clock soak
+        run: ctest --test-dir build -C Release -L soak --output-on-failure

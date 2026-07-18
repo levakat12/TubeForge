@@ -2,7 +2,7 @@
 
 TubeForge is the Windows-first implementation of the NeuralTone Studio architecture: a low-latency standalone application and VST3 plug-in for guitar and bass tone processing.
 
-The active `0.2.0` codebase implements the Phase 1 core infrastructure. It intentionally processes only input gain, output gain, bypass, and metering; amplifier modelling and ML inference begin in later phases.
+The active `0.3.0` codebase implements the Phase 1 runtime infrastructure and Phase 2 reusable DSP foundation. The current product shell still exposes only input gain, output gain, bypass, and metering; the DSP library is the tested baseline for amplifier modelling, cabinet processing, tone shaping, and later ML inference.
 
 ## Phase 1 foundation
 
@@ -18,6 +18,20 @@ The active `0.2.0` codebase implements the Phase 1 core infrastructure. It inten
 - Separate libraries and test targets with a Windows GitHub Actions pipeline.
 
 See [Phase 1 coverage](docs/phase-01-coverage.md) for the requirement-by-requirement status.
+
+## Phase 2 DSP foundation
+
+- Linear/dB gain conversion, linear and logarithmic smoothing, and ramped gain.
+- First-order, biquad, state-variable, and Linkwitz-Riley filters with guarded coefficients and automation interpolation.
+- Tanh, arctangent, hard, soft, asymmetric, diode, biasable, and envelope-dependent waveshapers.
+- 1x/2x/4x/8x oversampling with polyphase symmetric anti-alias FIR filters and exact latency reporting.
+- Noise gate, feed-forward compressor, and lookahead peak limiter with internally smoothed automation.
+- Direct and uniform partitioned convolution with inactive preparation and atomic response crossfades.
+- Asynchronous cabinet WAV decoding, channel conversion, resampling, DC removal, trimming, and normalization.
+- FFT, STFT reconstruction, spectrum, waveform, peak, RMS, BS.1770 loudness, crest, clipping, and gain-reduction metering.
+- Generic mode crossfades, explicit SSE2 kernels, fixed DI fixtures, hashes, numeric regression metrics, and a complete repeatable performance matrix.
+
+See [Phase 2 coverage](docs/phase-02-coverage.md), [DSP architecture](docs/phase-02-architecture.md), and [benchmark results](docs/phase-02-benchmarks.csv).
 
 ## Build on Windows
 
@@ -53,6 +67,8 @@ The standalone window embeds JUCE's device selector in its **Audio settings** ta
 | Target | Responsibility |
 |---|---|
 | `nts_audio_core` | JUCE-independent processing contract and neutral engine |
+| `nts_dsp` | Reusable filters, dynamics, nonlinear, oversampling, convolution, analysis, metering, and regression DSP |
+| `nts_ir` | Background cabinet audio decoding and offline IR preparation |
 | `nts_state` | Project schema, migration, validation, paths, settings |
 | `nts_diagnostics` | Lock-free events, timing, latency, logging, workers |
 | `nts_standalone` | Custom standalone host with embedded device selector |
@@ -64,6 +80,15 @@ The standalone window embeds JUCE's device selector in its **Audio settings** ta
 | `nts_wrapper_tests` | Processor state and repeated editor lifecycle tests |
 | `nts_vst3_host_tests` | Actual VST3 scan, instantiation, processing, and editor tests |
 | `nts_soak_tests` | True wall-clock continuous-processing soak test |
+| `nts_dsp_tests` | Phase 2 response, stability, aliasing, convolution, analysis, regression, and allocation tests |
+| `nts_ir_tests` | Real asynchronous cabinet WAV decode/preparation test |
+| `nts_dsp_benchmarks` | Required sample-rate/block-size mono/stereo performance matrix |
+
+Run the repeatable DSP benchmark matrix with:
+
+```powershell
+.\build\nts_dsp_benchmarks_artefacts\Release\nts_dsp_benchmarks.exe
+```
 
 ## Optional long stress test
 

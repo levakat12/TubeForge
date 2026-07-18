@@ -1,4 +1,5 @@
 /build/
+/build-*/
 /cmake-build-*/
 /.vs/
 /.vscode/
@@ -15,3 +16,5 @@
 *.exp
 *.dll
 *.log
+*.tforge
+Testing/

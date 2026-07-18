@@ -153,7 +153,7 @@ class TubeForgeApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "TubeForge"; }
-    const juce::String getApplicationVersion() override { return "0.2.0"; }
+    const juce::String getApplicationVersion() override { return "0.3.0"; }
     bool moreThanOneInstanceAllowed() override { return true; }
 
     void initialise(const juce::String&) override

@@ -9,7 +9,7 @@
 namespace nts::state
 {
 inline constexpr int currentSchemaVersion = 1;
-inline constexpr std::string_view currentApplicationVersion = "0.2.0";
+inline constexpr std::string_view currentApplicationVersion = "0.3.0";
 
 struct EngineState
 {

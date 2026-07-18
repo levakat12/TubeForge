@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(TubeForge VERSION 0.2.0 LANGUAGES CXX)
+project(TubeForge VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,19 @@ add_library(nts_audio_core STATIC
     engine/audio-core/src/CoreEngine.cpp
 )
 target_include_directories(nts_audio_core PUBLIC engine/audio-core/include)
+
+add_library(nts_dsp STATIC
+    engine/dsp/src/Analysis.cpp
+    engine/dsp/src/BassSplit.cpp
+    engine/dsp/src/Convolution.cpp
+    engine/dsp/src/Dynamics.cpp
+    engine/dsp/src/Filters.cpp
+    engine/dsp/src/Metering.cpp
+    engine/dsp/src/Oversampling.cpp
+    engine/dsp/src/Regression.cpp
+    engine/dsp/src/Simd.cpp
+)
+target_include_directories(nts_dsp PUBLIC engine/dsp/include)
 
 add_library(nts_diagnostics STATIC
     engine/diagnostics/src/DiagnosticsCollector.cpp
@@ -41,7 +54,13 @@ add_library(nts_state STATIC
 target_include_directories(nts_state PUBLIC engine/state/include)
 target_link_libraries(nts_state PUBLIC juce::juce_core)
 
-foreach(target nts_audio_core nts_diagnostics nts_state)
+add_library(nts_ir STATIC
+    engine/ir/src/CabinetIrLoader.cpp
+)
+target_include_directories(nts_ir PUBLIC engine/ir/include)
+target_link_libraries(nts_ir PUBLIC nts_dsp nts_diagnostics juce::juce_audio_formats)
+
+foreach(target nts_audio_core nts_dsp nts_diagnostics nts_state nts_ir)
     target_link_libraries(${target} PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags
@@ -156,7 +175,7 @@ tubeforge_configure_asio(nts_standalone_app)
 add_custom_target(nts_vst3 DEPENDS TubeForge_VST3)
 add_custom_target(nts_standalone DEPENDS nts_standalone_app)
 
-option(TUBEFORGE_BUILD_TESTS "Build TubeForge Phase 1 tests" ON)
+option(TUBEFORGE_BUILD_TESTS "Build TubeForge test and benchmark targets" ON)
 option(TUBEFORGE_ENABLE_HOUR_SOAK_TEST "Register the one-hour wall-clock soak test with CTest" OFF)
 
 if(TUBEFORGE_BUILD_TESTS)
@@ -242,12 +261,33 @@ if(TUBEFORGE_BUILD_TESTS)
     target_include_directories(nts_soak_tests PRIVATE Tests)
     target_link_libraries(nts_soak_tests PRIVATE nts_audio_core)
 
+    juce_add_console_app(nts_dsp_tests PRODUCT_NAME "TubeForge DSP Tests")
+    target_sources(nts_dsp_tests PRIVATE Tests/DspTests.cpp)
+    target_include_directories(nts_dsp_tests PRIVATE Tests)
+    if(MSVC)
+        target_compile_definitions(nts_dsp_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    target_link_libraries(nts_dsp_tests PRIVATE nts_dsp)
+
+    juce_add_console_app(nts_ir_tests PRODUCT_NAME "TubeForge IR Tests")
+    target_sources(nts_ir_tests PRIVATE Tests/IrTests.cpp)
+    target_include_directories(nts_ir_tests PRIVATE Tests)
+    target_link_libraries(nts_ir_tests PRIVATE nts_ir juce::juce_audio_formats)
+
+    juce_add_console_app(nts_dsp_benchmarks PRODUCT_NAME "TubeForge DSP Benchmarks")
+    target_sources(nts_dsp_benchmarks PRIVATE Tests/DspBenchmarks.cpp)
+    target_include_directories(nts_dsp_benchmarks PRIVATE Tests)
+    target_link_libraries(nts_dsp_benchmarks PRIVATE nts_dsp)
+
     add_test(NAME nts_unit_tests COMMAND nts_unit_tests)
     add_test(NAME nts_integration_tests COMMAND nts_integration_tests)
     add_test(NAME nts_device_tests COMMAND nts_device_tests)
     add_test(NAME nts_wrapper_tests COMMAND nts_wrapper_tests)
     add_test(NAME nts_vst3_host_tests COMMAND nts_vst3_host_tests
              "${CMAKE_BINARY_DIR}/TubeForge_artefacts/$<CONFIG>/VST3/TubeForge.vst3")
+    add_test(NAME nts_dsp_tests COMMAND nts_dsp_tests)
+    add_test(NAME nts_ir_tests COMMAND nts_ir_tests)
+    add_test(NAME nts_dsp_benchmark_acceptance COMMAND nts_dsp_benchmarks)
     if(TUBEFORGE_ENABLE_HOUR_SOAK_TEST)
         add_test(NAME nts_hour_soak COMMAND nts_soak_tests 3600)
         set_tests_properties(nts_hour_soak PROPERTIES LABELS soak TIMEOUT 3900)

@@ -1,0 +1,17 @@
+/build/
+/cmake-build-*/
+/.vs/
+/.vscode/
+*.user
+*.suo
+*.VC.db
+*.opendb
+*.vst3
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.dll
+*.log

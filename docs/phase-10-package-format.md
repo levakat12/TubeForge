@@ -20,7 +20,17 @@ example.ntone/
 versions, creation time, tags, quality, supported sample rates, model operator allowlist, package license,
 `sourceAudioIncluded: false`, and an asset table. Every asset entry declares its relative path, role, exact
 byte count, SHA-256, license class, and redistribution permission. Optional signatures use
-`rsa-sha256-raw-v1` and a trusted signer ID over canonical manifest JSON without the signature fields.
+`rsa-pkcs1-sha256-v1` and a trusted signer ID over canonical manifest JSON without the signature fields.
+
+Signatures are RSASSA-PKCS1-v1_5 over SHA-256 (RFC 8017) with a minimum 2048-bit modulus, encoded as a
+fixed-width lowercase hex value exactly as wide as the modulus. Verification rebuilds the whole expected
+encoded message and compares it in full rather than parsing the recovered value. The signature covers the
+algorithm identifier, so a manifest cannot be downgraded to a weaker scheme in transit.
+
+This replaces `rsa-sha256-raw-v1`, which applied the RSA primitive to a bare SHA-256 digest with no padding.
+That construction was forgeable: JUCE key generation prefers a public exponent of 3, and an unpadded 256-bit
+digest inside a 2048-bit modulus can be recovered by integer cube root without the private key. Packages and
+update manifests carrying the old identifier are rejected.
 
 ## Import security
 

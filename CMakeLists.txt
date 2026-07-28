@@ -109,6 +109,7 @@ target_link_libraries(nts_assistant PUBLIC nts_amp nts_tone_analysis nts_diagnos
 add_library(nts_ecosystem STATIC
     engine/ecosystem/src/TonePackage.cpp
     engine/ecosystem/src/ReleaseServices.cpp
+    engine/ecosystem/src/PackageSignature.cpp
 )
 target_include_directories(nts_ecosystem PUBLIC engine/ecosystem/include)
 target_link_libraries(nts_ecosystem PUBLIC nts_amp nts_ml_runtime juce::juce_cryptography)

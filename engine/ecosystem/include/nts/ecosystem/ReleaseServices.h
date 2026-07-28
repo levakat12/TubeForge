@@ -1,5 +1,6 @@
 #pragma once
 
+#include <nts/ecosystem/PackageSignature.h>
 #include <nts/ecosystem/TonePackage.h>
 
 #include <map>
@@ -20,6 +21,7 @@ struct UpdateManifest
     std::uint64_t sizeBytes {};
     std::string minimumOs;
     std::string signerId;
+    std::string signatureAlgorithm { signatureAlgorithmId };
     std::string signature;
 };
 

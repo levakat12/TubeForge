@@ -28,6 +28,8 @@ juce::var updateVar(const UpdateManifest& manifest, bool includeSignature)
     root->setProperty("sizeBytes", static_cast<juce::int64>(manifest.sizeBytes));
     root->setProperty("minimumOs", juce::String(manifest.minimumOs));
     root->setProperty("signerId", juce::String(manifest.signerId));
+    // Covered by the signature so the algorithm cannot be downgraded in transit.
+    root->setProperty("signatureAlgorithm", juce::String(manifest.signatureAlgorithm));
     if (includeSignature) root->setProperty("signature", juce::String(manifest.signature));
     return juce::var(root);
 }
@@ -49,13 +51,10 @@ bool validHash(std::string_view value)
 
 bool verifyUpdateSignature(const UpdateManifest& manifest, std::string_view encodedPublicKey)
 {
-    juce::RSAKey key { juce::String::fromUTF8(encodedPublicKey.data(), static_cast<int>(encodedPublicKey.size())) };
-    juce::BigInteger signedValue; signedValue.parseString(juce::String(manifest.signature), 16);
-    if (! key.isValid() || signedValue.isZero() || ! key.applyToValue(signedValue)) return false;
-    const auto canonical = updateManifestJson(manifest, false, false);
-    juce::BigInteger expected;
-    expected.parseString(juce::SHA256(canonical.data(), canonical.size()).toHexString(), 16);
-    return signedValue == expected;
+    if (manifest.signatureAlgorithm != signatureAlgorithmId || manifest.signature.empty()) return false;
+    std::string error;
+    return verifyCanonicalText(updateManifestJson(manifest, false, false), manifest.signature,
+                               encodedPublicKey, error);
 }
 
 const char* telemetryName(TelemetryEvent event) noexcept
@@ -89,7 +88,10 @@ std::optional<UpdateManifest> parseUpdateManifest(std::string_view json, std::st
     const auto size = static_cast<juce::int64>(object->getProperty("sizeBytes"));
     result.sizeBytes = size > 0 ? static_cast<std::uint64_t>(size) : 0;
     result.minimumOs = property(*object, "minimumOs"); result.signerId = property(*object, "signerId");
+    result.signatureAlgorithm = property(*object, "signatureAlgorithm");
     result.signature = property(*object, "signature");
+    if (result.signatureAlgorithm != signatureAlgorithmId)
+    { error = "Update manifest uses an unsupported signature algorithm"; return std::nullopt; }
     if (result.schemaVersion != 1 || ! semver(result.version) || ! validHash(result.sha256)
         || result.sizeBytes == 0 || result.sizeBytes > 1024ULL * 1024ULL * 1024ULL
         || ! juce::URL(juce::String(result.downloadUrl)).isWellFormed()

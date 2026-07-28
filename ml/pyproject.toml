@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nts-ml"
+version = "0.1.0"
+description = "Reproducible paired-audio dataset, training, evaluation, and export tools for TubeForge"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26"]
+
+[project.scripts]
+nts-validate-dataset = "nts_ml.cli:validate_dataset"
+nts-tiny-train = "nts_ml.cli:tiny_train"
+nts-evaluate = "nts_ml.cli:evaluate_model"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nts_ml*"]
+
+[tool.setuptools.package-data]
+"nts_ml.evaluation" = ["*.html"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

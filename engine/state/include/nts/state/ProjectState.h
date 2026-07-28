@@ -8,14 +8,15 @@
 
 namespace nts::state
 {
-inline constexpr int currentSchemaVersion = 1;
-inline constexpr std::string_view currentApplicationVersion = "0.3.0";
+inline constexpr int currentSchemaVersion = 2;
+inline constexpr std::string_view currentApplicationVersion = "0.10.0";
 
 struct EngineState
 {
     float inputGainDb {};
     float outputGainDb {};
     bool bypass {};
+    std::vector<float> ampControls;
 
     bool operator==(const EngineState&) const = default;
 };
@@ -37,6 +38,7 @@ struct GraphState
 {
     int latencySamples {};
     bool enabled { true };
+    std::string physicalCircuitJson;
 
     bool operator==(const GraphState&) const = default;
 };

@@ -139,7 +139,8 @@ void testStateMigrationAndValidation(TestHarness& tests)
     tests.expect(static_cast<bool>(migrated), "legacy state migrates to the current schema");
     if (migrated)
     {
-        tests.expectEqual(migrated.state->schemaVersion, 1, "migration writes schema version 1");
+        tests.expectEqual(migrated.state->schemaVersion, nts::state::currentSchemaVersion,
+                          "migration writes the current schema version");
         tests.expectNear(migrated.state->engine.inputGainDb, 3.5, 1.0e-6, "migration preserves input gain");
         tests.expect(migrated.state->engine.bypass, "migration preserves bypass");
     }
@@ -157,6 +158,7 @@ void testStateRoundTrip(TestHarness& tests)
     original.engine = { 4.5f, -3.0f, true };
     original.device = { "ASIO", "Input", "Output", 96000.0, 32, { 0 }, { 0, 1 } };
     original.graph.latencySamples = 48;
+    original.graph.physicalCircuitJson = R"({"schemaVersion":1,"id":"test-circuit"})";
     original.ui = { 900, 640, false };
     original.assets.relativePaths = { "irs/cab.wav", "models/amp.ntm" };
 

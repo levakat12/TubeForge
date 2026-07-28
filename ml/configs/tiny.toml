@@ -1,0 +1,26 @@
+[model]
+type = "tiny_tanh_rnn"
+hidden_size = 8
+layers = 1
+
+[data]
+sample_rate = 48000
+chunk_samples = 4096
+history_samples = 2048
+
+[training]
+batch_size = 4
+optimizer = "adamw"
+learning_rate = 0.0003
+weight_decay = 0.0001
+epochs = 10
+seed = 417
+
+[loss]
+time_l1 = 1.0
+time_l2 = 0.0
+pre_emphasis = 0.25
+multi_resolution_stft = 0.5
+spectral_convergence = 0.1
+dc_penalty = 0.05
+loudness_difference = 0.02

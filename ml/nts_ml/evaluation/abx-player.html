@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TubeForge blinded ABX</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #111; color: #eee; }
+    body { max-width: 780px; margin: 3rem auto; padding: 0 1.5rem; }
+    .panel { background: #1c1c1c; border: 1px solid #444; border-radius: 14px; padding: 1.5rem; }
+    .transport, .answer { display: flex; gap: .7rem; flex-wrap: wrap; margin: 1rem 0; }
+    button, input, select, textarea { font: inherit; color: inherit; background: #292929; border: 1px solid #666;
+      border-radius: 8px; padding: .65rem .9rem; }
+    button { min-width: 5rem; cursor: pointer; } button.active { background: #b05b13; border-color: #f2a257; }
+    label { display: grid; gap: .3rem; margin: .7rem 0; } input, textarea { width: 100%; box-sizing: border-box; }
+    .scores { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0 .8rem; }
+    #status { color: #f2a257; min-height: 1.5rem; } .muted { color: #aaa; }
+  </style>
+</head>
+<body>
+<main class="panel">
+  <h1>TubeForge blinded ABX</h1>
+  <p id="progress" class="muted"></p><p id="status">Loading manifest…</p>
+  <label>Participant ID <input id="participant" autocomplete="off" required></label>
+  <div class="transport">
+    <button id="play">Play / restart</button><button data-monitor="A">Monitor A</button>
+    <button data-monitor="B">Monitor B</button><button data-monitor="X">Monitor X</button>
+    <button id="stop">Stop</button>
+  </div>
+  <div class="answer"><span>X is:</span><button data-answer="A">A</button><button data-answer="B">B</button></div>
+  <div id="scores" class="scores"></div>
+  <label>Confidence (1–7) <input id="confidence" type="number" min="1" max="7"></label>
+  <label>Comments <textarea id="comments" rows="3"></textarea></label>
+  <div class="transport"><button id="next">Save and next</button><button id="export">Export CSV</button></div>
+</main>
+<script>
+let manifest, index = 0, context, sources = [], gains = {}, selectedAnswer = "", responses = [];
+const status = document.querySelector("#status");
+const csvFields = ["participantId", "trialId", "selection", "confidence", "pickResponse",
+  "lowEndStability", "chordSeparation", "sustain", "noise", "harshness", "overallPreference", "comments"];
+const title = value => value.replace(/([A-Z])/g, " $1").replace(/^./, c => c.toUpperCase());
+fetch("trials.json").then(r => { if (!r.ok) throw Error(r.statusText); return r.json(); }).then(data => {
+  manifest = data;
+  document.querySelector("#scores").innerHTML = manifest.scoreFields.map(field =>
+    `<label>${title(field)} (1–7)<input data-score="${field}" type="number" min="1" max="7"></label>`).join("");
+  showTrial(); status.textContent = "Ready. Enter a participant ID, then press Play.";
+}).catch(error => status.textContent = `Could not load trials.json: ${error}. Serve this folder over HTTP.`);
+function trial() { return manifest.trials[index]; }
+function showTrial() {
+  document.querySelector("#progress").textContent = `Trial ${index + 1} of ${manifest.trials.length}`;
+  selectedAnswer = "";
+  document.querySelectorAll("[data-answer]").forEach(button => button.classList.remove("active"));
+  document.querySelectorAll("[data-score], #confidence, #comments").forEach(input => input.value = "");
+}
+async function stopAudio() {
+  sources.forEach(source => { try { source.stop(); } catch (_) {} }); sources = []; gains = {};
+  document.querySelectorAll("[data-monitor]").forEach(button => button.classList.remove("active"));
+}
+async function play() {
+  await stopAudio(); context ||= new AudioContext(); await context.resume(); status.textContent = "Loading trial audio…";
+  const buffers = {};
+  for (const name of ["A", "B", "X"]) {
+    const response = await fetch(trial().audio[name]);
+    buffers[name] = await context.decodeAudioData(await response.arrayBuffer());
+  }
+  const start = context.currentTime + .05;
+  for (const name of ["A", "B", "X"]) {
+    const source = context.createBufferSource(), gain = context.createGain();
+    source.buffer = buffers[name]; source.loop = true; gain.gain.value = name === "A" ? 1 : 0;
+    source.connect(gain).connect(context.destination); source.start(start); sources.push(source); gains[name] = gain;
+  }
+  monitor("A"); status.textContent = "Playing synchronized A/B/X buffers.";
+}
+function monitor(name) {
+  if (!context || !gains[name]) return;
+  const now = context.currentTime, end = now + .01;
+  for (const [key, gain] of Object.entries(gains)) {
+    gain.gain.cancelScheduledValues(now); gain.gain.setValueAtTime(gain.gain.value, now);
+    gain.gain.linearRampToValueAtTime(key === name ? 1 : 0, end);
+  }
+  document.querySelectorAll("[data-monitor]").forEach(button => button.classList.toggle("active", button.dataset.monitor === name));
+}
+function responseRow() {
+  const participant = document.querySelector("#participant").value.trim();
+  if (!participant || !selectedAnswer) throw Error("Participant ID and X=A/B answer are required.");
+  const row = {participantId: participant, trialId: trial().trialId, selection: selectedAnswer,
+    confidence: document.querySelector("#confidence").value, comments: document.querySelector("#comments").value};
+  document.querySelectorAll("[data-score]").forEach(input => row[input.dataset.score] = input.value);
+  return row;
+}
+function csvCell(value) { return `"${String(value ?? "").replaceAll('"', '""')}"`; }
+function exportCsv() {
+  if (!responses.length) { status.textContent = "Complete at least one trial before export."; return; }
+  const csv = [csvFields.join(","), ...responses.map(row => csvFields.map(field => csvCell(row[field])).join(","))].join("\r\n");
+  const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([csv], {type: "text/csv"}));
+  link.download = `abx-${responses[0].participantId}.csv`; link.click(); URL.revokeObjectURL(link.href);
+}
+document.querySelector("#play").onclick = () => play().catch(error => status.textContent = String(error));
+document.querySelector("#stop").onclick = stopAudio;
+document.querySelectorAll("[data-monitor]").forEach(button => button.onclick = () => monitor(button.dataset.monitor));
+document.querySelectorAll("[data-answer]").forEach(button => button.onclick = () => {
+  selectedAnswer = button.dataset.answer;
+  document.querySelectorAll("[data-answer]").forEach(other => other.classList.toggle("active", other === button));
+});
+document.querySelector("#next").onclick = async () => {
+  try { responses.push(responseRow()); } catch (error) { status.textContent = error.message; return; }
+  await stopAudio();
+  if (++index >= manifest.trials.length) { index = manifest.trials.length - 1; status.textContent = "Session complete. Export the CSV."; return; }
+  showTrial(); status.textContent = "Response saved. Press Play for the next trial.";
+};
+document.querySelector("#export").onclick = exportCsv;
+</script>
+</body>
+</html>

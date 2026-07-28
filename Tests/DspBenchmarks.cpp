@@ -22,6 +22,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace
 {
 struct Configuration { double sampleRate; std::size_t blockSize; };
@@ -30,24 +36,29 @@ struct Statistics { double averageUs {}; double p99Us {}; };
 template <typename Callback>
 Statistics benchmark(Callback&& callback)
 {
-    constexpr std::size_t warmups = 40;
-    constexpr std::size_t iterations = 400;
+    constexpr std::size_t warmups = 40, iterations = 400, batches = 3;
     for (std::size_t iteration = 0; iteration < warmups; ++iteration)
         callback();
-    std::vector<double> timings; timings.reserve(iterations);
-    for (std::size_t iteration = 0; iteration < iterations; ++iteration)
+    std::array<Statistics, batches> batchStatistics {};
+    for (std::size_t batch = 0; batch < batches; ++batch)
     {
-        std::atomic_signal_fence(std::memory_order_seq_cst);
-        const auto started = std::chrono::steady_clock::now();
-        callback();
-        const auto finished = std::chrono::steady_clock::now();
-        std::atomic_signal_fence(std::memory_order_seq_cst);
-        timings.push_back(std::chrono::duration<double, std::micro>(finished - started).count());
+        std::vector<double> timings; timings.reserve(iterations);
+        for (std::size_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+            const auto started = std::chrono::steady_clock::now(); callback();
+            const auto finished = std::chrono::steady_clock::now();
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+            timings.push_back(std::chrono::duration<double, std::micro>(finished - started).count());
+        }
+        const auto sum = std::accumulate(timings.begin(), timings.end(), 0.0);
+        std::sort(timings.begin(), timings.end());
+        batchStatistics[batch] = { sum / static_cast<double>(timings.size()),
+            timings[static_cast<std::size_t>(timings.size() * 0.99)] };
     }
-    const auto sum = std::accumulate(timings.begin(), timings.end(), 0.0);
-    std::sort(timings.begin(), timings.end());
-    return { sum / static_cast<double>(timings.size()),
-             timings[static_cast<std::size_t>(timings.size() * 0.99)] };
+    std::sort(batchStatistics.begin(), batchStatistics.end(), [](const auto& left, const auto& right)
+    { return left.averageUs < right.averageUs; });
+    return batchStatistics[batches / 2];
 }
 
 void emit(const std::string& processor, const Configuration& configuration,
@@ -75,6 +86,15 @@ Statistics measureAndEmit(const std::string& processor, const Configuration& con
 
 int main()
 {
+#if defined(_WIN32)
+    SYSTEM_INFO systemInfo {};
+    GetSystemInfo(&systemInfo);
+    const auto processorIndex = std::min<DWORD>(systemInfo.dwNumberOfProcessors > 0
+        ? systemInfo.dwNumberOfProcessors - 1 : 0, static_cast<DWORD>(sizeof(DWORD_PTR) * 8 - 1));
+    (void) SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    (void) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    (void) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR { 1 } << processorIndex);
+#endif
     std::cout << "processor,sampleRate,blockSize,channels,averageUs,p99Us,memoryBytes,latencySamples,simdSpeedup,callbackBudgetPercent\n";
     const Configuration configurations[] { { 44100.0, 64 }, { 48000.0, 128 }, { 96000.0, 64 } };
     bool meteringWithinBudget = true;

@@ -1,6 +1,7 @@
 #include <nts/ecosystem/TonePackage.h>
 
 #include <nts/amp/TraditionalAmp.h>
+#include <nts/ecosystem/PackageSignature.h>
 #include <nts/ml/PackedTanhModel.h>
 
 #include <juce_cryptography/juce_cryptography.h>
@@ -331,29 +332,16 @@ std::string sha256File(const Path& file, std::string& error)
 std::string signPackageManifest(const TonePackageManifest& manifest, std::string_view encodedPrivateKey,
                                 std::string& error)
 {
-    juce::RSAKey privateKey { juce::String::fromUTF8(encodedPrivateKey.data(), static_cast<int>(encodedPrivateKey.size())) };
-    if (! privateKey.isValid()) { error = "Invalid package signing key"; return {}; }
-    const auto canonical = packageManifestJson(manifest, false, false);
-    const auto digest = juce::SHA256(canonical.data(), canonical.size()).toHexString();
-    juce::BigInteger value; value.parseString(digest, 16);
-    if (! privateKey.applyToValue(value)) { error = "Unable to sign package manifest"; return {}; }
-    error.clear(); return value.toString(16).toStdString();
+    return signCanonicalText(packageManifestJson(manifest, false, false), encodedPrivateKey, error);
 }
 
 bool verifyPackageManifestSignature(const TonePackageManifest& manifest, std::string_view encodedPublicKey,
                                     std::string& error)
 {
-    if (manifest.signatureAlgorithm != "rsa-sha256-raw-v1" || manifest.signature.empty())
+    if (manifest.signatureAlgorithm != signatureAlgorithmId || manifest.signature.empty())
     { error = "Unsupported or missing package signature"; return false; }
-    juce::RSAKey publicKey { juce::String::fromUTF8(encodedPublicKey.data(), static_cast<int>(encodedPublicKey.size())) };
-    juce::BigInteger signedValue; signedValue.parseString(juce::String(manifest.signature), 16);
-    if (! publicKey.isValid() || signedValue.isZero() || ! publicKey.applyToValue(signedValue))
-    { error = "Package signature could not be verified"; return false; }
-    const auto canonical = packageManifestJson(manifest, false, false);
-    juce::BigInteger expected;
-    expected.parseString(juce::SHA256(canonical.data(), canonical.size()).toHexString(), 16);
-    if (signedValue != expected) { error = "Package signature does not match its manifest"; return false; }
-    error.clear(); return true;
+    return verifyCanonicalText(packageManifestJson(manifest, false, false), manifest.signature,
+                               encodedPublicKey, error);
 }
 
 bool exportTonePackage(const Path& destination, PackageExportRequest request, std::string& error)
@@ -416,7 +404,7 @@ bool exportTonePackage(const Path& destination, PackageExportRequest request, st
     }
     if (! request.encodedPrivateKey.empty())
     {
-        manifest.signerId = request.signerId; manifest.signatureAlgorithm = "rsa-sha256-raw-v1";
+        manifest.signerId = request.signerId; manifest.signatureAlgorithm = signatureAlgorithmId;
         manifest.signature = signPackageManifest(manifest, request.encodedPrivateKey, error);
         if (! error.empty()) return false;
     }

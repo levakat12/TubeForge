@@ -12,6 +12,14 @@ circuit runtime, Phase 7 tone analysis, Phase 8 source reconstruction, Phase 9 i
 Phase 10 Windows release ecosystem. Traditional, physical, and deterministic tone-analysis modes
 work without ML assets; learned neural components activate only after a validated model is loaded.
 
+**Status: pre-release, not shipped.** The per-phase coverage documents are the authoritative record of what
+is actually delivered, and each names its own gaps: Phase 6 at 91%, Phase 7 at 90%, Phase 8 at 95%, Phase 9
+at 91%, and Phase 10 at 86%. The feature lists below describe implemented behavior, not release readiness.
+Outstanding release gates include a production Authenticode certificate, an exercised update download and
+rollback transport, host-owned plug-in crash interception, a consented crash-upload service, and recorded
+REAPER and VST3PluginTestHost validation runs. See [Phase 10 coverage](docs/phase-10-coverage.md) for the
+full list.
+
 ## Phase 1 foundation
 
 - One framework-independent C++20 engine shared by standalone and VST3 wrappers.
@@ -153,7 +161,8 @@ See [Phase 9 coverage](docs/phase-09-coverage.md) and [architecture](docs/phase-
 ## Phase 10 release and ecosystem
 
 - Versioned directory-based `.ntone` packages with UUID/compatibility/license metadata, exact hashes, optional
-  RSA signatures, strict path/type/size allowlists, and neural runtime validation.
+  RSASSA-PKCS1-v1_5 signatures over SHA-256 with a minimum 2048-bit modulus, strict path/type/size allowlists,
+  and neural runtime validation.
 - Local Profile Library UI for search, instrument/favorite filters, compatibility and trust warnings,
   import/export, favorites, last-used ordering, and current-rig application.
 - Standalone-only verified update decisions, plugin-installer-only policy, sanitized consent-aware crash reports,
@@ -239,7 +248,11 @@ Run the repeatable DSP benchmark matrix with:
 
 ## Optional long stress test
 
-The normal integration suite runs 20,000 blocks at 96 kHz with a 32-sample buffer. `nts_soak_tests 3600` performs a true one-hour wall-clock run. The latest local acceptance run completed all 3,600 seconds and processed 23,885,199,732 blocks successfully. Weekly CI and manual workflow dispatches register and execute this test with `TUBEFORGE_ENABLE_HOUR_SOAK_TEST=ON`.
+The normal integration suite runs 20,000 blocks at 96 kHz with a 32-sample buffer. `nts_soak_tests 3600` performs a true one-hour wall-clock run.
+
+The soak drives the traditional amplifier and the core engine together, so oversampling, waveshaping, tone stack, sag, and convolution are all under continuous load, with parameter automation, periodic preset crossfades, and periodic state resets applied while audio keeps flowing. It checks that output stays finite, stays bounded, and stays non-silent. A 20-second local run processes roughly 424,000 blocks, about seven times real time; a full hour is on the order of 76 million blocks.
+
+Earlier revisions of this test exercised only `nts_audio_core`, which is input gain, output gain, and metering. The much larger block counts previously quoted here reflected that gain-only path and did not indicate amplifier stability. Weekly CI and manual workflow dispatches register and execute this test with `TUBEFORGE_ENABLE_HOUR_SOAK_TEST=ON`.
 
 ## Licensing
 

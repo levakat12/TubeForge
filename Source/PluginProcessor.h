@@ -157,6 +157,10 @@ private:
     nts::diagnostics::LatencyBudget latencyBudget;
     nts::diagnostics::StructuredLogger logger;
     std::uint64_t absoluteSamplePosition {};
+    // The amplifier processes the host buffer in place, so the untouched input has
+    // to be kept aside for the engine's input metering. Sized in prepareToPlay to
+    // keep the audio callback allocation-free.
+    juce::AudioBuffer<float> inputSnapshot;
     double currentSampleRate { 44100.0 };
     int currentBlockSize {};
     std::atomic<int> pendingOversamplingLatencySamples {};

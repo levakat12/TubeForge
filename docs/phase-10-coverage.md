@@ -6,7 +6,7 @@ lines of code or document count.
 
 | Area | Weight | Covered | Status |
 |---|---:|---:|---|
-| `.ntone` format and hostile-input security | 25% | 24% | Format 1, UUID/compatibility/assets, bounded allowlist, SHA-256, trusted RSA signatures, rig/model/operator/memory/embedded-vector validation, no execution |
+| `.ntone` format and hostile-input security | 25% | 24% | Format 1, UUID/compatibility/assets, bounded allowlist, SHA-256, trusted RSASSA-PKCS1-v1_5 signatures (2048-bit minimum), rig/model/operator/memory/embedded-vector validation, no execution |
 | Profile browser and file-based sharing | 15% | 14% | Search, instrument/favorite filters, author/tags, compatibility/trust warnings, import/export/apply, favorites and last-used state; gain-category and sample-rate filters exist in the API but not yet as UI controls |
 | Versioning, licenses and privacy | 12% | 12% | Independent matrix, IR redistribution gate, no source audio, opt-in allowlisted telemetry, sanitized diagnostics, policies/notices |
 | Windows distribution and update path | 15% | 10% | Reproducible staged VST3/standalone/docs/PDB/hash bundle, component installer source, repair/uninstall/collector, signed-manifest standalone policy; no production certificate or network downloader exercised locally |

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "category": "clean-guitar-arpeggio",
+      "sourceId": "replace-with-stable-source-id",
+      "candidateA": "renders/clean-guitar-arpeggio-a.wav",
+      "candidateB": "renders/clean-guitar-arpeggio-b.wav"
+    }
+  ]
+}

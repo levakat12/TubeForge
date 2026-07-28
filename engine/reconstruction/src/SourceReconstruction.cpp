@@ -1,0 +1,776 @@
+#include <nts/reconstruction/SourceReconstruction.h>
+
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <limits>
+#include <numbers>
+#include <numeric>
+#include <sstream>
+
+namespace nts::reconstruction
+{
+namespace
+{
+float clamp01(float value) noexcept { return std::clamp(value, 0.0f, 1.0f); }
+float db(float value) noexcept { return 20.0f * std::log10(std::max(value, 1.0e-9f)); }
+float linear(float decibels) noexcept { return std::pow(10.0f, decibels / 20.0f); }
+
+void hashBytes(std::uint64_t& hash, const void* data, std::size_t bytes) noexcept
+{
+    const auto* source = static_cast<const std::uint8_t*>(data);
+    for (std::size_t index = 0; index < bytes; ++index)
+    {
+        hash ^= source[index];
+        hash *= 1099511628211ull;
+    }
+}
+
+std::string hexHash(std::uint64_t hash)
+{
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return stream.str();
+}
+
+StereoAudio like(const StereoAudio& source)
+{
+    StereoAudio result;
+    result.sampleRate = source.sampleRate;
+    result.left.assign(source.samples(), 0.0f);
+    result.right.assign(source.samples(), 0.0f);
+    return result;
+}
+
+float rmsRange(const std::vector<float>& values, std::size_t begin, std::size_t end) noexcept
+{
+    if (end <= begin || begin >= values.size()) return 0.0f;
+    end = std::min(end, values.size());
+    double energy = 0.0;
+    for (auto index = begin; index < end; ++index) energy += values[index] * values[index];
+    return std::sqrt(static_cast<float>(energy / static_cast<double>(end - begin)));
+}
+
+float sampleAt(const std::vector<float>& values, std::size_t index) noexcept
+{
+    return index < values.size() ? values[index] : 0.0f;
+}
+
+float correlationRange(const StereoAudio& audio, std::size_t begin, std::size_t end) noexcept
+{
+    if (audio.right.empty() || end <= begin) return 1.0f;
+    double cross = 0.0, leftEnergy = 0.0, rightEnergy = 0.0;
+    end = std::min({ end, audio.left.size(), audio.right.size() });
+    for (auto index = begin; index < end; ++index)
+    {
+        cross += audio.left[index] * audio.right[index];
+        leftEnergy += audio.left[index] * audio.left[index];
+        rightEnergy += audio.right[index] * audio.right[index];
+    }
+    return static_cast<float>(cross / std::sqrt(std::max(1.0e-18, leftEnergy * rightEnergy)));
+}
+
+struct PitchSummary
+{
+    int dominantMidi { -1 };
+    int lowestMidi { -1 };
+    float frequency {};
+    float confidence {};
+    float cents {};
+};
+
+std::string pitchName(int midi)
+{
+    static constexpr std::array names { "C", "C#", "D", "D#", "E", "F",
+                                        "F#", "G", "G#", "A", "A#", "B" };
+    if (midi < 0) return "Unknown pitch";
+    return std::string(names[static_cast<std::size_t>((midi % 12 + 12) % 12)])
+        + std::to_string(midi / 12 - 1);
+}
+
+PitchSummary estimatePitch(const StereoAudio& audio, std::size_t begin, std::size_t end,
+                           TargetInstrument target)
+{
+    PitchSummary result;
+    if (end <= begin || begin >= audio.samples() || audio.sampleRate < 8000.0) return result;
+    end = std::min(end, audio.samples());
+    const auto downsample = std::max<std::size_t>(1, static_cast<std::size_t>(std::lround(audio.sampleRate / 8000.0)));
+    const auto analysisRate = audio.sampleRate / static_cast<double>(downsample);
+    const auto frameSourceSamples = std::max<std::size_t>(downsample * 256,
+        static_cast<std::size_t>(audio.sampleRate * 0.16));
+    const auto hop = std::max<std::size_t>(1, static_cast<std::size_t>(audio.sampleRate * 0.10));
+    const auto minimumFrequency = target == TargetInstrument::bass ? 30.0 : 55.0;
+    const auto minimumLag = std::max(2, static_cast<int>(analysisRate / 900.0));
+    const auto maximumLag = std::max(minimumLag + 1, static_cast<int>(analysisRate / minimumFrequency));
+    std::array<float, 128> midiWeights {};
+    std::vector<float> centsValues;
+    float confidenceSum {};
+    std::size_t accepted {};
+    const auto availableFrames = std::max<std::size_t>(1, (end - begin) / hop);
+    const auto frameStride = std::max<std::size_t>(1, availableFrames / 32);
+    std::vector<float> frame;
+    frame.reserve(frameSourceSamples / downsample + 1);
+
+    std::size_t frameIndex {};
+    for (auto frameBegin = begin; frameBegin + frameSourceSamples <= end; frameBegin += hop, ++frameIndex)
+    {
+        if (frameIndex % frameStride != 0) continue;
+        frame.clear();
+        for (auto index = frameBegin; index < frameBegin + frameSourceSamples; index += downsample)
+        {
+            const auto right = audio.right.empty() ? audio.left[index] : audio.right[index];
+            frame.push_back(0.5f * (audio.left[index] + right));
+        }
+        const auto mean = std::accumulate(frame.begin(), frame.end(), 0.0) / std::max<std::size_t>(1, frame.size());
+        double energy {};
+        for (auto& sample : frame) { sample -= static_cast<float>(mean); energy += sample * sample; }
+        if (energy / std::max<std::size_t>(1, frame.size()) < 1.0e-7) continue;
+
+        auto correlationAt = [&frame](int lag)
+        {
+            double cross {}, first {}, second {};
+            for (std::size_t index = static_cast<std::size_t>(lag); index < frame.size(); ++index)
+            {
+                const auto a = frame[index], b = frame[index - static_cast<std::size_t>(lag)];
+                cross += a * b; first += a * a; second += b * b;
+            }
+            return static_cast<float>(cross / std::sqrt(std::max(1.0e-18, first * second)));
+        };
+        auto bestLag = minimumLag;
+        auto bestCorrelation = -1.0f;
+        std::vector<float> correlations(static_cast<std::size_t>(maximumLag + 1), -1.0f);
+        for (auto lag = minimumLag; lag <= maximumLag && lag < static_cast<int>(frame.size() / 2); ++lag)
+        {
+            const auto correlation = correlationAt(lag);
+            correlations[static_cast<std::size_t>(lag)] = correlation;
+            if (correlation > bestCorrelation) { bestCorrelation = correlation; bestLag = lag; }
+        }
+        for (auto lag = minimumLag + 1; lag < maximumLag; ++lag)
+            if (correlations[static_cast<std::size_t>(lag)] >= bestCorrelation * 0.96f
+                && correlations[static_cast<std::size_t>(lag)] >= correlations[static_cast<std::size_t>(lag - 1)]
+                && correlations[static_cast<std::size_t>(lag)] >= correlations[static_cast<std::size_t>(lag + 1)])
+            { bestLag = lag; bestCorrelation = correlations[static_cast<std::size_t>(lag)]; break; }
+        if (bestCorrelation < 0.28f) continue;
+        const auto frequency = static_cast<float>(analysisRate / static_cast<double>(bestLag));
+        const auto midiFloat = 69.0f + 12.0f * std::log2(frequency / 440.0f);
+        const auto midi = std::clamp(static_cast<int>(std::lround(midiFloat)), 0, 127);
+        midiWeights[static_cast<std::size_t>(midi)] += bestCorrelation;
+        centsValues.push_back((midiFloat - static_cast<float>(midi)) * 100.0f);
+        confidenceSum += bestCorrelation;
+        ++accepted;
+    }
+    if (accepted == 0) return result;
+    result.dominantMidi = static_cast<int>(std::distance(midiWeights.begin(),
+        std::max_element(midiWeights.begin(), midiWeights.end())));
+    result.frequency = 440.0f * std::pow(2.0f, (static_cast<float>(result.dominantMidi) - 69.0f) / 12.0f);
+    result.confidence = clamp01((confidenceSum / static_cast<float>(accepted))
+        * std::min(1.0f, static_cast<float>(accepted) / 6.0f));
+    std::sort(centsValues.begin(), centsValues.end());
+    result.cents = centsValues[centsValues.size() / 2];
+    float cumulative {}, threshold = confidenceSum * 0.12f;
+    for (std::size_t midi = 0; midi < midiWeights.size(); ++midi)
+    {
+        cumulative += midiWeights[midi];
+        if (cumulative >= threshold) { result.lowestMidi = static_cast<int>(midi); break; }
+    }
+    return result;
+}
+
+std::string tuningFamily(int lowestMidi)
+{
+    if (lowestMidi < 0) return "Tuning uncertain";
+    switch ((lowestMidi % 12 + 12) % 12)
+    {
+        case 4: return "Likely E-standard family";
+        case 3: return "Likely E-flat family";
+        case 2: return "Likely D / Drop-D family";
+        case 1: return "Likely C# / Drop-C# family";
+        case 0: return "Likely C / Drop-C family";
+        case 11: return "Likely B / Drop-B family";
+        default: return "Tuning uncertain (open string not observed)";
+    }
+}
+
+std::pair<GainCharacter, float> estimateGainCharacter(const StereoAudio& audio,
+                                                       std::size_t begin, std::size_t end)
+{
+    end = std::min(end, audio.samples());
+    if (end <= begin) return { GainCharacter::clean, 0.0f };
+    const auto stride = std::max<std::size_t>(1, (end - begin) / 240000);
+    double energy {}, derivativeEnergy {};
+    float peak {}, previous {};
+    std::size_t samples {}, crossings {};
+    for (auto index = begin; index < end; index += stride)
+    {
+        const auto right = audio.right.empty() ? audio.left[index] : audio.right[index];
+        const auto value = 0.5f * (audio.left[index] + right);
+        energy += value * value;
+        const auto difference = value - previous;
+        derivativeEnergy += difference * difference;
+        if (samples > 0 && std::signbit(value) != std::signbit(previous)) ++crossings;
+        peak = std::max(peak, std::abs(value)); previous = value; ++samples;
+    }
+    const auto rms = std::sqrt(static_cast<float>(energy / std::max<std::size_t>(1, samples)));
+    const auto crest = peak / std::max(rms, 1.0e-7f);
+    const auto derivativeRatio = std::sqrt(static_cast<float>(derivativeEnergy / std::max(energy, 1.0e-12)));
+    const auto seconds = static_cast<float>(end - begin) / static_cast<float>(audio.sampleRate);
+    const auto crossingRate = static_cast<float>(crossings * stride) / std::max(seconds, 1.0e-6f);
+    const auto score = clamp01(clamp01((derivativeRatio - 0.045f) / 0.22f) * 0.60f
+        + clamp01((crossingRate - 450.0f) / 2600.0f) * 0.25f
+        + clamp01((4.5f - crest) / 2.8f) * 0.15f);
+    return { score < 0.34f ? GainCharacter::clean : score < 0.62f ? GainCharacter::crunch
+                                                                       : GainCharacter::distorted,
+             score };
+}
+
+nts::tone::ToneProfile profile(std::string id, const nts::tone::ToneAnalysisResult& analysis)
+{
+    return { std::move(id), "Reconstruction", analysis.embedding, analysis.features, analysis.report,
+             analysis.report.context.instrument, nts::tone::SourceType::userRecording,
+             analysis.report.confidence.aggregate, analysis.analysisVersion, { "phase-8" },
+             "user-supplied reference; source audio excluded" };
+}
+
+void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneReport& report,
+                            std::size_t variant)
+{
+    auto& p = preset.parameters;
+    const auto offset = (static_cast<int>(variant % 5) - 2) * 0.06f;
+    const auto gain = clamp01(report.gain.value + offset);
+    const auto brightness = clamp01(report.brightness.value - offset * 0.5f);
+    const auto tightness = clamp01(report.tightness.value + offset * 0.3f);
+    p.topology = tightness > 0.55f ? nts::amp::Topology::tightModern : nts::amp::Topology::vintageBloom;
+    p.stageCount = gain < 0.2f ? 2 : gain < 0.65f ? 3 : 4;
+    for (std::size_t stage = 0; stage < p.stages.size(); ++stage)
+    {
+        p.stages[stage].driveDb = 2.0f + gain * 28.0f + static_cast<float>(stage) * 2.0f + offset * 20.0f;
+        p.stages[stage].bias = (0.5f - report.tightness.value) * 0.45f + offset;
+        p.stages[stage].asymmetry = gain * 0.35f;
+        p.stages[stage].oversamplingFactor = 1;
+    }
+    p.preEq.lowCutHz = p.instrument == nts::amp::Instrument::bass
+        ? 28.0f + tightness * 45.0f : 55.0f + tightness * 95.0f;
+    p.preEq.highCutHz = 6500.0f + brightness * 9500.0f;
+    p.preEq.tightness = tightness;
+    p.toneStack.bass = clamp01(0.35f + report.cleanLowBlendEstimate.value * 0.35f);
+    p.toneStack.mid = clamp01(0.35f + (1.0f - brightness) * 0.35f + offset);
+    p.toneStack.treble = clamp01(0.22f + brightness * 0.65f);
+    p.powerAmp.masterDb = -12.0f + gain * 10.0f;
+    p.powerAmp.saturation = gain;
+    p.powerAmp.sag = clamp01(0.75f - tightness * 0.55f);
+    p.powerAmp.feedback = clamp01(0.25f + tightness * 0.55f);
+    p.powerAmp.presence = brightness;
+    p.powerAmp.resonance = report.cleanLowBlendEstimate.value;
+    p.cabinet.highCutHz = 5500.0f + (1.0f - report.cabinetDarkness.value) * 8500.0f;
+    p.cabinet.blend = clamp01(0.45f + offset);
+    p.postLowDb = (report.cleanLowBlendEstimate.value - 0.5f) * 5.0f;
+    p.postMidDb = (0.5f - brightness) * 3.0f;
+    p.postHighDb = (brightness - 0.5f) * 5.0f;
+    p.bass.crossoverHz = 90.0f + tightness * 180.0f;
+    p.bass.cleanBlend = report.cleanLowBlendEstimate.value;
+    p.outputGainDb = -9.0f;
+    preset.name = "Plausible " + std::string(nts::tone::toString(report.context.gainCategory))
+        + " candidate " + std::to_string(variant + 1);
+}
+} // namespace
+
+std::string StemSeparator::deterministicCacheKey(const StereoAudio& mixture,
+                                                 const SeparationOptions& options)
+{
+    std::uint64_t hash = 1469598103934665603ull;
+    hashBytes(hash, &mixture.sampleRate, sizeof(mixture.sampleRate));
+    const auto count = mixture.samples();
+    hashBytes(hash, &count, sizeof(count));
+    hashBytes(hash, options.modelVersion.data(), options.modelVersion.size());
+    hashBytes(hash, &options.chunkSamples, sizeof(options.chunkSamples));
+    hashBytes(hash, &options.overlapSamples, sizeof(options.overlapSamples));
+    hashBytes(hash, mixture.left.data(), mixture.left.size() * sizeof(float));
+    hashBytes(hash, mixture.right.data(), mixture.right.size() * sizeof(float));
+    return hexHash(hash);
+}
+
+StemSet StemSeparator::separate(const StereoAudio& mixture, const SeparationOptions& options,
+                                const ProgressCallback& progress, std::stop_token stopToken) const
+{
+    StemSet result;
+    result.modelVersion = options.modelVersion;
+    if (mixture.sampleRate < 8000.0 || mixture.sampleRate > 384000.0 || mixture.left.empty()
+        || (! mixture.right.empty() && mixture.right.size() != mixture.left.size()))
+    {
+        result.error = "invalid decoded song audio";
+        return result;
+    }
+    if (options.chunkSamples < 1024 || options.overlapSamples >= options.chunkSamples)
+    {
+        result.error = "invalid separation chunk/overlap configuration";
+        return result;
+    }
+    result.cacheKey = deterministicCacheKey(mixture, options);
+    result.usedGpu = false;
+    if (options.preferGpu) result.warnings.emplace_back("GPU model unavailable; deterministic CPU fallback used");
+    auto source = mixture;
+    if (source.right.empty()) source.right = source.left;
+    auto rawVocals = like(source), rawDrums = like(source), rawBass = like(source), rawOther = like(source);
+    const auto alphaBass = 1.0f - std::exp(-2.0f * std::numbers::pi_v<float> * 230.0f
+                                           / static_cast<float>(source.sampleRate));
+    const auto alphaBand = 1.0f - std::exp(-2.0f * std::numbers::pi_v<float> * 5200.0f
+                                           / static_cast<float>(source.sampleRate));
+    std::array<float, 2> low {}, bandLow {}, previous {}, transientEnvelope {};
+    for (std::size_t index = 0; index < source.samples(); ++index)
+    {
+        if (stopToken.stop_requested()) { result.error = "separation cancelled"; return result; }
+        const auto mid = 0.5f * (source.left[index] + source.right[index]);
+        const auto side = 0.5f * (source.left[index] - source.right[index]);
+        for (std::size_t channel = 0; channel < 2; ++channel)
+        {
+            const auto input = channel == 0 ? source.left[index] : source.right[index];
+            low[channel] += alphaBass * (input - low[channel]);
+            bandLow[channel] += alphaBand * (input - bandLow[channel]);
+            const auto high = input - bandLow[channel];
+            const auto onset = std::abs(input - previous[channel]);
+            transientEnvelope[channel] = std::max(onset, transientEnvelope[channel] * 0.985f);
+            const auto drumWeight = clamp01((onset - transientEnvelope[channel] * 0.35f) * 8.0f);
+            const auto vocalMid = (bandLow[channel] - low[channel]) * 0.42f;
+            const auto vocal = vocalMid + mid * 0.05f - side * (channel == 0 ? 0.02f : -0.02f);
+            const auto drum = high * (0.08f + drumWeight * 0.38f)
+                            + (input - previous[channel]) * drumWeight * 0.12f;
+            auto& vocals = channel == 0 ? rawVocals.left : rawVocals.right;
+            auto& drums = channel == 0 ? rawDrums.left : rawDrums.right;
+            auto& bass = channel == 0 ? rawBass.left : rawBass.right;
+            auto& other = channel == 0 ? rawOther.left : rawOther.right;
+            vocals[index] = vocal;
+            drums[index] = drum;
+            bass[index] = low[channel];
+            other[index] = input - vocal - drum - low[channel];
+            previous[channel] = input;
+        }
+    }
+
+    result.vocals = like(source); result.drums = like(source); result.bass = like(source); result.other = like(source);
+    std::vector<float> weights(source.samples(), 0.0f);
+    const auto hop = options.chunkSamples - options.overlapSamples;
+    const auto chunks = std::max<std::size_t>(1, (source.samples() + hop - 1) / hop);
+    std::size_t chunkIndex {};
+    for (std::size_t begin = 0; begin < source.samples(); begin += hop, ++chunkIndex)
+    {
+        const auto end = std::min(source.samples(), begin + options.chunkSamples);
+        for (auto index = begin; index < end; ++index)
+        {
+            float weight = 1.0f;
+            if (options.overlapSamples > 0 && begin > 0 && index < begin + options.overlapSamples)
+                weight *= static_cast<float>(index - begin + 1) / static_cast<float>(options.overlapSamples + 1);
+            if (options.overlapSamples > 0 && end < source.samples() && index + options.overlapSamples >= end)
+                weight *= static_cast<float>(end - index) / static_cast<float>(options.overlapSamples + 1);
+            weights[index] += weight;
+            for (std::size_t channel = 0; channel < 2; ++channel)
+            {
+                auto add = [index, weight](std::vector<float>& destination, const std::vector<float>& raw)
+                    { destination[index] += raw[index] * weight; };
+                add(channel == 0 ? result.vocals.left : result.vocals.right,
+                    channel == 0 ? rawVocals.left : rawVocals.right);
+                add(channel == 0 ? result.drums.left : result.drums.right,
+                    channel == 0 ? rawDrums.left : rawDrums.right);
+                add(channel == 0 ? result.bass.left : result.bass.right,
+                    channel == 0 ? rawBass.left : rawBass.right);
+                add(channel == 0 ? result.other.left : result.other.right,
+                    channel == 0 ? rawOther.left : rawOther.right);
+            }
+        }
+        const auto update = SeparationProgress { 0.15f + 0.8f * static_cast<float>(chunkIndex + 1)
+                                                 / static_cast<float>(chunks), "separating overlapping chunks" };
+        if ((progress && ! progress(update)) || stopToken.stop_requested())
+        { result.error = "separation cancelled"; return result; }
+        if (end == source.samples()) break;
+    }
+    double errorEnergy = 0.0, sourceEnergy = 0.0;
+    for (std::size_t index = 0; index < source.samples(); ++index)
+    {
+        const auto inverse = 1.0f / std::max(weights[index], 1.0e-9f);
+        for (auto* stem : { &result.vocals, &result.drums, &result.bass, &result.other })
+        { stem->left[index] *= inverse; stem->right[index] *= inverse; }
+        const auto reconstructed = result.vocals.left[index] + result.drums.left[index]
+                                 + result.bass.left[index] + result.other.left[index];
+        const auto difference = reconstructed - source.left[index];
+        errorEnergy += difference * difference;
+        sourceEnergy += source.left[index] * source.left[index];
+    }
+    result.reconstructionError = std::sqrt(static_cast<float>(errorEnergy / std::max(1.0e-18, sourceEnergy)));
+    result.success = true;
+    if (result.reconstructionError > 1.0e-4f)
+        result.warnings.emplace_back("stem reconstruction consistency is outside tolerance");
+    if (progress) progress({ 1.0f, "separation complete" });
+    return result;
+}
+
+StereoAudio selectStem(const StemSet& stems, TargetInstrument target)
+{
+    if (target == TargetInstrument::bass) return stems.bass;
+    if (! stems.guitar.left.empty()) return stems.guitar;
+    auto guitar = stems.other;
+    if (guitar.left.empty()) return guitar;
+    const auto alphaLow = 1.0f - std::exp(-2.0f * std::numbers::pi_v<float> * 75.0f
+                                          / static_cast<float>(guitar.sampleRate));
+    const auto alphaHigh = 1.0f - std::exp(-2.0f * std::numbers::pi_v<float> * 9500.0f
+                                           / static_cast<float>(guitar.sampleRate));
+    std::array<float, 2> low {}, high {};
+    for (std::size_t index = 0; index < guitar.samples(); ++index)
+        for (std::size_t channel = 0; channel < 2; ++channel)
+        {
+            auto& samples = channel == 0 ? guitar.left : guitar.right;
+            low[channel] += alphaLow * (samples[index] - low[channel]);
+            high[channel] += alphaHigh * (samples[index] - high[channel]);
+            samples[index] = high[channel] - low[channel];
+        }
+    return guitar;
+}
+
+StereoAudio applyStereoMode(const StereoAudio& audio, StereoMode mode)
+{
+    auto source = audio;
+    if (source.right.empty()) source.right = source.left;
+    auto result = like(source);
+    double leftEnergy = 0.0, rightEnergy = 0.0;
+    for (std::size_t index = 0; index < source.samples(); ++index)
+    { leftEnergy += source.left[index] * source.left[index]; rightEnergy += source.right[index] * source.right[index]; }
+    const auto chooseLeft = leftEnergy >= rightEnergy;
+    for (std::size_t index = 0; index < source.samples(); ++index)
+    {
+        const auto left = source.left[index], right = source.right[index];
+        switch (mode)
+        {
+            case StereoMode::left: result.left[index] = result.right[index] = left; break;
+            case StereoMode::right: result.left[index] = result.right[index] = right; break;
+            case StereoMode::mid: result.left[index] = result.right[index] = 0.5f * (left + right); break;
+            case StereoMode::side: result.left[index] = result.right[index] = 0.5f * (left - right); break;
+            case StereoMode::pannedEstimate:
+                result.left[index] = result.right[index] = chooseLeft ? left - 0.25f * right : right - 0.25f * left; break;
+            case StereoMode::fullStereo: result.left[index] = left; result.right[index] = right; break;
+        }
+    }
+    return result;
+}
+
+std::vector<RegionQuality> scoreRegions(const StemSet& stems, TargetInstrument target,
+                                        double regionSeconds, double hopSeconds)
+{
+    std::vector<RegionQuality> result;
+    if (! stems.success || regionSeconds <= 0.0 || hopSeconds <= 0.0) return result;
+    const auto targetAudio = selectStem(stems, target);
+    const auto regionSamples = std::max<std::size_t>(1, static_cast<std::size_t>(regionSeconds * targetAudio.sampleRate));
+    const auto hopSamples = std::max<std::size_t>(1, static_cast<std::size_t>(hopSeconds * targetAudio.sampleRate));
+    for (std::size_t begin = 0; begin < targetAudio.samples(); begin += hopSamples)
+    {
+        const auto end = std::min(targetAudio.samples(), begin + regionSamples);
+        RegionQuality quality;
+        quality.startSeconds = static_cast<double>(begin) / targetAudio.sampleRate;
+        quality.endSeconds = static_cast<double>(end) / targetAudio.sampleRate;
+        quality.duration = static_cast<float>(quality.endSeconds - quality.startSeconds);
+        const auto targetRms = 0.5f * (rmsRange(targetAudio.left, begin, end) + rmsRange(targetAudio.right, begin, end));
+        const auto vocalRms = 0.5f * (rmsRange(stems.vocals.left, begin, end) + rmsRange(stems.vocals.right, begin, end));
+        const auto drumRms = 0.5f * (rmsRange(stems.drums.left, begin, end) + rmsRange(stems.drums.right, begin, end));
+        quality.targetEnergy = clamp01((db(targetRms) + 60.0f) / 48.0f);
+        quality.vocalLeakage = clamp01(vocalRms / std::max(targetRms, 1.0e-6f));
+        quality.drumLeakage = clamp01(drumRms / std::max(targetRms, 1.0e-6f));
+        quality.stereoStability = clamp01((correlationRange(targetAudio, begin, end) + 1.0f) * 0.5f);
+        std::size_t clipped {}, crossings {};
+        double tailCorrelation = 0.0, tailEnergy = 0.0;
+        const auto delay = static_cast<std::size_t>(targetAudio.sampleRate * 0.08);
+        for (auto index = begin; index < end; ++index)
+        {
+            // Different separator backends do not necessarily materialize every stem. The
+            // Demucs target-only loading path, for example, keeps vocals, drums, and the
+            // requested instrument while leaving the other vectors empty to reduce memory.
+            const auto reconstructedMixture = sampleAt(stems.vocals.left, index)
+                                            + sampleAt(stems.drums.left, index)
+                                            + sampleAt(stems.bass.left, index)
+                                            + sampleAt(stems.other.left, index)
+                                            + sampleAt(stems.guitar.left, index)
+                                            + sampleAt(stems.piano.left, index);
+            if (std::abs(reconstructedMixture) > 0.985f) ++clipped;
+            if (index > begin && std::signbit(targetAudio.left[index]) != std::signbit(targetAudio.left[index - 1])) ++crossings;
+            if (index >= begin + delay)
+            { tailCorrelation += targetAudio.left[index] * targetAudio.left[index - delay]; tailEnergy += targetAudio.left[index] * targetAudio.left[index]; }
+        }
+        quality.clipping = clamp01(static_cast<float>(clipped) / static_cast<float>(std::max<std::size_t>(1, end - begin)) * 40.0f);
+        quality.reverbAmount = clamp01(std::abs(static_cast<float>(tailCorrelation / std::max(1.0e-12, tailEnergy))));
+        quality.polyphonicDensity = clamp01(static_cast<float>(crossings) / static_cast<float>(std::max<std::size_t>(1, end - begin))
+                                            * static_cast<float>(targetAudio.sampleRate) / 1800.0f);
+        const auto durationScore = clamp01(quality.duration / 5.0f);
+        quality.confidence = clamp01(quality.targetEnergy * 0.24f + (1.0f - quality.vocalLeakage) * 0.16f
+            + (1.0f - quality.drumLeakage) * 0.17f + quality.stereoStability * 0.10f
+            + (1.0f - quality.clipping) * 0.10f + (1.0f - quality.reverbAmount) * 0.08f
+            + durationScore * 0.15f);
+        if (quality.duration < 2.0f) quality.warnings.emplace_back("region is too short for reliable reconstruction");
+        if (quality.drumLeakage > 0.55f) quality.warnings.emplace_back("heavy drum leakage");
+        if (quality.vocalLeakage > 0.55f) quality.warnings.emplace_back("vocal leakage");
+        if (quality.clipping > 0.1f) quality.warnings.emplace_back("clipped reference");
+        if (quality.reverbAmount > 0.55f) quality.warnings.emplace_back("strong room or reverb tail");
+        if (quality.polyphonicDensity > 0.8f) quality.warnings.emplace_back("dense or ambiguous source");
+        result.push_back(std::move(quality));
+        if (end == targetAudio.samples()) break;
+    }
+    return result;
+}
+
+RegionQuality recommendRegion(const StemSet& stems, TargetInstrument target, double regionSeconds)
+{
+    auto regions = scoreRegions(stems, target, regionSeconds, std::max(0.5, regionSeconds * 0.5));
+    if (regions.empty()) return {};
+    return *std::max_element(regions.begin(), regions.end(), [](const auto& first, const auto& second)
+        { return first.confidence < second.confidence; });
+}
+
+std::vector<PlayableRegion> analyzePlayableRegions(
+    const StereoAudio& targetAudio, std::span<const RegionQuality> qualityRegions,
+    TargetInstrument target, std::size_t maximumRegions)
+{
+    std::vector<PlayableRegion> result;
+    if (targetAudio.left.empty() || maximumRegions == 0 || qualityRegions.empty()) return result;
+    std::vector<std::size_t> ranked(qualityRegions.size());
+    std::iota(ranked.begin(), ranked.end(), 0);
+    std::sort(ranked.begin(), ranked.end(), [qualityRegions](auto first, auto second)
+    { return qualityRegions[first].confidence > qualityRegions[second].confidence; });
+    for (const auto index : ranked)
+    {
+        const auto& quality = qualityRegions[index];
+        const auto centre = (quality.startSeconds + quality.endSeconds) * 0.5;
+        const auto overlaps = std::any_of(result.begin(), result.end(), [centre, &quality](const auto& selected)
+        {
+            const auto selectedCentre = (selected.quality.startSeconds + selected.quality.endSeconds) * 0.5;
+            return std::abs(selectedCentre - centre) < std::max(1.0, quality.duration * 0.45);
+        });
+        if (overlaps) continue;
+        PlayableRegion region;
+        region.quality = quality;
+        const auto begin = std::min(targetAudio.samples(), static_cast<std::size_t>(
+            std::max(0.0, quality.startSeconds) * targetAudio.sampleRate));
+        const auto end = std::min(targetAudio.samples(), static_cast<std::size_t>(
+            std::max(quality.startSeconds, quality.endSeconds) * targetAudio.sampleRate));
+        const auto gain = estimateGainCharacter(targetAudio, begin, end);
+        region.gainCharacter = gain.first;
+        region.gainScore = gain.second;
+        const auto pitch = estimatePitch(targetAudio, begin, end, target);
+        region.dominantPitch = pitchName(pitch.dominantMidi);
+        region.dominantFrequencyHz = pitch.frequency;
+        region.pitchConfidence = pitch.confidence;
+        region.lowestPitchMidi = pitch.lowestMidi;
+        region.tuningOffsetCents = pitch.cents;
+        region.estimatedTuning = tuningFamily(pitch.lowestMidi);
+        result.push_back(std::move(region));
+        if (result.size() >= maximumRegions) break;
+    }
+    const auto reliableLowest = std::min_element(result.begin(), result.end(), [](const auto& first, const auto& second)
+    {
+        const auto firstMidi = first.pitchConfidence >= 0.35f && first.lowestPitchMidi >= 0
+            ? first.lowestPitchMidi : std::numeric_limits<int>::max();
+        const auto secondMidi = second.pitchConfidence >= 0.35f && second.lowestPitchMidi >= 0
+            ? second.lowestPitchMidi : std::numeric_limits<int>::max();
+        return firstMidi < secondMidi;
+    });
+    if (reliableLowest != result.end() && reliableLowest->pitchConfidence >= 0.35f)
+    {
+        const auto tuning = tuningFamily(reliableLowest->lowestPitchMidi);
+        const auto cents = reliableLowest->tuningOffsetCents;
+        for (auto& region : result)
+        {
+            region.estimatedTuning = tuning;
+            region.tuningOffsetCents = cents;
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const auto& first, const auto& second)
+    { return first.quality.startSeconds < second.quality.startSeconds; });
+    return result;
+}
+
+StereoAudio extractRegion(const StereoAudio& audio, double startSeconds, double endSeconds)
+{
+    StereoAudio result; result.sampleRate = audio.sampleRate;
+    const auto start = std::min(audio.samples(), static_cast<std::size_t>(std::max(0.0, startSeconds) * audio.sampleRate));
+    const auto end = std::min(audio.samples(), static_cast<std::size_t>(std::max(startSeconds, endSeconds) * audio.sampleRate));
+    result.left.assign(audio.left.begin() + static_cast<std::ptrdiff_t>(start), audio.left.begin() + static_cast<std::ptrdiff_t>(end));
+    if (! audio.right.empty()) result.right.assign(audio.right.begin() + static_cast<std::ptrdiff_t>(start), audio.right.begin() + static_cast<std::ptrdiff_t>(end));
+    return result;
+}
+
+ReferenceNormalization normalizeReference(const StereoAudio& audio, bool reduceRoomTail)
+{
+    ReferenceNormalization result; result.audio = audio;
+    if (result.audio.left.empty()) return result;
+    if (result.audio.right.empty()) result.audio.right = result.audio.left;
+    double meanLeft = 0.0, meanRight = 0.0;
+    for (auto sample : result.audio.left) meanLeft += sample;
+    for (auto sample : result.audio.right) meanRight += sample;
+    meanLeft /= result.audio.left.size(); meanRight /= result.audio.right.size();
+    float peak = 0.0f;
+    for (std::size_t index = 0; index < result.audio.samples(); ++index)
+    {
+        result.audio.left[index] -= static_cast<float>(meanLeft);
+        result.audio.right[index] -= static_cast<float>(meanRight);
+        peak = std::max({ peak, std::abs(result.audio.left[index]), std::abs(result.audio.right[index]) });
+    }
+    const auto threshold = peak * 0.005f;
+    std::size_t begin {}, end = result.audio.samples();
+    while (begin < end && std::abs(result.audio.left[begin]) < threshold && std::abs(result.audio.right[begin]) < threshold) ++begin;
+    while (end > begin && std::abs(result.audio.left[end - 1]) < threshold && std::abs(result.audio.right[end - 1]) < threshold) --end;
+    if (begin < end)
+    {
+        result.audio.left = { result.audio.left.begin() + static_cast<std::ptrdiff_t>(begin), result.audio.left.begin() + static_cast<std::ptrdiff_t>(end) };
+        result.audio.right = { result.audio.right.begin() + static_cast<std::ptrdiff_t>(begin), result.audio.right.begin() + static_cast<std::ptrdiff_t>(end) };
+    }
+    const auto inputRms = 0.5f * (rmsRange(result.audio.left, 0, result.audio.samples())
+                                  + rmsRange(result.audio.right, 0, result.audio.samples()));
+    result.originalLoudnessDb = db(inputRms);
+    const auto scale = linear(result.normalizedLoudnessDb) / std::max(inputRms, 1.0e-7f);
+    const auto roomDelay = static_cast<std::size_t>(result.audio.sampleRate * 0.06);
+    for (std::size_t index = 0; index < result.audio.samples(); ++index)
+        for (auto* channel : { &result.audio.left, &result.audio.right })
+        {
+            auto value = (*channel)[index];
+            if (reduceRoomTail && index >= roomDelay) value -= (*channel)[index - roomDelay] * 0.08f;
+            (*channel)[index] = std::clamp(value * scale, -2.0f, 2.0f);
+        }
+    result.roomTailReduced = reduceRoomTail;
+    const auto quarter = std::max<std::size_t>(1, result.audio.samples() / 4);
+    const auto low = rmsRange(result.audio.left, 0, quarter);
+    const auto middle = rmsRange(result.audio.left, quarter, quarter * 3);
+    const auto high = rmsRange(result.audio.left, quarter * 3, result.audio.samples());
+    const auto average = std::max((low + middle + high) / 3.0f, 1.0e-7f);
+    result.broadProductionEqDb = { db(low / average), db(middle / average), db(high / average) };
+    return result;
+}
+
+ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference& reference,
+                                                   std::span<const float> userDi, double sampleRate,
+                                                   std::size_t candidateCount,
+                                                   const ProgressCallback& progress,
+                                                   std::stop_token stopToken) const
+{
+    ReconstructionResult result; result.reference = reference;
+    if (! reference.tone.success || userDi.empty() || sampleRate < 8000.0 || candidateCount == 0)
+    { result.error = "valid tone reference, DI, sample rate, and candidate count are required"; return result; }
+    result.neuralConditioning = reference.tone.embedding.values;
+    const auto diRms = rmsRange(std::vector<float>(userDi.begin(), userDi.end()), 0, userDi.size());
+    const auto targetRms = std::max(reference.tone.features.rms, 1.0e-6f);
+    const auto inputTrim = std::clamp(db(targetRms / std::max(diRms, 1.0e-7f)), -18.0f, 18.0f);
+    const auto poolSize = std::max<std::size_t>(candidateCount * 3, 12);
+    nts::tone::ToneAnalyzer analyzer;
+    std::vector<RigCandidate> pool;
+    for (std::size_t variant = 0; variant < poolSize; ++variant)
+    {
+        if (stopToken.stop_requested()) { result.error = "reconstruction cancelled"; return result; }
+        RigCandidate candidate;
+        const auto instrument = reference.target == TargetInstrument::bass ? nts::amp::Instrument::bass
+                                                                           : nts::amp::Instrument::guitar;
+        candidate.rigPreset = nts::amp::makeOriginalPreset(nts::amp::Topology::tightModern, instrument);
+        setCandidateParameters(candidate.rigPreset, reference.tone.report, variant);
+        candidate.adaptation.inputTrimDb = inputTrim;
+        candidate.adaptation.lowShelfDb = (reference.tone.report.cleanLowBlendEstimate.value - 0.5f) * 6.0f;
+        candidate.adaptation.midEqDb = (0.5f - reference.tone.report.brightness.value) * 3.0f;
+        candidate.adaptation.highShelfDb = (reference.tone.report.brightness.value - 0.5f) * 5.0f;
+        candidate.adaptation.dynamicRangeScale = std::clamp(1.35f - reference.tone.report.compression.value, 0.45f, 1.35f);
+        candidate.rigPreset.parameters.manualInputTrimDb = candidate.adaptation.inputTrimDb;
+        candidate.rigPreset.parameters.preEq.lowShelfEnabled = true;
+        candidate.rigPreset.parameters.preEq.lowShelfDb = candidate.adaptation.lowShelfDb;
+        candidate.rigPreset.parameters.preEq.midEmphasisEnabled = true;
+        candidate.rigPreset.parameters.preEq.midEmphasisDb = candidate.adaptation.midEqDb;
+        nts::amp::TraditionalAmpProcessor processor;
+        processor.prepare({ sampleRate, 512, 1 });
+        processor.loadPreset(candidate.rigPreset, 0);
+        auto rendered = nts::amp::renderOffline(processor, userDi, 256);
+        const auto renderedTone = analyzer.analyze({ rendered, {}, sampleRate,
+                                                     nts::tone::SourceType::pluginRender, 1.0f });
+        if (! renderedTone.success) continue;
+        const auto comparison = nts::tone::ToneSimilarity::compare(profile("reference", reference.tone),
+                                                                    profile("candidate", renderedTone));
+        candidate.toneSimilarity = comparison.score;
+        const auto loudnessMatch = 1.0f - clamp01(std::abs(renderedTone.features.dynamic.integratedLoudnessDb
+                                                          - reference.tone.features.dynamic.integratedLoudnessDb) / 24.0f);
+        const auto productionPenalty = reference.tone.features.spatial.roomReverbEstimate * 0.18f
+                                     + reference.tone.features.spatial.doubleTrackingLikelihood * 0.12f;
+        candidate.recordingSimilarity = clamp01(candidate.toneSimilarity * 0.76f + loudnessMatch * 0.24f
+                                                 - productionPenalty);
+        candidate.complexityPenalty = static_cast<float>(candidate.rigPreset.parameters.stageCount - 2) * 0.025f
+                                    + (candidate.rigPreset.parameters.preEq.midEmphasisEnabled ? 0.01f : 0.0f);
+        candidate.confidence = clamp01(reference.analysisConfidence * 0.65f + candidate.toneSimilarity * 0.35f
+                                       - candidate.complexityPenalty);
+        if (reference.quality.stereoStability < 0.45f)
+            candidate.warnings.emplace_back("double-tracked or unstable stereo reference");
+        if (reference.quality.drumLeakage > 0.5f)
+            candidate.warnings.emplace_back("candidate may reflect drum leakage");
+        candidate.warnings.emplace_back("plausible virtual approximation; original hardware is not identified");
+        pool.push_back(std::move(candidate));
+        if (progress && ! progress({ static_cast<float>(variant + 1) / static_cast<float>(poolSize),
+                                     "rendering and ranking candidate rigs" }))
+        { result.error = "reconstruction cancelled"; return result; }
+    }
+    std::sort(pool.begin(), pool.end(), [](const auto& first, const auto& second)
+    {
+        const auto firstScore = first.toneSimilarity * 0.7f + first.recordingSimilarity * 0.3f - first.complexityPenalty;
+        const auto secondScore = second.toneSimilarity * 0.7f + second.recordingSimilarity * 0.3f - second.complexityPenalty;
+        return firstScore > secondScore;
+    });
+    if (pool.empty()) { result.error = "candidate rendering did not produce a valid tone"; return result; }
+    pool.resize(std::min(candidateCount, pool.size()));
+    result.candidates = std::move(pool);
+    if (reference.analysisConfidence < 0.55f)
+        result.warnings.emplace_back("ambiguous reference: candidates have reduced confidence");
+    result.warnings.emplace_back("shared result contains parameters and embeddings only; source audio is excluded");
+    result.success = true;
+    return result;
+}
+
+std::string serializeResult(const ReconstructionResult& result, bool pretty)
+{
+    const auto newline = pretty ? "\n" : "";
+    const auto indent = pretty ? "  " : "";
+    std::ostringstream stream; stream << std::setprecision(7);
+    stream << '{' << newline << indent << "\"schemaVersion\":\"" << result.reconstructionVersion << "\","
+           << newline << indent << "\"reference\":{"
+           << "\"sourceHash\":\"" << result.reference.sourceHash << "\","
+           << "\"regionStartSeconds\":" << result.reference.regionStartSeconds << ','
+           << "\"regionEndSeconds\":" << result.reference.regionEndSeconds << ','
+           << "\"separationModelVersion\":\"" << result.reference.separationModelVersion << "\"," 
+           << "\"analysisConfidence\":" << result.reference.analysisConfidence << ','
+           << "\"dominantPitch\":\"" << result.reference.dominantPitch << "\","
+           << "\"estimatedTuning\":\"" << result.reference.estimatedTuning << "\","
+           << "\"gainCharacter\":\"" << result.reference.gainCharacter << "\","
+           << "\"pitchConfidence\":" << result.reference.pitchConfidence << ','
+           << "\"tuningOffsetCents\":" << result.reference.tuningOffsetCents << "},"
+           << newline << indent << "\"candidates\":[";
+    for (std::size_t index = 0; index < result.candidates.size(); ++index)
+    {
+        if (index > 0) stream << ',';
+        const auto& candidate = result.candidates[index];
+        stream << newline << indent << indent << '{'
+               << "\"rigPreset\":" << nts::amp::serializePreset(candidate.rigPreset, false) << ','
+               << "\"toneSimilarity\":" << candidate.toneSimilarity << ','
+               << "\"recordingSimilarity\":" << candidate.recordingSimilarity << ','
+               << "\"confidence\":" << candidate.confidence << '}';
+    }
+    stream << newline << indent << "]" << newline << '}';
+    return stream.str();
+}
+
+std::string_view toString(TargetInstrument value) noexcept
+{ return value == TargetInstrument::bass ? "bass" : "guitar"; }
+std::string_view toString(StereoMode value) noexcept
+{
+    switch (value)
+    {
+        case StereoMode::left: return "left"; case StereoMode::right: return "right";
+        case StereoMode::mid: return "mid"; case StereoMode::side: return "side";
+        case StereoMode::pannedEstimate: return "panned-estimate"; default: return "full-stereo";
+    }
+}
+std::string_view toString(GainCharacter value) noexcept
+{
+    switch (value)
+    {
+        case GainCharacter::crunch: return "crunch";
+        case GainCharacter::distorted: return "distorted";
+        default: return "clean";
+    }
+}
+} // namespace nts::reconstruction

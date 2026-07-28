@@ -25,6 +25,13 @@ juce::var stringArray(const std::vector<std::string>& values)
     return result;
 }
 
+juce::var floatArray(const std::vector<float>& values)
+{
+    juce::Array<juce::var> result;
+    for (const auto value : values) result.add(value);
+    return result;
+}
+
 std::vector<int> readIntegerArray(const juce::var& value)
 {
     std::vector<int> result;
@@ -45,6 +52,17 @@ std::vector<std::string> readStringArray(const juce::var& value)
         result.reserve(static_cast<std::size_t>(array->size()));
         for (const auto& item : *array)
             result.push_back(item.toString().toStdString());
+    }
+    return result;
+}
+
+std::vector<float> readFloatArray(const juce::var& value)
+{
+    std::vector<float> result;
+    if (const auto* array = value.getArray())
+    {
+        result.reserve(static_cast<std::size_t>(array->size()));
+        for (const auto& item : *array) result.push_back(static_cast<float>(static_cast<double>(item)));
     }
     return result;
 }
@@ -72,6 +90,18 @@ juce::var migrateV0ToV1(const juce::var& source)
     return migrated;
 }
 
+juce::var migrateV1ToV2(const juce::var& source)
+{
+    auto migrated = source.clone();
+    auto* root = migrated.getDynamicObject();
+    root->setProperty("schemaVersion", 2);
+    auto graph = root->getProperty("graph");
+    if (! graph.isObject()) graph = juce::var(new juce::DynamicObject());
+    graph.getDynamicObject()->setProperty("physicalCircuitJson", "");
+    root->setProperty("graph", graph);
+    return migrated;
+}
+
 juce::var toVar(const ProjectState& state)
 {
     auto* root = new juce::DynamicObject();
@@ -82,6 +112,7 @@ juce::var toVar(const ProjectState& state)
     engine->setProperty("inputGainDb", state.engine.inputGainDb);
     engine->setProperty("outputGainDb", state.engine.outputGainDb);
     engine->setProperty("bypass", state.engine.bypass);
+    engine->setProperty("ampControls", floatArray(state.engine.ampControls));
     root->setProperty("engine", juce::var(engine));
 
     auto* device = new juce::DynamicObject();
@@ -97,6 +128,7 @@ juce::var toVar(const ProjectState& state)
     auto* graph = new juce::DynamicObject();
     graph->setProperty("latencySamples", state.graph.latencySamples);
     graph->setProperty("enabled", state.graph.enabled);
+    graph->setProperty("physicalCircuitJson", juce::String::fromUTF8(state.graph.physicalCircuitJson.c_str()));
     root->setProperty("graph", juce::var(graph));
 
     auto* ui = new juce::DynamicObject();
@@ -121,6 +153,7 @@ ProjectState fromVar(const juce::var& root)
     state.engine.inputGainDb = static_cast<float>(static_cast<double>(engine.getProperty("inputGainDb", 0.0)));
     state.engine.outputGainDb = static_cast<float>(static_cast<double>(engine.getProperty("outputGainDb", 0.0)));
     state.engine.bypass = static_cast<bool>(engine.getProperty("bypass", false));
+    state.engine.ampControls = readFloatArray(engine.getProperty("ampControls", {}));
 
     const auto device = root.getProperty("device", {});
     state.device.backend = device.getProperty("backend", "").toString().toStdString();
@@ -134,6 +167,7 @@ ProjectState fromVar(const juce::var& root)
     const auto graph = root.getProperty("graph", {});
     state.graph.latencySamples = static_cast<int>(graph.getProperty("latencySamples", 0));
     state.graph.enabled = static_cast<bool>(graph.getProperty("enabled", true));
+    state.graph.physicalCircuitJson = graph.getProperty("physicalCircuitJson", "").toString().toStdString();
 
     const auto ui = root.getProperty("ui", {});
     state.ui.width = static_cast<int>(ui.getProperty("width", 760));
@@ -162,8 +196,8 @@ StateResult deserialize(std::string_view json)
     if (sourceVersion > currentSchemaVersion || sourceVersion < 0)
         return { std::nullopt, "Unsupported project schema version" };
 
-    if (sourceVersion == 0)
-        parsed = migrateV0ToV1(parsed);
+    if (sourceVersion == 0) parsed = migrateV0ToV1(parsed);
+    if (sourceVersion <= 1) parsed = migrateV1ToV2(parsed);
 
     auto state = fromVar(parsed);
     std::string error;
@@ -190,6 +224,13 @@ bool validate(const ProjectState& state, std::string& error) noexcept
         error = "Engine gain is outside the supported range";
         return false;
     }
+    if (state.engine.ampControls.size() > 64
+        || std::any_of(state.engine.ampControls.begin(), state.engine.ampControls.end(),
+                       [](float value) { return ! std::isfinite(value); }))
+    {
+        error = "Amp control state is invalid";
+        return false;
+    }
     if (! std::isfinite(state.device.sampleRate) || state.device.sampleRate < 8000.0 || state.device.sampleRate > 384000.0)
     {
         error = "Device sample rate is invalid";
@@ -203,6 +244,11 @@ bool validate(const ProjectState& state, std::string& error) noexcept
     if (state.graph.latencySamples < 0)
     {
         error = "Graph latency cannot be negative";
+        return false;
+    }
+    if (state.graph.physicalCircuitJson.size() > 1024U * 1024U)
+    {
+        error = "Physical circuit state exceeds the 1 MiB safety limit";
         return false;
     }
     for (const auto& path : state.assets.relativePaths)

@@ -16,7 +16,7 @@ Simple controls cross the thread boundary through `RuntimeParameters` atomics. L
 
 ## State activation
 
-Project files use schema version 1 and contain `applicationVersion`, `engine`, `device`, `graph`, `ui`, and `assets`. Deserialization follows this order:
+Project files use schema version 2 and contain `applicationVersion`, `engine`, `device`, `graph`, `ui`, and `assets`. The graph section now persists the complete selected physical-circuit JSON in addition to latency and enabled state. Deserialization follows this order:
 
 1. Parse JSON without changing live state.
 2. Reject unknown future schema versions.

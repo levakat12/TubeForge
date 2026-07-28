@@ -11,31 +11,81 @@ on:
 jobs:
   windows-vst3:
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ml/pyproject.toml
+      - name: Install ML package
+        run: python -m pip install -e ml
+      - name: Audit Python runtime dependencies
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit --requirement ml/requirements-audit.txt
       - name: Configure
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
       - name: Build VST3, standalone, and tests
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --config ${{ matrix.configuration }} --parallel
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: |
+          New-Item -ItemType Directory -Force build/test-results | Out-Null
+          ctest --test-dir build -C ${{ matrix.configuration }} --output-on-failure --output-junit build/test-results/ctest-${{ matrix.configuration }}.xml
+      - name: Capture Release benchmark reports
+        if: matrix.configuration == 'Release'
+        run: |
+          & build/nts_dsp_benchmarks_artefacts/Release/nts_dsp_benchmarks.exe 2>&1 | Tee-Object build/test-results/dsp-benchmarks.txt
+          & build/Release/nts_ml_runtime_benchmarks.exe 2>&1 | Tee-Object build/test-results/ml-runtime-benchmarks.txt
+      - name: Stage reproducible release bundle
+        if: matrix.configuration == 'Release'
+        run: cmake --build build --config Release --target nts_release_bundle --parallel
+      - name: Install Inno Setup
+        if: matrix.configuration == 'Release'
+        run: choco install innosetup --no-progress -y
+      - name: Build unsigned CI installer
+        if: matrix.configuration == 'Release'
+        run: ./packaging/windows/build-installer.ps1 -BuildDirectory build -Configuration Release
       - name: Configure ASIO compile validation
+        if: matrix.configuration == 'Release'
         run: cmake -S . -B build-asio -G "Visual Studio 17 2022" -A x64 -DTUBEFORGE_ENABLE_ASIO=ON -DFETCHCONTENT_SOURCE_DIR_JUCE="${{ github.workspace }}/build/_deps/juce-src"
       - name: Compile ASIO-enabled standalone and probe (not packaged)
+        if: matrix.configuration == 'Release'
         run: cmake --build build-asio --config Release --target nts_standalone nts_asio_tests --parallel
       - name: Test ASIO registration
+        if: matrix.configuration == 'Release'
         run: ctest --test-dir build-asio -C Release -R nts_asio_tests --output-on-failure
-      - name: Upload VST3
+      - name: Upload test report
         uses: actions/upload-artifact@v4
         with:
-          name: TubeForge-Windows-VST3
-          path: build/TubeForge_artefacts/Release/VST3/TubeForge.vst3
-      - name: Upload standalone
+          name: TubeForge-${{ matrix.configuration }}-Test-Report
+          path: build/test-results
+      - name: Upload Debug binaries
+        if: matrix.configuration == 'Debug'
         uses: actions/upload-artifact@v4
         with:
-          name: TubeForge-Windows-Standalone
-          path: build/nts_standalone_app_artefacts/Release/TubeForge.exe
+          name: TubeForge-Windows-Debug
+          path: |
+            build/TubeForge_artefacts/Debug/VST3/TubeForge.vst3
+            build/nts_standalone_app_artefacts/Debug/TubeForge.exe
+            build/**/*.pdb
+      - name: Upload staged Release and symbols
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TubeForge-Windows-Release-Bundle
+          path: build/release/TubeForge-0.10.0-Windows-x64
+      - name: Upload unsigned CI installer
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TubeForge-Windows-Unsigned-CI-Installer
+          path: build/release/installer/TubeForge-0.10.0-Windows-x64.exe
 
   windows-hour-soak:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

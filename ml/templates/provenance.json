@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "takes": [
+    {
+      "takeId": "take-0001",
+      "performanceId": "replace-with-stable-performance-id",
+      "category": "clean-guitar-arpeggio",
+      "creator": "performer or rights holder",
+      "licenseId": "signed-performer-release-v1",
+      "licenseUri": "https://replace-with-license-or-release-reference.invalid",
+      "releaseDocument": "releases/performer-release.pdf",
+      "rightsCleared": false,
+      "synthetic": false,
+      "inputSha256": "replace-with-lowercase-sha256"
+    }
+  ]
+}

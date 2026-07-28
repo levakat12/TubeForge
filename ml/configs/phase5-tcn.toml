@@ -1,0 +1,31 @@
+[model]
+type = "causal_tcn"
+hidden_size = 16
+layers = 5
+kernel_size = 3
+conditioning = "concatenate"
+residual = true
+
+[data]
+sample_rate = 48000
+chunk_samples = 4096
+history_samples = 2048
+
+[training]
+batch_size = 4
+optimizer = "adamw"
+learning_rate = 0.0005
+weight_decay = 0.0001
+epochs = 20
+seed = 506
+
+[loss]
+time_l1 = 1.0
+time_l2 = 0.0
+pre_emphasis = 0.1
+multi_resolution_stft = 0.5
+spectral_convergence = 0.0
+dc_penalty = 0.05
+loudness_difference = 0.0
+silence_stability = 0.05
+transient_weighted = 0.05

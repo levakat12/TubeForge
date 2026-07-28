@@ -1,4 +1,5 @@
 #include "TestHarness.h"
+#include "AudioInputRouting.h"
 
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_gui_basics/juce_gui_basics.h>
@@ -223,5 +224,15 @@ int main()
     TestHarness tests;
     testNoDeviceStartup(tests);
     testDeviceConfigurationAndRecovery(tests);
+    const auto inputOne = nts::standalone::inputChannelsForRouting(1, 2);
+    const auto inputTwo = nts::standalone::inputChannelsForRouting(2, 2);
+    const auto stereo = nts::standalone::inputChannelsForRouting(
+        nts::standalone::stereoInputRoutingId, 2);
+    tests.expect(inputOne.countNumberOfSetBits() == 1 && inputOne[0] && ! inputOne[1],
+                 "mono input 1 routing excludes the noisy second hardware input");
+    tests.expect(inputTwo.countNumberOfSetBits() == 1 && ! inputTwo[0] && inputTwo[1],
+                 "mono input 2 routing selects only the second hardware input");
+    tests.expect(stereo.countNumberOfSetBits() == 2 && stereo[0] && stereo[1],
+                 "stereo routing explicitly enables both hardware inputs");
     return tests.result();
 }

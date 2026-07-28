@@ -241,6 +241,8 @@ void TubeForgeAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     currentSampleRate = sampleRate;
     currentBlockSize = samplesPerBlock;
     absoluteSamplePosition = 0;
+    inputSnapshot.setSize(std::max(1, getTotalNumInputChannels()), std::max(1, samplesPerBlock),
+                          false, true, false);
     engine.prepare(sampleRate,
                    static_cast<std::size_t>(samplesPerBlock),
                    static_cast<std::size_t>(getTotalNumInputChannels()),
@@ -307,6 +309,14 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     std::array<float*, maximumChannels> outputs {};
     const auto inputCount = std::min(getTotalNumInputChannels(), static_cast<int>(maximumChannels));
     const auto outputCount = std::min(getTotalNumOutputChannels(), static_cast<int>(maximumChannels));
+
+    // Snapshot the input before the amplifier overwrites the buffer in place. The
+    // engine still processes the buffer itself, so the audio path is unchanged;
+    // the copy exists only to recover a true input level for metering below.
+    const auto snapshotChannels = std::min(inputCount, inputSnapshot.getNumChannels());
+    const auto snapshotSamples = std::min(buffer.getNumSamples(), inputSnapshot.getNumSamples());
+    for (int channel = 0; channel < snapshotChannels; ++channel)
+        inputSnapshot.copyFrom(channel, 0, buffer, channel, 0, snapshotSamples);
 
     for (int channel = 0; channel < inputCount; ++channel)
         inputs[static_cast<std::size_t>(channel)] = buffer.getReadPointer(channel);
@@ -377,6 +387,17 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
 
     diagnostics.verifySampleRate(context.sampleRate, absoluteSamplePosition);
     engine.process(context);
+
+    // The engine meters the buffer it was handed, which the amplifier has already
+    // written to, so its input peaks are really post-amplifier levels. Republish
+    // them from the untouched snapshot and keep the output peaks it just measured.
+    for (int channel = 0; channel < snapshotChannels; ++channel)
+    {
+        const auto index = static_cast<std::size_t>(channel);
+        meters.publish(index, inputSnapshot.getMagnitude(channel, 0, snapshotSamples),
+                       meters.outputPeak(index));
+    }
+
     diagnostics.endCallback(startedAt, static_cast<std::uint32_t>(buffer.getNumSamples()), absoluteSamplePosition);
     const auto assistantOutputMeasurement = measureBuffer(buffer);
     nts::assistant::AudioSummaryFrame assistantFrame;

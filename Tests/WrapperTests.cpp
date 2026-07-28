@@ -32,6 +32,30 @@ void testProcessorStateAndAudio(TestHarness& tests)
             finite = finite && std::isfinite(buffer.getSample(channel, sample));
     tests.expect(finite, "JUCE wrapper processes a valid block");
 
+    {
+        // The amplifier writes the host buffer in place, so the input meter has to
+        // come from a snapshot taken first. A quiet input driven into a loud amp
+        // setting is the case where reading the processed buffer is visibly wrong.
+        auto* gainParameter = processor.getParameters().getParameter("gain");
+        if (gainParameter != nullptr)
+            gainParameter->setValueNotifyingHost(gainParameter->convertTo0to1(9.5f));
+
+        constexpr auto quietInput = 0.02f;
+        juce::AudioBuffer<float> quiet(2, 32);
+        for (int block = 0; block < 8; ++block)
+        {
+            for (int channel = 0; channel < quiet.getNumChannels(); ++channel)
+                for (int sample = 0; sample < quiet.getNumSamples(); ++sample)
+                    quiet.setSample(channel, sample, quietInput);
+            processor.processBlock(quiet, midi);
+        }
+
+        const auto reportedInput = std::max(processor.meterState().inputPeak(0),
+                                            processor.meterState().inputPeak(1));
+        tests.expectNear(reportedInput, quietInput, 1.0e-4,
+                         "input meter reports the pre-amplifier level");
+    }
+
     tests.expect(static_cast<juce::AudioProcessor&>(processor).getParameters().size() >= 28,
                  "wrapper exposes simple and advanced traditional-amp controls");
     auto allAutomatable = true;

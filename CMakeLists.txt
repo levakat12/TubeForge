@@ -421,7 +421,7 @@ if(TUBEFORGE_BUILD_TESTS)
     juce_add_console_app(nts_soak_tests PRODUCT_NAME "TubeForge Soak Tests")
     target_sources(nts_soak_tests PRIVATE Tests/SoakTests.cpp)
     target_include_directories(nts_soak_tests PRIVATE Tests)
-    target_link_libraries(nts_soak_tests PRIVATE nts_audio_core)
+    target_link_libraries(nts_soak_tests PRIVATE nts_audio_core nts_amp)
 
     juce_add_console_app(nts_dsp_tests PRODUCT_NAME "TubeForge DSP Tests")
     target_sources(nts_dsp_tests PRIVATE Tests/DspTests.cpp)

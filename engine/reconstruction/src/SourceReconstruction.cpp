@@ -58,6 +58,23 @@ float sampleAt(const std::vector<float>& values, std::size_t index) noexcept
     return index < values.size() ? values[index] : 0.0f;
 }
 
+/** Leakage severity from the target-to-interferer ratio, in dB.
+
+    This used to be `clamp01(interfererRms / targetRms)`, which saturates the moment
+    the interferer reaches the target's level. Every region from "slightly leaky" to
+    "hopeless" therefore scored exactly 1.0, and region ranking lost its ordering in
+    precisely the range where the choice between regions matters. Mapping a 30 dB
+    window keeps the whole span ordered: +12 dB of separation or better reads as
+    clean, -18 dB or worse as unusable, and the existing 0.55 warning threshold
+    still lands at a sensible -4.5 dB.
+*/
+float leakageSeverity(float targetRms, float interfererRms) noexcept
+{
+    constexpr float cleanSeparationDb = 12.0f;
+    constexpr float severityRangeDb = 30.0f;
+    return clamp01((cleanSeparationDb - (db(targetRms) - db(interfererRms))) / severityRangeDb);
+}
+
 float correlationRange(const StereoAudio& audio, std::size_t begin, std::size_t end) noexcept
 {
     if (audio.right.empty() || end <= begin) return 1.0f;
@@ -280,6 +297,21 @@ struct CandidatePoint
     float driveOffset {};
 };
 
+/** Centres a search axis so a whole grid of steps stays inside 0..1.
+
+    `clamp01(base + step)` folds every step that runs past a rail onto the rail
+    itself. A reference measured at full brightness therefore collapsed the entire
+    brightness axis to a single value, and the shortlist handed the user several
+    identical rigs — the exact failure the mixed-radix indexing below was meant to
+    end. Pulling the centre `span` away from each rail keeps every step distinct
+    while moving the search centre by at most that same span, which the refinement
+    pass can walk back if the rail really was the right answer.
+*/
+float gridCentre(float base, float span) noexcept
+{
+    return std::clamp(base, span, 1.0f - span);
+}
+
 /** Maps a coarse variant index onto a point.
 
     Topology varies fastest so both voicings are covered within a small pool, then
@@ -298,10 +330,10 @@ CandidatePoint coarsePoint(const nts::tone::ToneReport& report, std::size_t vari
     CandidatePoint point;
     point.topology = topologyStep == 0 ? nts::amp::Topology::tightModern
                                        : nts::amp::Topology::vintageBloom;
-    point.gain = clamp01(report.gain.value + offset);
-    point.brightness = clamp01(report.brightness.value - offset * 0.5f
+    point.gain = clamp01(gridCentre(report.gain.value, 0.12f) + offset);
+    point.brightness = clamp01(gridCentre(report.brightness.value, 0.12f) - offset * 0.5f
                                + static_cast<float>(brightnessStep) * 0.06f);
-    point.tightness = clamp01(report.tightness.value + offset * 0.3f
+    point.tightness = clamp01(gridCentre(report.tightness.value, 0.096f) + offset * 0.3f
                               + static_cast<float>(tightnessStep) * 0.06f);
     point.driveOffset = offset;
     return point;
@@ -568,8 +600,8 @@ std::vector<RegionQuality> scoreRegions(const StemSet& stems, TargetInstrument t
         const auto vocalRms = 0.5f * (rmsRange(stems.vocals.left, begin, end) + rmsRange(stems.vocals.right, begin, end));
         const auto drumRms = 0.5f * (rmsRange(stems.drums.left, begin, end) + rmsRange(stems.drums.right, begin, end));
         quality.targetEnergy = clamp01((db(targetRms) + 60.0f) / 48.0f);
-        quality.vocalLeakage = clamp01(vocalRms / std::max(targetRms, 1.0e-6f));
-        quality.drumLeakage = clamp01(drumRms / std::max(targetRms, 1.0e-6f));
+        quality.vocalLeakage = leakageSeverity(targetRms, vocalRms);
+        quality.drumLeakage = leakageSeverity(targetRms, drumRms);
         quality.stereoStability = clamp01((correlationRange(targetAudio, begin, end) + 1.0f) * 0.5f);
         std::size_t clipped {}, crossings {};
         double tailCorrelation = 0.0, tailEnergy = 0.0;

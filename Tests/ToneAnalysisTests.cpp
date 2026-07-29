@@ -69,6 +69,33 @@ int main()
     std::vector<float> silence(static_cast<std::size_t>(sampleRate));
     tests.expect(!analyzer.analyze({ silence, {}, sampleRate }).success, "silence is rejected");
 
+    // Residual drum leakage is loud but sparse in time, so it survives an averaged
+    // spectrum and dies in a per-bin median. Run at the pipeline's own rate, where
+    // the analysis window is short relative to a backbeat.
+    {
+        constexpr double leakRate = 48000.0;
+        const auto leakSamples = static_cast<std::size_t>(leakRate * 3.0);
+        const auto sustained = render(leakSamples, leakRate, 110.0, 0.40f, 3.0f);
+        auto leaked = sustained;
+        for (std::size_t index = 0; index < leaked.size(); ++index)
+        {
+            const auto time = static_cast<double>(index) / leakRate;
+            const auto beat = std::fmod(time, 0.5);
+            if (beat < 0.03)
+                leaked[index] += static_cast<float>(0.5 * std::exp(-beat * 120.0)
+                    * std::sin(2.0 * std::numbers::pi * 3800.0 * time));
+        }
+        const auto sustainedResult = analyzer.analyze({ sustained, {}, leakRate, SourceType::isolatedStem, 1.0f });
+        const auto leakedResult = analyzer.analyze({ leaked, {}, leakRate, SourceType::isolatedStem, 1.0f });
+        tests.expect(sustainedResult.success && leakedResult.success, "leakage comparison clips analyze");
+        tests.expect(std::abs(sustainedResult.report.brightness.value
+                              - leakedResult.report.brightness.value) < 0.06f,
+                     "sparse percussive leakage barely moves the brightness descriptor");
+        tests.expect(std::abs(sustainedResult.features.spectral.highFrequencyRolloff
+                              - leakedResult.features.spectral.highFrequencyRolloff) < 0.06f,
+                     "sparse percussive leakage barely moves the high-frequency rolloff");
+    }
+
     auto contaminatedRight = cleanA;
     for (std::size_t index = 0; index < contaminatedRight.size(); ++index)
         contaminatedRight[index] += 0.15f * static_cast<float>(std::sin(

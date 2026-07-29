@@ -96,6 +96,7 @@ target_link_libraries(nts_tone_analysis PUBLIC nts_dsp juce::juce_core)
 
 add_library(nts_reconstruction STATIC
     engine/reconstruction/src/SourceReconstruction.cpp
+    engine/reconstruction/src/StemRefinement.cpp
 )
 target_include_directories(nts_reconstruction PUBLIC engine/reconstruction/include)
 target_link_libraries(nts_reconstruction PUBLIC nts_amp nts_tone_analysis juce::juce_core)
@@ -149,6 +150,30 @@ juce_generate_juce_header(TubeForge)
 target_sources(TubeForge PRIVATE
     Source/PluginEditor.cpp
     Source/PluginEditor.h
+    Source/TubeForgeTheme.h
+    Source/TubeForgeLookAndFeel.cpp
+    Source/TubeForgeLookAndFeel.h
+    Source/ui/ModulePage.h
+    Source/ui/UiSupport.cpp
+    Source/ui/UiSupport.h
+    Source/ui/ShellWidgets.cpp
+    Source/ui/ShellWidgets.h
+    Source/ui/AmplifierPage.cpp
+    Source/ui/AmplifierPage.h
+    Source/ui/ToneShapingPage.cpp
+    Source/ui/ToneShapingPage.h
+    Source/ui/NeuralCapturePage.cpp
+    Source/ui/NeuralCapturePage.h
+    Source/ui/ToneAssistantPage.cpp
+    Source/ui/ToneAssistantPage.h
+    Source/ui/ProfileLibraryPage.cpp
+    Source/ui/ProfileLibraryPage.h
+    Source/ui/CircuitPage.cpp
+    Source/ui/CircuitPage.h
+    Source/ui/ToneAnalyzerPage.cpp
+    Source/ui/ToneAnalyzerPage.h
+    Source/ui/SongMatchPage.cpp
+    Source/ui/SongMatchPage.h
     Source/PluginProcessor.cpp
     Source/PluginProcessor.h
 )
@@ -218,6 +243,30 @@ target_sources(nts_standalone_app PRIVATE
     apps/standalone/Main.cpp
     Source/PluginEditor.cpp
     Source/PluginEditor.h
+    Source/TubeForgeTheme.h
+    Source/TubeForgeLookAndFeel.cpp
+    Source/TubeForgeLookAndFeel.h
+    Source/ui/ModulePage.h
+    Source/ui/UiSupport.cpp
+    Source/ui/UiSupport.h
+    Source/ui/ShellWidgets.cpp
+    Source/ui/ShellWidgets.h
+    Source/ui/AmplifierPage.cpp
+    Source/ui/AmplifierPage.h
+    Source/ui/ToneShapingPage.cpp
+    Source/ui/ToneShapingPage.h
+    Source/ui/NeuralCapturePage.cpp
+    Source/ui/NeuralCapturePage.h
+    Source/ui/ToneAssistantPage.cpp
+    Source/ui/ToneAssistantPage.h
+    Source/ui/ProfileLibraryPage.cpp
+    Source/ui/ProfileLibraryPage.h
+    Source/ui/CircuitPage.cpp
+    Source/ui/CircuitPage.h
+    Source/ui/ToneAnalyzerPage.cpp
+    Source/ui/ToneAnalyzerPage.h
+    Source/ui/SongMatchPage.cpp
+    Source/ui/SongMatchPage.h
     Source/PluginProcessor.cpp
     Source/PluginProcessor.h
 )
@@ -379,6 +428,30 @@ if(TUBEFORGE_BUILD_TESTS)
         Tests/WrapperTests.cpp
         Source/PluginEditor.cpp
         Source/PluginEditor.h
+        Source/TubeForgeTheme.h
+        Source/TubeForgeLookAndFeel.cpp
+        Source/TubeForgeLookAndFeel.h
+        Source/ui/ModulePage.h
+        Source/ui/UiSupport.cpp
+        Source/ui/UiSupport.h
+        Source/ui/ShellWidgets.cpp
+        Source/ui/ShellWidgets.h
+        Source/ui/AmplifierPage.cpp
+        Source/ui/AmplifierPage.h
+        Source/ui/ToneShapingPage.cpp
+        Source/ui/ToneShapingPage.h
+        Source/ui/NeuralCapturePage.cpp
+        Source/ui/NeuralCapturePage.h
+        Source/ui/ToneAssistantPage.cpp
+        Source/ui/ToneAssistantPage.h
+        Source/ui/ProfileLibraryPage.cpp
+        Source/ui/ProfileLibraryPage.h
+        Source/ui/CircuitPage.cpp
+        Source/ui/CircuitPage.h
+        Source/ui/ToneAnalyzerPage.cpp
+        Source/ui/ToneAnalyzerPage.h
+        Source/ui/SongMatchPage.cpp
+        Source/ui/SongMatchPage.h
         Source/PluginProcessor.cpp
         Source/PluginProcessor.h
     )

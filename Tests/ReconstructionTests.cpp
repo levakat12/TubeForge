@@ -1,6 +1,7 @@
 #include "TestHarness.h"
 
 #include <nts/reconstruction/SourceReconstruction.h>
+#include <nts/reconstruction/StemRefinement.h>
 #include <juce_core/juce_core.h>
 
 #include <algorithm>
@@ -89,6 +90,66 @@ int main()
     const auto sparseRegions = scoreRegions(sparseNeuralStems, TargetInstrument::guitar, 2.0, 1.0);
     tests.expect(! sparseRegions.empty(),
                  "region scoring accepts a target-only neural stem set without indexing absent stems");
+
+    {
+        // Two known, near-orthogonal sources let the leakage in a stem be read off
+        // directly as its projection onto the source it should not contain.
+        constexpr double refineRate = 16000.0;
+        const auto refineSamples = static_cast<std::size_t>(refineRate * 4.0);
+        std::vector<float> trueGuitar(refineSamples), trueDrums(refineSamples);
+        for (std::size_t index = 0; index < refineSamples; ++index)
+        {
+            const auto time = static_cast<double>(index) / refineRate;
+            trueGuitar[index] = static_cast<float>(0.30 * std::sin(2.0 * std::numbers::pi * 220.0 * time));
+            trueDrums[index] = static_cast<float>(0.45 * std::exp(-std::fmod(time, 0.5) * 90.0)
+                                                  * std::sin(2.0 * std::numbers::pi * 3137.0 * time));
+        }
+        StereoAudio mixture; mixture.sampleRate = refineRate;
+        mixture.left.resize(refineSamples); mixture.right.resize(refineSamples);
+        StemSet leaky; leaky.success = true;
+        leaky.guitar.sampleRate = leaky.drums.sampleRate = refineRate;
+        leaky.guitar.left.resize(refineSamples); leaky.guitar.right.resize(refineSamples);
+        leaky.drums.left.resize(refineSamples); leaky.drums.right.resize(refineSamples);
+        for (std::size_t index = 0; index < refineSamples; ++index)
+        {
+            mixture.left[index] = mixture.right[index] = trueGuitar[index] + trueDrums[index];
+            leaky.guitar.left[index] = leaky.guitar.right[index] = trueGuitar[index] + 0.5f * trueDrums[index];
+            leaky.drums.left[index] = leaky.drums.right[index] = trueDrums[index] + 0.5f * trueGuitar[index];
+        }
+        const auto coefficient = [](const std::vector<float>& stem, const std::vector<float>& source)
+        {
+            return std::inner_product(stem.begin(), stem.end(), source.begin(), 0.0)
+                / std::max(1.0e-12, energy(source));
+        };
+        const auto leakageOf = [&coefficient, &trueGuitar, &trueDrums](const std::vector<float>& stem)
+        {
+            return std::abs(coefficient(stem, trueDrums))
+                / std::max(1.0e-9, std::abs(coefficient(stem, trueGuitar)));
+        };
+        const auto leakageBefore = leakageOf(leaky.guitar.left);
+        auto refined = leaky;
+        StemRefinementOptions refineOptions;
+        refineOptions.fftSize = 1024; refineOptions.hopSize = 256;
+        const auto refineReport = refineStems(refined, mixture, refineOptions);
+        tests.expect(refineReport.applied && refineReport.stemsRefined == 2,
+                     "Wiener refinement runs over every aligned stem");
+        tests.expect(leakageOf(refined.guitar.left) < leakageBefore * 0.6,
+                     "re-partitioning the mixture strips drum leakage out of the guitar stem");
+        tests.expect(refined.guitar.left.size() == refineSamples
+                     && refined.drums.right.size() == refineSamples,
+                     "refinement rewrites stems in place without changing their length");
+        tests.expect(refined.bass.left.empty() && refined.other.left.empty(),
+                     "stems the backend never produced are not fabricated");
+
+        StemSet singleStem; singleStem.success = true; singleStem.guitar = leaky.guitar;
+        tests.expect(! refineStems(singleStem, mixture, refineOptions).applied,
+                     "a lone stem has nothing to be re-partitioned against");
+        std::stop_source refineStopper; refineStopper.request_stop();
+        auto cancelledRefinement = leaky;
+        tests.expect(! refineStems(cancelledRefinement, mixture, refineOptions, {},
+                                   refineStopper.get_token()).applied,
+                     "refinement observes cancellation");
+    }
     const auto mid = applyStereoMode(guitar, StereoMode::mid);
     const auto side = applyStereoMode(guitar, StereoMode::side);
     const auto panned = applyStereoMode(guitar, StereoMode::pannedEstimate);

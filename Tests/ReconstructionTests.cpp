@@ -7,6 +7,7 @@
 #include <cmath>
 #include <numbers>
 #include <numeric>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -230,6 +231,45 @@ int main()
                     && candidate.rigPreset.parameters.stages[stage].oversamplingFactor > 1;
         tests.expect(oversampled,
                      "candidates are scored and returned with anti-aliased preamp stages");
+
+        // Refinement searches around the coarse winner, so it must not come back
+        // worse than the coarse grid. Comparing a larger shortlist against a
+        // smaller one from the same reference checks the ranking stays coherent.
+        const auto single = reconstructor.reconstruct(reference, di, sampleRate, 1);
+        tests.expect(single.success && ! single.candidates.empty(),
+                     "rig search returns a best candidate: " + single.error);
+        if (single.success && ! single.candidates.empty() && ! shortlist.candidates.empty())
+        {
+            const auto rank = [](const RigCandidate& value)
+            {
+                return value.toneSimilarity * 0.7f + value.recordingSimilarity * 0.3f
+                     - value.complexityPenalty;
+            };
+            tests.expect(rank(single.candidates.front()) >= rank(shortlist.candidates.front()) - 1.0e-4f,
+                         "the top candidate is the best the search found");
+        }
+
+        // Progress has to finish at 1 even though refinement can stop early and
+        // leave the render count short of its upper bound.
+        float lastFraction = -1.0f;
+        auto monotonic = true;
+        const auto tracked = reconstructor.reconstruct(reference, di, sampleRate, 2,
+            [&](const SeparationProgress& update)
+            {
+                monotonic = monotonic && update.fraction >= lastFraction - 1.0e-4f;
+                lastFraction = update.fraction;
+                return true;
+            });
+        tests.expect(tracked.success, "tracked reconstruction succeeds: " + tracked.error);
+        tests.expect(monotonic, "reconstruction progress never moves backwards");
+        tests.expectNear(lastFraction, 1.0, 1.0e-4, "reconstruction progress finishes at one");
+
+        std::stop_source stopper;
+        stopper.request_stop();
+        const auto cancelledRun = reconstructor.reconstruct(reference, di, sampleRate, 2, {},
+                                                            stopper.get_token());
+        tests.expect(! cancelledRun.success && ! cancelledRun.error.empty(),
+                     "an already-cancelled search stops instead of rendering");
     }
     const auto serialized = serializeResult(reconstruction);
     const auto parsed = juce::JSON::parse(juce::String::fromUTF8(serialized.c_str()));

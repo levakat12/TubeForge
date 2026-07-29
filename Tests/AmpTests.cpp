@@ -99,7 +99,8 @@ void testPreampStages(TestHarness& tests)
     stage.process(channels, 2, blockSize); const auto first = left;
     tests.expect(std::abs(stage.configuration().bias) <= 0.8f
                  && std::abs(stage.biasState(0)) <= 0.8f, "preamp bias and memory state remain bounded");
-    tests.expect(stage.latencySamples() == 8, "preamp exposes selected oversampling latency");
+    tests.expect(stage.latencySamples() == nts::dsp::antiAliasTapsPerPhase,
+                 "preamp exposes selected oversampling latency");
     stage.reset(); left = sine(blockSize, 440.0, 0.8f); right = left;
     channels[0] = left.data(); channels[1] = right.data();
     stage.process(channels, 2, blockSize);
@@ -127,6 +128,51 @@ void testPreampStages(TestHarness& tests)
     stage.process(afterChannel, 1, blockSize);
     tests.expect(std::abs(afterAutomation.front() - beforeAutomation.back()) < 0.8f,
                  "preamp gain automation is ramped without an unbounded discontinuity");
+
+    // Aliasing check. A 3350 Hz tone driven hard puts its 14th harmonic at
+    // 46900 Hz, which folds back to 1100 Hz when the stage runs without
+    // oversampling. Nothing else in the chain can put energy there: the input is
+    // a pure tone, so harmonic products only ever land on multiples of 3350 Hz.
+    // That makes the level at 1100 Hz a direct measurement of fold-back.
+    constexpr auto probeHz = 3350.0;
+    constexpr auto aliasHz = 1100.0;
+    constexpr std::size_t aliasSamples = 8192;
+
+    const auto aliasEnergyAt = [&](int oversamplingFactor)
+    {
+        nts::amp::ResponsivePreampStage aliasStage;
+        aliasStage.prepare({ sampleRate, aliasSamples, 1 });
+        nts::amp::PreampStageConfig aliasConfig;
+        aliasConfig.driveDb = 30.0f;
+        aliasConfig.highCutHz = 20000.0f;
+        aliasConfig.oversamplingFactor = oversamplingFactor;
+        // Only the time-varying behaviour is disabled. Bias drift, memory, attack
+        // reduction, and dynamic saturation modulate the waveform at low
+        // frequency, which puts energy near 1100 Hz that is not fold-back.
+        // Static asymmetry is kept deliberately: a symmetric shaper produces only
+        // odd harmonics, and the 14th harmonic this probe relies on is even.
+        aliasConfig.asymmetry = 0.3f;
+        aliasConfig.bias = 0.05f;
+        aliasConfig.dynamicBias = 0.0f;
+        aliasConfig.frequencySaturation = 0.0f;
+        aliasConfig.attackReduction = 0.0f;
+        aliasConfig.memoryAmount = 0.0f;
+        aliasStage.setConfig(aliasConfig, 0);
+        aliasStage.reset();
+        auto signal = sine(aliasSamples, probeHz, 0.7f);
+        float* channel[] { signal.data() };
+        aliasStage.process(channel, 1, aliasSamples);
+        // Skip the filter warm-up so the measurement is steady state.
+        return magnitude(std::span(signal).subspan(1024), aliasHz);
+    };
+
+    // Measured rejection at the shipped 8 taps per phase is about -30 dB
+    // (ratio 0.033). The bound is set well clear of that so the test asserts a
+    // real effect without tracking platform-to-platform arithmetic noise.
+    const auto aliasAt1x = aliasEnergyAt(1);
+    const auto aliasAt4x = aliasEnergyAt(4);
+    tests.expect(aliasAt4x < aliasAt1x * 0.15,
+                 "4x oversampling suppresses preamp fold-back that 1x leaves in the band");
 }
 
 void testTonePhaseAndPower(TestHarness& tests)

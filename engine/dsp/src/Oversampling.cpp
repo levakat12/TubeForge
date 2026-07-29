@@ -60,7 +60,7 @@ void Oversampler::designFilter()
     coefficients.clear();
     if (oversamplingFactor == 1)
         return;
-    const auto length = 8 * oversamplingFactor + 1;
+    const auto length = antiAliasTapsPerPhase * oversamplingFactor + 1;
     coefficients.resize(length);
     const auto midpoint = static_cast<double>(length - 1) * 0.5;
     const auto cutoff = 0.46 / static_cast<double>(oversamplingFactor);

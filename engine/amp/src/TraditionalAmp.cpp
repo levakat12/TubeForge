@@ -499,7 +499,8 @@ float ResponsivePreampStage::biasState(std::size_t channel) const noexcept
 }
 std::size_t ResponsivePreampStage::latencySamples() const noexcept
 {
-    return config.oversamplingFactor == 1 ? 0 : 8;
+    // Base-rate group delay of the anti-alias pair, which is the taps per phase.
+    return config.oversamplingFactor == 1 ? 0 : dsp::antiAliasTapsPerPhase;
 }
 
 void ToneStack::prepare(const dsp::ProcessSpec& newSpec) noexcept
@@ -892,8 +893,17 @@ void TraditionalAmpProcessor::reset() noexcept
 }
 void TraditionalAmpProcessor::setParameters(const AmpParameters& parameters) noexcept
 {
+    // A change of oversampling factor swaps in a different polyphase filter whose
+    // delay lines hold unrelated state, so it has to cross-fade like any other
+    // discrete change rather than switching under the signal.
+    auto oversamplingChanged = false;
+    for (std::size_t index = 0; index < parameters.stages.size(); ++index)
+        oversamplingChanged = oversamplingChanged
+            || parameters.stages[index].oversamplingFactor
+                   != requestedParameters.stages[index].oversamplingFactor;
     const auto discreteChanged = parameters.instrument != requestedParameters.instrument
-                              || parameters.topology != requestedParameters.topology;
+                              || parameters.topology != requestedParameters.topology
+                              || oversamplingChanged;
     requestedParameters = parameters;
     if (discreteChanged)
     {

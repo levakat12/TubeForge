@@ -1453,8 +1453,13 @@ juce::Result TubeForgeAudioProcessor::applyTonePackage(const juce::String& packa
     setParameterValue(parameterState, ParameterIds::highCut, p.preEq.highCutHz);
     setParameterValue(parameterState, ParameterIds::tightness, p.preEq.tightness * 10.0f);
     setParameterValue(parameterState, ParameterIds::pickEmphasis, p.preEq.pickEmphasisDb);
-    const auto factor = p.stages[0].oversamplingFactor;
-    setParameterValue(parameterState, ParameterIds::oversampling, factor >= 8 ? 3.0f : factor >= 4 ? 2.0f : factor >= 2 ? 1.0f : 0.0f);
+    // Loading a preset must not silently drop the user out of Auto; Auto already
+    // resolves the factor from the preset's own drive settings.
+    if (static_cast<int>(valueOf(parameterState, ParameterIds::oversampling)) != automaticOversamplingIndex)
+    {
+        const auto factor = p.stages[0].oversamplingFactor;
+        setParameterValue(parameterState, ParameterIds::oversampling, factor >= 8 ? 3.0f : factor >= 4 ? 2.0f : factor >= 2 ? 1.0f : 0.0f);
+    }
     setParameterValue(parameterState, ParameterIds::sag, p.powerAmp.sag * 100.0f);
     setParameterValue(parameterState, ParameterIds::feedback, p.powerAmp.feedback * 100.0f);
     setParameterValue(parameterState, ParameterIds::crossover, p.bass.crossoverHz);
@@ -1544,8 +1549,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout TubeForgeAudioProcessor::cre
     addFloat(ParameterIds::bias, "Stage bias", Range { -0.8f, 0.8f, 0.001f }, 0.0f);
     addFloat(ParameterIds::lowCut, "Pre low cut", Range { 20.0f, 500.0f, 1.0f, 0.4f }, 95.0f, "Hz");
     addFloat(ParameterIds::highCut, "Pre high cut", Range { 3000.0f, 22000.0f, 10.0f, 0.5f }, 16500.0f, "Hz");
+    // "Auto" is appended rather than inserted so the existing indices keep their
+    // meaning and saved projects and host automation stay valid.
     layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::oversampling, 1 }, "Oversampling",
-                                        juce::StringArray { "1x (minimum latency)", "2x", "4x", "8x" }, 0));
+                                        juce::StringArray { "1x (minimum latency)", "2x", "4x", "8x",
+                                                            "Auto (follows gain)" }, 4));
     addFloat(ParameterIds::sag, "Sag", Range { 0.0f, 100.0f, 0.1f }, 35.0f, "%");
     addFloat(ParameterIds::feedback, "Feedback", Range { 0.0f, 100.0f, 0.1f }, 35.0f, "%");
     addFloat(ParameterIds::crossover, "Bass crossover", Range { 60.0f, 500.0f, 1.0f, 0.5f }, 180.0f, "Hz");
@@ -1623,6 +1631,34 @@ bool TubeForgeAudioProcessor::applyProjectState(const nts::state::ProjectState& 
     return true;
 }
 
+int TubeForgeAudioProcessor::automaticOversamplingFactor(
+    const nts::amp::AmpParameters& parameters) const noexcept
+{
+    // Aliasing grows with how hard the cascade is driven, because a saturating
+    // stage generates harmonics far above Nyquist that fold back inaudibly high
+    // gain but audibly at high gain. Total stage drive is the cheapest honest
+    // proxy for that, so the factor follows it.
+    //
+    // 2x and 4x report identical latency (8 samples per oversampled stage), so
+    // the only boundary that can move reported latency is 1x, and that sits
+    // where the amp is genuinely clean and unlikely to be automated across.
+    auto cumulativeDriveDb = 0.0f;
+    const auto activeStages = std::min(parameters.stageCount, parameters.stages.size());
+    for (std::size_t stage = 0; stage < activeStages; ++stage)
+        cumulativeDriveDb += parameters.stages[stage].driveDb;
+
+    // Hysteresis, so a control resting on a boundary does not switch repeatedly.
+    constexpr auto margin = 4.0f;
+    const auto previous = autoOversamplingFactor.load(std::memory_order_relaxed);
+    const auto cleanCeiling = previous == 1 ? 6.0f : 6.0f - margin;
+    const auto drivenFloor = previous == 4 ? 30.0f - margin : 30.0f;
+
+    const auto factor = cumulativeDriveDb <= cleanCeiling ? 1
+                      : cumulativeDriveDb >= drivenFloor ? 4 : 2;
+    autoOversamplingFactor.store(factor, std::memory_order_relaxed);
+    return factor;
+}
+
 nts::amp::AmpParameters TubeForgeAudioProcessor::currentAmpParameters() const noexcept
 {
     const auto instrumentIndex = std::clamp(static_cast<int>(
@@ -1641,15 +1677,17 @@ nts::amp::AmpParameters TubeForgeAudioProcessor::currentAmpParameters() const no
     parameters.cabinet.bypass = valueOf(parameterState, ParameterIds::cabinet) < 0.5f;
     const std::array stageIds { ParameterIds::stage1, ParameterIds::stage2,
                                 ParameterIds::stage3, ParameterIds::stage4 };
-    const auto oversamplingIndex = std::clamp(static_cast<int>(
-        valueOf(parameterState, ParameterIds::oversampling)), 0, 3);
-    const auto oversamplingFactor = std::array { 1, 2, 4, 8 }[static_cast<std::size_t>(oversamplingIndex)];
     for (std::size_t stage = 0; stage < parameters.stages.size(); ++stage)
     {
         parameters.stages[stage].driveDb = valueOf(parameterState, stageIds[stage]) + simpleGainOffset;
         parameters.stages[stage].bias = valueOf(parameterState, ParameterIds::bias);
-        parameters.stages[stage].oversamplingFactor = oversamplingFactor;
     }
+    const auto oversamplingIndex = std::clamp(static_cast<int>(
+        valueOf(parameterState, ParameterIds::oversampling)), 0, automaticOversamplingIndex);
+    const auto oversamplingFactor = oversamplingIndex == automaticOversamplingIndex
+        ? automaticOversamplingFactor(parameters)
+        : std::array { 1, 2, 4, 8 }[static_cast<std::size_t>(oversamplingIndex)];
+    for (auto& stage : parameters.stages) stage.oversamplingFactor = oversamplingFactor;
     parameters.preEq.lowCutHz = valueOf(parameterState, ParameterIds::lowCut);
     parameters.preEq.highCutHz = valueOf(parameterState, ParameterIds::highCut);
     parameters.preEq.tightness = valueOf(parameterState, ParameterIds::tightness) * 0.1f;

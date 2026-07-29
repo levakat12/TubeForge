@@ -123,6 +123,13 @@ private:
                                   float plainValue);
     [[nodiscard]] nts::state::ProjectState makeProjectState() const;
     bool applyProjectState(const nts::state::ProjectState& state);
+    /** Index of the "Auto" entry in the oversampling choice list. Appended last so
+        the existing 1x/2x/4x/8x indices stay valid in saved projects.
+    */
+    static constexpr int automaticOversamplingIndex = 4;
+
+    [[nodiscard]] int automaticOversamplingFactor(
+        const nts::amp::AmpParameters& parameters) const noexcept;
     [[nodiscard]] nts::amp::AmpParameters currentAmpParameters() const noexcept;
     [[nodiscard]] nts::circuit::SimpleControls currentCircuitControls() const noexcept;
     [[nodiscard]] nts::circuit::CircuitGraphDescription currentCircuitGraph() const;
@@ -164,6 +171,8 @@ private:
     double currentSampleRate { 44100.0 };
     int currentBlockSize {};
     std::atomic<int> pendingOversamplingLatencySamples {};
+    // Last factor chosen by Auto, kept so the choice has hysteresis across blocks.
+    mutable std::atomic<int> autoOversamplingFactor { 4 };
     std::atomic<nts::diagnostics::AssetLoadStatus> neuralLoadStatus { nts::diagnostics::AssetLoadStatus::idle };
     mutable std::mutex neuralStatusMutex;
     std::string neuralStatusDetail { "No neural model loaded" };

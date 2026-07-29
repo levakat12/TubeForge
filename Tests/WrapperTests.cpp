@@ -14,8 +14,31 @@ void testProcessorStateAndAudio(TestHarness& tests)
     TubeForgeAudioProcessor processor;
     processor.setPlayConfigDetails(2, 2, 48000.0, 32);
     processor.prepareToPlay(48000.0, 32);
-    tests.expectEqual(processor.getLatencySamples(), 0,
-                      "wrapper defaults to zero algorithmic latency at 1x oversampling");
+
+    {
+        // Oversampling defaults to Auto, which follows total stage drive. The
+        // factory guitar patch is a four-stage cascade well into saturation, so
+        // the default must be oversampled: at 1x it aliases audibly.
+        auto* gainParameter = processor.getParameters().getParameter("gain");
+        tests.expect(gainParameter != nullptr, "gain parameter exists");
+        tests.expect(processor.getLatencySamples() > 0,
+                     "auto oversampling engages for the default high-gain patch");
+
+        if (gainParameter != nullptr)
+        {
+            gainParameter->setValueNotifyingHost(gainParameter->convertTo0to1(0.0f));
+            processor.prepareToPlay(48000.0, 32);
+            tests.expectEqual(processor.getLatencySamples(), 0,
+                              "auto oversampling drops to 1x when the amp is clean");
+
+            gainParameter->setValueNotifyingHost(gainParameter->convertTo0to1(10.0f));
+            processor.prepareToPlay(48000.0, 32);
+            tests.expect(processor.getLatencySamples() > 0,
+                         "auto oversampling re-engages at maximum gain");
+            gainParameter->setValueNotifyingHost(gainParameter->convertTo0to1(5.0f));
+            processor.prepareToPlay(48000.0, 32);
+        }
+    }
 
     juce::AudioBuffer<float> buffer(2, 32);
     juce::MidiBuffer midi;

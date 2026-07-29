@@ -209,12 +209,13 @@ private:
     juce::ImageComponent ampArtwork;
     std::array<juce::Label, 7> simpleLabels;
     std::array<juce::Slider, 7> simpleSliders;
-    std::array<juce::Label, 14> advancedLabels;
-    std::array<juce::Slider, 14> advancedSliders;
+    std::array<juce::Label, 19> advancedLabels;
+    std::array<juce::Slider, 19> advancedSliders;
     juce::ComboBox instrumentSelector;
     juce::ComboBox topologySelector;
     juce::ComboBox oversamplingSelector;
     juce::ToggleButton cabinetEnabled { "Cabinet enabled" };
+    juce::ToggleButton gateEnabled { "Noise gate" };
     juce::ComboBox engineModeSelector;
     juce::ComboBox neuralMonitorSelector;
     juce::ToggleButton neuralCompensation { "Apply bounded input compensation" };
@@ -238,6 +239,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> topologyAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> oversamplingAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> cabinetAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> gateAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> engineModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> neuralMonitorAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> neuralCompensationAttachment;

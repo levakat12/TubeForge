@@ -232,6 +232,13 @@ std::string serializePreset(const AmpPreset& preset, bool pretty)
            << ",\"targetRmsLowDb\":" << preset.calibration.targetRmsLowDb
            << ",\"targetRmsHighDb\":" << preset.calibration.targetRmsHighDb
            << ",\"targetPeakDb\":" << preset.calibration.targetPeakDb << "}," << newline
+           << indent << "\"gate\":{"
+           << "\"enabled\":" << (p.gateEnabled ? "true" : "false")
+           << ",\"thresholdDb\":" << p.gateThresholdDb
+           << ",\"depthDb\":" << p.gateDepthDb
+           << ",\"attackMs\":" << p.gateAttackMs
+           << ",\"holdMs\":" << p.gateHoldMs
+           << ",\"releaseMs\":" << p.gateReleaseMs << "}," << newline
            << indent << "\"preEq\":{"
            << "\"lowCutHz\":" << p.preEq.lowCutHz << ",\"highCutHz\":" << p.preEq.highCutHz
            << ",\"tightness\":" << p.preEq.tightness << ",\"pickEmphasisDb\":" << p.preEq.pickEmphasisDb
@@ -306,6 +313,14 @@ std::optional<AmpPreset> deserializePreset(std::string_view json)
     preset.calibration.targetRmsLowDb = numberOr(json, "targetRmsLowDb", preset.calibration.targetRmsLowDb);
     preset.calibration.targetRmsHighDb = numberOr(json, "targetRmsHighDb", preset.calibration.targetRmsHighDb);
     preset.calibration.targetPeakDb = numberOr(json, "targetPeakDb", preset.calibration.targetPeakDb);
+    // Absent in presets written before the gate was controllable, so each falls
+    // back to the constructed default and old files keep their previous sound.
+    p.gateEnabled = jsonBool(json, "enabled", p.gateEnabled);
+    p.gateThresholdDb = numberOr(json, "thresholdDb", p.gateThresholdDb);
+    p.gateDepthDb = numberOr(json, "depthDb", p.gateDepthDb);
+    p.gateAttackMs = numberOr(json, "attackMs", p.gateAttackMs);
+    p.gateHoldMs = numberOr(json, "holdMs", p.gateHoldMs);
+    p.gateReleaseMs = numberOr(json, "releaseMs", p.gateReleaseMs);
     p.preEq.lowCutHz = numberOr(json, "lowCutHz", p.preEq.lowCutHz);
     p.preEq.highCutHz = numberOr(json, "highCutHz", p.preEq.highCutHz);
     p.preEq.tightness = numberOr(json, "tightness", p.preEq.tightness);
@@ -768,8 +783,13 @@ void AmpVoice::setParameters(const AmpParameters& next) noexcept
     inputTrim.setTarget(dsp::dbToLinear(std::clamp(parameters.manualInputTrimDb, -24.0f, 24.0f)));
     outputGain.setTarget(dsp::dbToLinear(std::clamp(parameters.outputGainDb, -60.0f, 18.0f)));
     cleanBlend.setTarget(clamp01(parameters.bass.cleanBlend));
-    dsp::NoiseGateParameters gateParameters; gateParameters.thresholdDb = parameters.gateThresholdDb;
-    gateParameters.rangeDb = -80.0f; gate.setParameters(gateParameters);
+    dsp::NoiseGateParameters gateParameters;
+    gateParameters.thresholdDb = parameters.gateThresholdDb;
+    gateParameters.rangeDb = std::clamp(parameters.gateDepthDb, -90.0f, 0.0f);
+    gateParameters.attackMs = std::clamp(static_cast<double>(parameters.gateAttackMs), 0.1, 50.0);
+    gateParameters.holdMs = std::clamp(static_cast<double>(parameters.gateHoldMs), 0.0, 500.0);
+    gateParameters.releaseMs = std::clamp(static_cast<double>(parameters.gateReleaseMs), 5.0, 2000.0);
+    gate.setParameters(gateParameters);
     preEq.setParameters(parameters.preEq);
     for (std::size_t index = 0; index < stages.size(); ++index)
     {
@@ -814,7 +834,9 @@ void AmpVoice::process(float* const* channels, std::size_t channelCount, std::si
             dryBuffer[channel * spec.maximumBlockSize + sample] = channels[channel][sample];
         }
     }
-    gate.process(channels, count, processSamples);
+    // Bypassed rather than opened wide, so a disabled gate costs nothing and
+    // cannot colour the signal through its sidechain filter.
+    if (parameters.gateEnabled) gate.process(channels, count, processSamples);
     if (parameters.instrument == Instrument::bass)
     {
         std::array<const float*, dsp::maximumChannels> inputPointers {};

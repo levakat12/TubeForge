@@ -12,11 +12,16 @@ constexpr std::array simpleIds { "gain", "bass", "mid", "treble", "presence", "r
 constexpr std::array simpleNames { "Gain", "Bass", "Mid", "Treble", "Presence", "Resonance", "Master" };
 constexpr std::array advancedIds { "stage1", "stage2", "stage3", "stage4", "bias", "lowCut", "highCut",
                                    "sag", "feedback", "crossover", "cleanBlend", "cabinetAlignment",
-                                   "tightness", "pickEmphasis" };
+                                   "tightness", "pickEmphasis",
+                                   "gateThreshold", "gateDepth", "gateAttack", "gateHold", "gateRelease" };
 constexpr std::array advancedNames { "Stage 1 gain", "Stage 2 gain", "Stage 3 gain", "Stage 4 gain",
                                      "Bias", "Pre low cut", "Pre high cut", "Sag", "Feedback",
                                      "Bass crossover", "Clean blend", "Cab alignment", "Tightness",
-                                     "Pick emphasis" };
+                                     "Pick emphasis",
+                                     "Gate threshold", "Gate depth", "Gate attack", "Gate hold",
+                                     "Gate release" };
+static_assert(advancedIds.size() == advancedNames.size(),
+              "each advanced control needs a matching display name");
 
 juce::String statusName(nts::diagnostics::AssetLoadStatus status)
 {
@@ -659,6 +664,7 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     ampArtwork.toBack();
     advancedPage.addAndMakeVisible(topologySelector);
     advancedPage.addAndMakeVisible(oversamplingSelector);
+    advancedPage.addAndMakeVisible(gateEnabled);
     for (auto* component : std::initializer_list<juce::Component*> {
              &neuralMonitorSelector, &neuralCompensation,
              &loadNeuralModel, &neuralStatus, &neuralCalibration, &captureWizardHelp })
@@ -776,6 +782,8 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
         processor.getParameters(), "oversampling", oversamplingSelector);
     cabinetAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
         processor.getParameters(), "cabinet", cabinetEnabled);
+    gateAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor.getParameters(), "gateEnabled", gateEnabled);
     engineModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor.getParameters(), "engineMode", engineModeSelector);
     neuralMonitorAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
@@ -1002,7 +1010,10 @@ void TubeForgeAudioProcessorEditor::resized()
     auto advancedTop = advanced.removeFromTop(34);
     topologySelector.setBounds(advancedTop.removeFromLeft(220).reduced(4));
     oversamplingSelector.setBounds(advancedTop.removeFromLeft(150).reduced(4));
-    constexpr int advancedColumns = 3;
+    gateEnabled.setBounds(advancedTop.removeFromLeft(130).reduced(4, 2));
+    // Four columns rather than three: the gate controls took the advanced page to
+    // nineteen entries, and seven rows of them ran past the bottom of the page.
+    constexpr int advancedColumns = 4;
     const auto advancedRows = static_cast<int>((advancedSliders.size() + advancedColumns - 1) / advancedColumns);
     const auto advancedCellHeight = std::max(48, advanced.getHeight() / advancedRows);
     for (std::size_t index = 0; index < advancedSliders.size(); ++index)

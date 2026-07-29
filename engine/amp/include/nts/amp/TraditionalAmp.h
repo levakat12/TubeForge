@@ -148,7 +148,17 @@ struct AmpParameters
     PickupProfile pickup { PickupProfile::passive };
     Topology topology { Topology::tightModern };
     float manualInputTrimDb {};
+    /** The gate runs before the preamp, so anything it closes on is removed ahead
+        of 60-plus dB of gain. Every control is exposed rather than fixed: a gate
+        deep enough and fast enough to kill hum also truncates note decay, and
+        which side of that trade is right depends on the rig.
+    */
+    bool gateEnabled { true };
     float gateThresholdDb { -58.0f };
+    float gateDepthDb { -80.0f };
+    float gateAttackMs { 2.0f };
+    float gateHoldMs { 60.0f };
+    float gateReleaseMs { 250.0f };
     PreEqParameters preEq;
     std::array<PreampStageConfig, 4> stages {};
     std::size_t stageCount { 3 };

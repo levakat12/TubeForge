@@ -264,25 +264,58 @@ nts::tone::ToneProfile profile(std::string id, const nts::tone::ToneAnalysisResu
              "user-supplied reference; source audio excluded" };
 }
 
+/** One point in the rig search space.
+
+    Topology is part of the point rather than derived from tightness, so both
+    voicings can be rendered and compared instead of one being unreachable for a
+    given reference. The three scalars are absolute 0..1 positions, which lets the
+    refinement pass step around a coarse winner without re-deriving it.
+*/
+struct CandidatePoint
+{
+    nts::amp::Topology topology { nts::amp::Topology::tightModern };
+    float gain {};
+    float brightness {};
+    float tightness {};
+    float driveOffset {};
+};
+
+/** Maps a coarse variant index onto a point.
+
+    Topology varies fastest so both voicings are covered within a small pool, then
+    gain, then brightness and tightness. A single scalar offset taken as
+    `variant % 5` gave only five distinct rigs, so a pool of twelve rendered seven
+    exact duplicates; this mixed radix gives 2 x 5 x 3 x 3 = 90 unique points.
+*/
+CandidatePoint coarsePoint(const nts::tone::ToneReport& report, std::size_t variant)
+{
+    const auto topologyStep = variant % 2;
+    const auto gainStep = static_cast<int>((variant / 2) % 5) - 2;
+    const auto brightnessStep = static_cast<int>((variant / 10) % 3) - 1;
+    const auto tightnessStep = static_cast<int>((variant / 30) % 3) - 1;
+    const auto offset = static_cast<float>(gainStep) * 0.06f;
+
+    CandidatePoint point;
+    point.topology = topologyStep == 0 ? nts::amp::Topology::tightModern
+                                       : nts::amp::Topology::vintageBloom;
+    point.gain = clamp01(report.gain.value + offset);
+    point.brightness = clamp01(report.brightness.value - offset * 0.5f
+                               + static_cast<float>(brightnessStep) * 0.06f);
+    point.tightness = clamp01(report.tightness.value + offset * 0.3f
+                              + static_cast<float>(tightnessStep) * 0.06f);
+    point.driveOffset = offset;
+    return point;
+}
+
 void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneReport& report,
-                            std::size_t variant)
+                            const CandidatePoint& point)
 {
     auto& p = preset.parameters;
-    // Candidates are spread over three independent axes. A single scalar offset
-    // taken as `variant % 5` gave only five distinct rigs, so a pool of twelve
-    // rendered seven exact duplicates and the shortlist could return the same
-    // rig several times. Mixed radix over gain, brightness, and tightness gives
-    // 5 x 3 x 3 = 45 unique combinations before anything repeats.
-    const auto gainStep = static_cast<int>(variant % 5) - 2;
-    const auto brightnessStep = static_cast<int>((variant / 5) % 3) - 1;
-    const auto tightnessStep = static_cast<int>((variant / 15) % 3) - 1;
-    const auto offset = static_cast<float>(gainStep) * 0.06f;
-    const auto gain = clamp01(report.gain.value + offset);
-    const auto brightness = clamp01(report.brightness.value - offset * 0.5f
-                                    + static_cast<float>(brightnessStep) * 0.06f);
-    const auto tightness = clamp01(report.tightness.value + offset * 0.3f
-                                   + static_cast<float>(tightnessStep) * 0.06f);
-    p.topology = tightness > 0.55f ? nts::amp::Topology::tightModern : nts::amp::Topology::vintageBloom;
+    const auto gain = point.gain;
+    const auto brightness = point.brightness;
+    const auto tightness = point.tightness;
+    const auto offset = point.driveOffset;
+    p.topology = point.topology;
     p.stageCount = gain < 0.2f ? 2 : gain < 0.65f ? 3 : 4;
     for (std::size_t stage = 0; stage < p.stages.size(); ++stage)
     {
@@ -319,7 +352,24 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
     p.bass.cleanBlend = report.cleanLowBlendEstimate.value;
     p.outputGainDb = -9.0f;
     preset.name = "Plausible " + std::string(nts::tone::toString(report.context.gainCategory))
-        + " candidate " + std::to_string(variant + 1);
+        + (point.topology == nts::amp::Topology::tightModern ? " tight" : " bloom") + " candidate";
+}
+
+/** Neighbours of a point, one step along each axis. Topology is deliberately not
+    perturbed: it is a discrete voicing already covered by the coarse pass, and
+    stepping it here would restart the search rather than refine it.
+*/
+std::vector<CandidatePoint> refinementNeighbours(const CandidatePoint& centre, float step)
+{
+    std::vector<CandidatePoint> points;
+    for (const auto direction : { -1.0f, 1.0f })
+    {
+        auto gainPoint = centre; gainPoint.gain = clamp01(centre.gain + direction * step);
+        auto brightPoint = centre; brightPoint.brightness = clamp01(centre.brightness + direction * step);
+        auto tightPoint = centre; tightPoint.tightness = clamp01(centre.tightness + direction * step);
+        points.push_back(gainPoint); points.push_back(brightPoint); points.push_back(tightPoint);
+    }
+    return points;
 }
 } // namespace
 
@@ -702,16 +752,28 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
     const auto targetRms = std::max(reference.tone.features.rms, 1.0e-6f);
     const auto inputTrim = std::clamp(db(targetRms / std::max(diRms, 1.0e-7f)), -18.0f, 18.0f);
     const auto poolSize = std::max<std::size_t>(candidateCount * 3, 12);
+    // Two refinement rounds, each stepping half as far as the last, starting at
+    // half the coarse grid spacing of 0.06.
+    constexpr std::array refinementSteps { 0.03f, 0.015f };
     nts::tone::ToneAnalyzer analyzer;
     std::vector<RigCandidate> pool;
-    for (std::size_t variant = 0; variant < poolSize; ++variant)
+    std::vector<CandidatePoint> evaluatedPoints;
+
+    const auto totalRenders = poolSize + refinementSteps.size() * 6;
+    std::size_t rendersDone {};
+
+    const auto evaluate = [&](const CandidatePoint& point) -> std::optional<RigCandidate>
     {
-        if (stopToken.stop_requested()) { result.error = "reconstruction cancelled"; return result; }
         RigCandidate candidate;
         const auto instrument = reference.target == TargetInstrument::bass ? nts::amp::Instrument::bass
                                                                            : nts::amp::Instrument::guitar;
-        candidate.rigPreset = nts::amp::makeOriginalPreset(nts::amp::Topology::tightModern, instrument);
-        setCandidateParameters(candidate.rigPreset, reference.tone.report, variant);
+        // Built from the point's own topology so the values setCandidateParameters
+        // leaves alone, the phase inverter and the supply sag timings, come from
+        // that voicing. Previously every candidate started from Tight Modern and
+        // only had its topology flag flipped afterwards, so a Vintage Bloom
+        // candidate carried Tight Modern's power stage.
+        candidate.rigPreset = nts::amp::makeOriginalPreset(point.topology, instrument);
+        setCandidateParameters(candidate.rigPreset, reference.tone.report, point);
         candidate.adaptation.inputTrimDb = inputTrim;
         candidate.adaptation.lowShelfDb = (reference.tone.report.cleanLowBlendEstimate.value - 0.5f) * 6.0f;
         candidate.adaptation.midEqDb = (0.5f - reference.tone.report.brightness.value) * 3.0f;
@@ -728,7 +790,7 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
         auto rendered = nts::amp::renderOffline(processor, userDi, 256);
         const auto renderedTone = analyzer.analyze({ rendered, {}, sampleRate,
                                                      nts::tone::SourceType::pluginRender, 1.0f });
-        if (! renderedTone.success) continue;
+        if (! renderedTone.success) return std::nullopt;
         const auto comparison = nts::tone::ToneSimilarity::compare(profile("reference", reference.tone),
                                                                     profile("candidate", renderedTone));
         candidate.toneSimilarity = comparison.score;
@@ -747,23 +809,108 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
         if (reference.quality.drumLeakage > 0.5f)
             candidate.warnings.emplace_back("candidate may reflect drum leakage");
         candidate.warnings.emplace_back("plausible virtual approximation; original hardware is not identified");
-        pool.push_back(std::move(candidate));
-        if (progress && ! progress({ static_cast<float>(variant + 1) / static_cast<float>(poolSize),
-                                     "rendering and ranking candidate rigs" }))
-        { result.error = "reconstruction cancelled"; return result; }
-    }
-    std::sort(pool.begin(), pool.end(), [](const auto& first, const auto& second)
+        return candidate;
+    };
+
+    const auto rank = [](const RigCandidate& value)
     {
-        const auto firstScore = first.toneSimilarity * 0.7f + first.recordingSimilarity * 0.3f - first.complexityPenalty;
-        const auto secondScore = second.toneSimilarity * 0.7f + second.recordingSimilarity * 0.3f - second.complexityPenalty;
-        return firstScore > secondScore;
-    });
+        return value.toneSimilarity * 0.7f + value.recordingSimilarity * 0.3f - value.complexityPenalty;
+    };
+
+    const auto record = [&](const CandidatePoint& point, std::string_view stage) -> bool
+    {
+        if (stopToken.stop_requested()) return false;
+        if (auto candidate = evaluate(point))
+        {
+            pool.push_back(std::move(*candidate));
+            evaluatedPoints.push_back(point);
+        }
+        ++rendersDone;
+        if (progress && ! progress({ static_cast<float>(rendersDone) / static_cast<float>(totalRenders),
+                                     std::string(stage) }))
+            return false;
+        return true;
+    };
+
+    // Coarse pass: sample the grid, covering both topologies.
+    for (std::size_t variant = 0; variant < poolSize; ++variant)
+        if (! record(coarsePoint(reference.tone.report, variant), "rendering and ranking candidate rigs"))
+        { result.error = "reconstruction cancelled"; return result; }
+
     if (pool.empty()) { result.error = "candidate rendering did not produce a valid tone"; return result; }
-    pool.resize(std::min(candidateCount, pool.size()));
-    result.candidates = std::move(pool);
+
+    // Refinement pass: coordinate descent around the coarse winner. The coarse
+    // grid is far too sparse to land on a good match by itself, so the best point
+    // is stepped along each axis and kept whenever the score improves.
+    {
+        auto bestIndex = static_cast<std::size_t>(std::distance(pool.begin(),
+            std::max_element(pool.begin(), pool.end(), [&](const auto& a, const auto& b)
+            { return rank(a) < rank(b); })));
+        auto bestPoint = evaluatedPoints[bestIndex];
+        auto bestScore = rank(pool[bestIndex]);
+
+        for (const auto step : refinementSteps)
+        {
+            auto improved = false;
+            for (const auto& neighbour : refinementNeighbours(bestPoint, step))
+            {
+                const auto before = pool.size();
+                if (! record(neighbour, "refining the closest rig"))
+                { result.error = "reconstruction cancelled"; return result; }
+                if (pool.size() > before && rank(pool.back()) > bestScore)
+                {
+                    bestScore = rank(pool.back());
+                    bestPoint = neighbour;
+                    improved = true;
+                }
+            }
+            // Nothing along any axis beat the centre, so a smaller step around the
+            // same point cannot either.
+            if (! improved) break;
+        }
+    }
+
+    std::sort(pool.begin(), pool.end(), [&](const auto& first, const auto& second)
+    {
+        return rank(first) > rank(second);
+    });
+    // The shortlist is something the user auditions and edits, so near-identical
+    // entries waste its slots. Refinement deliberately produces points close to
+    // the winner, so take the best first and then only entries that actually
+    // sound like a different rig, falling back to rank order if too few qualify.
+    const auto audiblyDifferent = [](const nts::amp::AmpParameters& first,
+                                     const nts::amp::AmpParameters& second)
+    {
+        return first.topology != second.topology
+            || std::abs(first.stages[0].driveDb - second.stages[0].driveDb) > 1.5f
+            || std::abs(first.toneStack.treble - second.toneStack.treble) > 0.05f
+            || std::abs(first.toneStack.mid - second.toneStack.mid) > 0.05f
+            || std::abs(first.preEq.highCutHz - second.preEq.highCutHz) > 400.0f
+            || first.stageCount != second.stageCount;
+    };
+
+    std::vector<std::size_t> chosen;
+    for (std::size_t index = 0; index < pool.size() && chosen.size() < candidateCount; ++index)
+    {
+        const auto distinct = std::all_of(chosen.begin(), chosen.end(), [&](std::size_t existing)
+        { return audiblyDifferent(pool[existing].rigPreset.parameters, pool[index].rigPreset.parameters); });
+        if (distinct) chosen.push_back(index);
+    }
+    for (std::size_t index = 0; index < pool.size() && chosen.size() < candidateCount; ++index)
+        if (std::find(chosen.begin(), chosen.end(), index) == chosen.end()) chosen.push_back(index);
+
+    // Back into rank order: pool is already sorted, so ascending index is descending score.
+    std::sort(chosen.begin(), chosen.end());
+    std::vector<RigCandidate> shortlist;
+    shortlist.reserve(chosen.size());
+    for (const auto index : chosen) shortlist.push_back(std::move(pool[index]));
+    result.candidates = std::move(shortlist);
     if (reference.analysisConfidence < 0.55f)
         result.warnings.emplace_back("ambiguous reference: candidates have reduced confidence");
     result.warnings.emplace_back("shared result contains parameters and embeddings only; source audio is excluded");
+    // Refinement stops early once an axis sweep finds no improvement, so the
+    // render count is an upper bound and the fraction above can end short of 1.
+    if (progress) progress({ 1.0f, "reconstruction complete" });
     result.success = true;
     return result;
 }

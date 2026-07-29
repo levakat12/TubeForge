@@ -118,6 +118,45 @@ int main()
                  && drivenParts.front().gainCharacter != GainCharacter::clean,
                  "playable-region analysis distinguishes clean and driven material");
 
+    {
+        // Gain classification must not depend on how long the region is. The
+        // analyser used to sub-sample regions longer than five seconds, which
+        // aliased away the high-frequency content that identifies distortion and
+        // made long high-gain parts read as crunch or clean. The two-second case
+        // above never crossed that threshold, so it could not catch it.
+        const auto drivenRegionOfLength = [&](double seconds)
+        {
+            StereoAudio audio;
+            audio.sampleRate = sampleRate;
+            audio.left.resize(static_cast<std::size_t>(sampleRate * seconds));
+            audio.right.resize(audio.left.size());
+            for (std::size_t index = 0; index < audio.samples(); ++index)
+            {
+                const auto value = 0.3f * static_cast<float>(std::sin(2.0 * std::numbers::pi * 220.0
+                    * static_cast<double>(index) / sampleRate));
+                audio.left[index] = audio.right[index] = std::tanh(value * 12.0f) * 0.45f;
+            }
+            RegionQuality quality; quality.startSeconds = 0.0; quality.endSeconds = seconds;
+            quality.duration = static_cast<float>(seconds); quality.confidence = 0.9f;
+            const std::array qualities { quality };
+            return analyzePlayableRegions(audio, qualities, TargetInstrument::guitar);
+        };
+
+        // 30 seconds at this fixture's 16 kHz rate is 480000 samples, comfortably
+        // past the 240000-sample budget where the sub-sampling used to begin.
+        const auto shortRegion = drivenRegionOfLength(2.0);
+        const auto longRegion = drivenRegionOfLength(30.0);
+        tests.expect(! shortRegion.empty() && ! longRegion.empty(),
+                     "gain classification produces a region at both lengths");
+        if (! shortRegion.empty() && ! longRegion.empty())
+        {
+            tests.expect(longRegion.front().gainCharacter != GainCharacter::clean,
+                         "a long driven region is not classified as clean");
+            tests.expectNear(longRegion.front().gainScore, shortRegion.front().gainScore, 0.1,
+                             "gain score is stable across region length");
+        }
+    }
+
     const auto monoSong = makeSong(sampleRate, 2.0, false);
     const auto monoStems = separator.separate(monoSong, options);
     tests.expect(monoStems.success && monoStems.bass.left.size() == monoStems.bass.right.size(),

@@ -3,6 +3,7 @@
 #include <TubeForgeAssets.h>
 
 #include <nts/diagnostics/ProcessMemory.h>
+#include <nts/reconstruction/StemRefinement.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_cryptography/juce_cryptography.h>
 
@@ -878,6 +879,29 @@ void TubeForgeAudioProcessor::reconstructSongFile(
         if (! mlFailure.empty()) stems.warnings.emplace_back("ML fallback: " + mlFailure);
     }
     if (! stems.success) { fail(stems.error); return; }
+
+    // Separation backends decode each source independently, so the same snare sits
+    // in the drum stem and in the guitar stem at once and nothing downstream can
+    // tell them apart. Re-partitioning the mixture across the stems awards each
+    // time-frequency bin to whichever source dominates it before any of the tone
+    // features are measured.
+    {
+        const std::scoped_lock lock(reconstructionMutex);
+        reconstructionStatus = "Refining stem masks against the mixture";
+    }
+    const auto refinement = nts::reconstruction::refineStems(stems, song, {},
+        [this](const nts::reconstruction::SeparationProgress& update)
+        {
+            reconstructionProgressValue.store(0.60f + update.fraction * 0.04f, std::memory_order_relaxed);
+            return true;
+        }, stopToken);
+    if (stopToken.stop_requested()) { fail("Reconstruction cancelled"); return; }
+    for (const auto& warning : refinement.warnings) stems.warnings.push_back("refinement: " + warning);
+    if (refinement.applied)
+        stems.warnings.emplace_back("stems re-partitioned with " + refinement.version + " ("
+            + std::to_string(refinement.stemsRefined) + " stems, "
+            + std::to_string(static_cast<int>(std::lround(refinement.residualShare * 100.0f)))
+            + "% of the mixture unexplained)");
 
     const auto cacheDirectory = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
         .getChildFile("TubeForge").getChildFile("cache").getChildFile("source-reconstruction");

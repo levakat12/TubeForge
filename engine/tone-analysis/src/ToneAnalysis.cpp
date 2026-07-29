@@ -33,13 +33,27 @@ struct SpectrumSummary
     double sampleRate {};
 };
 
-SpectrumSummary averageSpectrum(std::span<const float> mono, double sampleRate, std::size_t requestedSize)
+/** Per-bin percentile of the short-time power spectrum.
+
+    The summary used to be the arithmetic mean across frames, which is the wrong
+    statistic for a stem that still carries leakage. Drums and vocals are sparse in
+    time: a snare on 2 and 4 occupies a tenth of the frames but contributes its full
+    energy to every mean, so it landed in `upperMidAttack`, `highFrequencyRolloff`
+    and the spectral slope as if the guitar had produced it. A per-bin median keeps
+    whatever is present in most frames — the sustained instrument — and discards
+    what is only present in a few. Every feature below is a ratio of bands taken
+    from the same summary, so the constant offset between a median and a mean
+    cancels and only the leakage rejection survives.
+*/
+SpectrumSummary summarizeSpectrum(std::span<const float> mono, double sampleRate,
+                                  std::size_t requestedSize, float powerPercentile = 0.5f)
 {
     SpectrumSummary result;
     nts::dsp::Fft fft;
     fft.prepare(requestedSize);
     result.fftSize = fft.size(); result.sampleRate = sampleRate;
-    result.power.assign(result.fftSize / 2 + 1, 0.0f);
+    const auto bins = result.fftSize / 2 + 1;
+    result.power.assign(bins, 0.0f);
     std::vector<std::complex<float>> work(result.fftSize);
     std::vector<float> window(result.fftSize);
     for (std::size_t index = 0; index < window.size(); ++index)
@@ -49,6 +63,7 @@ SpectrumSummary averageSpectrum(std::span<const float> mono, double sampleRate, 
     const auto availableFrames = mono.size() <= result.fftSize ? 1U
         : static_cast<unsigned>((mono.size() - result.fftSize) / std::max<std::size_t>(1, result.fftSize / 4) + 1);
     const auto frames = std::clamp<unsigned>(availableFrames, 1, 256);
+    std::vector<float> framePower(static_cast<std::size_t>(frames) * bins);
     for (unsigned frame = 0; frame < frames; ++frame)
     {
         const auto maximumStart = mono.size() > result.fftSize ? mono.size() - result.fftSize : 0;
@@ -56,11 +71,20 @@ SpectrumSummary averageSpectrum(std::span<const float> mono, double sampleRate, 
         for (std::size_t index = 0; index < result.fftSize; ++index)
             work[index] = { index + start < mono.size() ? mono[index + start] * window[index] : 0.0f, 0.0f };
         fft.transform(work);
-        for (std::size_t bin = 0; bin < result.power.size(); ++bin)
-            result.power[bin] += std::norm(work[bin]);
+        auto* destination = framePower.data() + static_cast<std::size_t>(frame) * bins;
+        for (std::size_t bin = 0; bin < bins; ++bin)
+            destination[bin] = std::norm(work[bin]);
     }
-    const auto scale = 1.0f / static_cast<float>(frames);
-    for (auto& value : result.power) value *= scale;
+    std::vector<float> scratch(frames);
+    const auto rank = static_cast<std::ptrdiff_t>(std::clamp(powerPercentile, 0.0f, 1.0f)
+                                                  * static_cast<float>(frames - 1));
+    for (std::size_t bin = 0; bin < bins; ++bin)
+    {
+        for (unsigned frame = 0; frame < frames; ++frame)
+            scratch[frame] = framePower[static_cast<std::size_t>(frame) * bins + bin];
+        std::nth_element(scratch.begin(), scratch.begin() + rank, scratch.end());
+        result.power[bin] = scratch[static_cast<std::size_t>(rank)];
+    }
     return result;
 }
 
@@ -173,9 +197,9 @@ ToneAnalysisResult ToneAnalyzer::analyze(const AnalysisInput& input) const
 
     const auto normalization = 0.125f / result.features.rms;
     for (auto& sample : mono) sample = std::clamp(sample * normalization, -4.0f, 4.0f);
-    const auto shortSpectrum = averageSpectrum(mono, input.sampleRate, 512);
-    const auto spectrum = averageSpectrum(mono, input.sampleRate, 4096);
-    const auto longSpectrum = averageSpectrum(mono, input.sampleRate, 8192);
+    const auto shortSpectrum = summarizeSpectrum(mono, input.sampleRate, 512);
+    const auto spectrum = summarizeSpectrum(mono, input.sampleRate, 4096);
+    const auto longSpectrum = summarizeSpectrum(mono, input.sampleRate, 8192);
     const auto nyquist = input.sampleRate * 0.5;
     const auto total = std::max(1.0e-12f, bandEnergy(spectrum, 20.0, nyquist));
     const auto shortTotal = std::max(1.0e-12f, bandEnergy(shortSpectrum, 20.0, nyquist));

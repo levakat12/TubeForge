@@ -642,7 +642,12 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     }
     instrumentSelector.addItemList({ "Guitar", "Bass" }, 1);
     topologySelector.addItemList({ "Tight Modern", "Vintage Bloom" }, 1);
-    oversamplingSelector.addItemList({ "1x (min latency)", "2x", "4x", "8x" }, 1);
+    // Taken from the parameter rather than duplicated here. A hardcoded copy of
+    // this list silently hid the "Auto" entry when it was added to the parameter,
+    // because the box only ever offered the four items it was built with.
+    if (const auto* choice = dynamic_cast<const juce::AudioParameterChoice*>(
+            processor.getParameters().getParameter("oversampling")))
+        oversamplingSelector.addItemList(choice->choices, 1);
     engineModeSelector.addItemList({ "Traditional", "Neural capture", "Physical circuit" }, 1);
     neuralMonitorSelector.addItemList({ "Model", "Bypass DI", "Loudness matched" }, 1);
     configureHeading(neuralStatus, "No neural model loaded");

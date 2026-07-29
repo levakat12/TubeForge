@@ -268,10 +268,20 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
                             std::size_t variant)
 {
     auto& p = preset.parameters;
-    const auto offset = (static_cast<int>(variant % 5) - 2) * 0.06f;
+    // Candidates are spread over three independent axes. A single scalar offset
+    // taken as `variant % 5` gave only five distinct rigs, so a pool of twelve
+    // rendered seven exact duplicates and the shortlist could return the same
+    // rig several times. Mixed radix over gain, brightness, and tightness gives
+    // 5 x 3 x 3 = 45 unique combinations before anything repeats.
+    const auto gainStep = static_cast<int>(variant % 5) - 2;
+    const auto brightnessStep = static_cast<int>((variant / 5) % 3) - 1;
+    const auto tightnessStep = static_cast<int>((variant / 15) % 3) - 1;
+    const auto offset = static_cast<float>(gainStep) * 0.06f;
     const auto gain = clamp01(report.gain.value + offset);
-    const auto brightness = clamp01(report.brightness.value - offset * 0.5f);
-    const auto tightness = clamp01(report.tightness.value + offset * 0.3f);
+    const auto brightness = clamp01(report.brightness.value - offset * 0.5f
+                                    + static_cast<float>(brightnessStep) * 0.06f);
+    const auto tightness = clamp01(report.tightness.value + offset * 0.3f
+                                   + static_cast<float>(tightnessStep) * 0.06f);
     p.topology = tightness > 0.55f ? nts::amp::Topology::tightModern : nts::amp::Topology::vintageBloom;
     p.stageCount = gain < 0.2f ? 2 : gain < 0.65f ? 3 : 4;
     for (std::size_t stage = 0; stage < p.stages.size(); ++stage)
@@ -279,7 +289,13 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
         p.stages[stage].driveDb = 2.0f + gain * 28.0f + static_cast<float>(stage) * 2.0f + offset * 20.0f;
         p.stages[stage].bias = (0.5f - report.tightness.value) * 0.45f + offset;
         p.stages[stage].asymmetry = gain * 0.35f;
-        p.stages[stage].oversamplingFactor = 1;
+        // Candidates were rendered at 1x, so the tone analyser measured the
+        // aliasing of the render rather than the amplifier. Fold-back adds
+        // inharmonic high-frequency energy that scales with drive, so high-gain
+        // candidates were scored against a spectrum the amp does not actually
+        // produce, and the preset handed back sounded unlike the thing that won.
+        // Matching playback here is what makes the score mean something.
+        p.stages[stage].oversamplingFactor = 4;
     }
     p.preEq.lowCutHz = p.instrument == nts::amp::Instrument::bass
         ? 28.0f + tightness * 45.0f : 55.0f + tightness * 95.0f;

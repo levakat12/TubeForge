@@ -199,6 +199,38 @@ int main()
                  "candidate ranking separates tone and full-recording similarity");
     tests.expect(reconstruction.candidates.front().rigPreset.parameters.stageCount >= 2,
                  "candidate contains an editable traditional-amp preset");
+
+    {
+        // Offering the user a shortlist is only useful if the entries differ.
+        // The variant offset used to come from `variant % 5`, so a pool of twelve
+        // contained five unique rigs and seven exact copies, and the shortlist
+        // could hand back the same settings more than once.
+        const auto shortlist = reconstructor.reconstruct(reference, di, sampleRate, 4);
+        tests.expect(shortlist.success && shortlist.candidates.size() == 4,
+                     "rig search returns the requested candidate count: " + shortlist.error);
+        auto allDistinct = true;
+        for (std::size_t a = 0; a < shortlist.candidates.size(); ++a)
+            for (auto b = a + 1; b < shortlist.candidates.size(); ++b)
+            {
+                const auto& first = shortlist.candidates[a].rigPreset.parameters;
+                const auto& second = shortlist.candidates[b].rigPreset.parameters;
+                const auto sameDrive = std::abs(first.stages[0].driveDb - second.stages[0].driveDb) < 1.0e-4f;
+                const auto sameTone = std::abs(first.toneStack.treble - second.toneStack.treble) < 1.0e-4f
+                                   && std::abs(first.toneStack.mid - second.toneStack.mid) < 1.0e-4f;
+                const auto samePreEq = std::abs(first.preEq.highCutHz - second.preEq.highCutHz) < 1.0e-4f
+                                    && std::abs(first.preEq.tightness - second.preEq.tightness) < 1.0e-4f;
+                if (sameDrive && sameTone && samePreEq) allDistinct = false;
+            }
+        tests.expect(allDistinct, "shortlisted candidates are not duplicates of one another");
+
+        auto oversampled = true;
+        for (const auto& candidate : shortlist.candidates)
+            for (std::size_t stage = 0; stage < candidate.rigPreset.parameters.stageCount; ++stage)
+                oversampled = oversampled
+                    && candidate.rigPreset.parameters.stages[stage].oversamplingFactor > 1;
+        tests.expect(oversampled,
+                     "candidates are scored and returned with anti-aliased preamp stages");
+    }
     const auto serialized = serializeResult(reconstruction);
     const auto parsed = juce::JSON::parse(juce::String::fromUTF8(serialized.c_str()));
     tests.expect(serialized.find("rigPreset") != std::string::npos

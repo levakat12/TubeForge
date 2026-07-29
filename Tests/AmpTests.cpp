@@ -244,6 +244,12 @@ void testCabinetAndPresets(TestHarness& tests)
     original.parameters.cabinet.delaySamplesB = 17;
     original.parameters.bass.lowMono = 0.37f;
     original.parameters.postHighDb = -2.25f;
+    original.parameters.gateEnabled = false;
+    original.parameters.gateThresholdDb = -47.5f;
+    original.parameters.gateDepthDb = -18.25f;
+    original.parameters.gateAttackMs = 4.5f;
+    original.parameters.gateHoldMs = 120.0f;
+    original.parameters.gateReleaseMs = 640.0f;
     const auto json = nts::amp::serializePreset(original);
     const auto restored = nts::amp::deserializePreset(json);
     tests.expect(restored.has_value() && restored->name == original.name
@@ -256,8 +262,62 @@ void testCabinetAndPresets(TestHarness& tests)
                  && restored->parameters.cabinet.phaseInvertB
                  && restored->parameters.cabinet.delaySamplesB == 17
                  && std::abs(restored->parameters.bass.lowMono - 0.37f) < 1.0e-5f
-                 && std::abs(restored->parameters.postHighDb + 2.25f) < 1.0e-5f,
+                 && std::abs(restored->parameters.postHighDb + 2.25f) < 1.0e-5f
+                 && ! restored->parameters.gateEnabled
+                 && std::abs(restored->parameters.gateThresholdDb + 47.5f) < 1.0e-5f
+                 && std::abs(restored->parameters.gateDepthDb + 18.25f) < 1.0e-5f
+                 && std::abs(restored->parameters.gateAttackMs - 4.5f) < 1.0e-5f
+                 && std::abs(restored->parameters.gateHoldMs - 120.0f) < 1.0e-5f
+                 && std::abs(restored->parameters.gateReleaseMs - 640.0f) < 1.0e-5f,
                  "amp preset schema serializes and restores every expert subsystem");
+
+    {
+        // The gate sits ahead of the preamp, so a quiet part that survives it is
+        // then amplified by everything downstream. These check the two things the
+        // user actually asked for: that it can be switched off entirely, and that
+        // depth controls how much is removed rather than always muting.
+        const auto tailLevelWith = [&](bool enabled, float depthDb, float releaseMs)
+        {
+            auto preset = nts::amp::makeOriginalPreset(nts::amp::Topology::tightModern,
+                                                        nts::amp::Instrument::guitar);
+            preset.parameters.gateEnabled = enabled;
+            preset.parameters.gateThresholdDb = -30.0f;
+            preset.parameters.gateDepthDb = depthDb;
+            preset.parameters.gateAttackMs = 2.0f;
+            preset.parameters.gateHoldMs = 10.0f;
+            preset.parameters.gateReleaseMs = releaseMs;
+
+            nts::amp::TraditionalAmpProcessor amp;
+            amp.prepare({ sampleRate, 512, 1 });
+            amp.loadPreset(preset, 0);
+
+            // A loud note that opens the gate, then a long quiet tail below the
+            // threshold, which is exactly the material a gate destroys. The tail
+            // is measured well after the loud section so the cabinet's own
+            // convolution ring-out has decayed and is not counted as signal.
+            const auto loudSamples = static_cast<std::size_t>(sampleRate * 0.25);
+            const auto tailSamples = static_cast<std::size_t>(sampleRate * 1.5);
+            auto signal = sine(loudSamples + tailSamples, 220.0, 1.0f);
+            for (std::size_t index = loudSamples; index < signal.size(); ++index)
+                signal[index] *= 0.004f;
+            const auto rendered = nts::amp::renderOffline(amp, signal, 256);
+            const auto measureFrom = loudSamples + static_cast<std::size_t>(sampleRate * 1.0);
+            return magnitude(std::span(rendered).subspan(measureFrom), 220.0);
+        };
+
+        // Measured: the full-depth gate leaves roughly 1/1800th of the tail that
+        // an open gate does, about 65 dB, which is what "killing the tone" means
+        // in numbers. A shallow gate sits between the two rather than muting.
+        const auto gatedTail = tailLevelWith(true, -80.0f, 40.0f);
+        const auto openTail = tailLevelWith(false, -80.0f, 40.0f);
+        const auto shallowTail = tailLevelWith(true, -12.0f, 40.0f);
+        tests.expect(openTail > gatedTail * 20.0,
+                     "disabling the gate leaves the quiet tail the gate removed");
+        tests.expect(shallowTail > gatedTail * 5.0,
+                     "reducing gate depth removes less of the quiet tail");
+        tests.expect(shallowTail < openTail,
+                     "gate depth is a continuum between muting and bypass");
+    }
 }
 
 void testCompleteGraphs(TestHarness& tests)

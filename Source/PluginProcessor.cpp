@@ -50,6 +50,12 @@ constexpr auto circuitPowerTopology = "circuitPowerTopology";
 constexpr auto circuitToneStack = "circuitToneStack";
 constexpr auto circuitBackend = "circuitBackend";
 constexpr auto circuitCabinetStyle = "circuitCabinetStyle";
+constexpr auto gateEnabled = "gateEnabled";
+constexpr auto gateThreshold = "gateThreshold";
+constexpr auto gateDepth = "gateDepth";
+constexpr auto gateAttack = "gateAttack";
+constexpr auto gateHold = "gateHold";
+constexpr auto gateRelease = "gateRelease";
 } // namespace ParameterIds
 
 namespace
@@ -65,7 +71,11 @@ constexpr std::array ampControlIds {
     ParameterIds::neuralMonitor, ParameterIds::neuralCompensation,
     ParameterIds::circuitPreampTube, ParameterIds::circuitPowerTube,
     ParameterIds::circuitPowerTopology, ParameterIds::circuitToneStack,
-    ParameterIds::circuitBackend, ParameterIds::circuitCabinetStyle
+    ParameterIds::circuitBackend, ParameterIds::circuitCabinetStyle,
+    // Appended so existing saved projects, which hold fewer entries, still map
+    // positionally onto the ids ahead of these.
+    ParameterIds::gateEnabled, ParameterIds::gateThreshold, ParameterIds::gateDepth,
+    ParameterIds::gateAttack, ParameterIds::gateHold, ParameterIds::gateRelease
 };
 
 void setCircuitParameter(nts::circuit::NodeSpec& node, std::string_view id, float value)
@@ -1152,6 +1162,12 @@ bool TubeForgeAudioProcessor::applyReconstructionCandidate(std::size_t index)
     setParameterValue(parameterState, ParameterIds::master, p.powerAmp.masterDb);
     setParameterValue(parameterState, ParameterIds::lowCut, p.preEq.lowCutHz);
     setParameterValue(parameterState, ParameterIds::highCut, p.preEq.highCutHz);
+    setParameterValue(parameterState, ParameterIds::gateEnabled, p.gateEnabled ? 1.0f : 0.0f);
+    setParameterValue(parameterState, ParameterIds::gateThreshold, p.gateThresholdDb);
+    setParameterValue(parameterState, ParameterIds::gateDepth, p.gateDepthDb);
+    setParameterValue(parameterState, ParameterIds::gateAttack, p.gateAttackMs);
+    setParameterValue(parameterState, ParameterIds::gateHold, p.gateHoldMs);
+    setParameterValue(parameterState, ParameterIds::gateRelease, p.gateReleaseMs);
     setParameterValue(parameterState, ParameterIds::sag, p.powerAmp.sag * 100.0f);
     setParameterValue(parameterState, ParameterIds::feedback, p.powerAmp.feedback * 100.0f);
     setParameterValue(parameterState, ParameterIds::crossover, p.bass.crossoverHz);
@@ -1460,6 +1476,12 @@ juce::Result TubeForgeAudioProcessor::applyTonePackage(const juce::String& packa
         const auto factor = p.stages[0].oversamplingFactor;
         setParameterValue(parameterState, ParameterIds::oversampling, factor >= 8 ? 3.0f : factor >= 4 ? 2.0f : factor >= 2 ? 1.0f : 0.0f);
     }
+    setParameterValue(parameterState, ParameterIds::gateEnabled, p.gateEnabled ? 1.0f : 0.0f);
+    setParameterValue(parameterState, ParameterIds::gateThreshold, p.gateThresholdDb);
+    setParameterValue(parameterState, ParameterIds::gateDepth, p.gateDepthDb);
+    setParameterValue(parameterState, ParameterIds::gateAttack, p.gateAttackMs);
+    setParameterValue(parameterState, ParameterIds::gateHold, p.gateHoldMs);
+    setParameterValue(parameterState, ParameterIds::gateRelease, p.gateReleaseMs);
     setParameterValue(parameterState, ParameterIds::sag, p.powerAmp.sag * 100.0f);
     setParameterValue(parameterState, ParameterIds::feedback, p.powerAmp.feedback * 100.0f);
     setParameterValue(parameterState, ParameterIds::crossover, p.bass.crossoverHz);
@@ -1554,6 +1576,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout TubeForgeAudioProcessor::cre
     layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::oversampling, 1 }, "Oversampling",
                                         juce::StringArray { "1x (minimum latency)", "2x", "4x", "8x",
                                                             "Auto (follows gain)" }, 4));
+    layout.add(std::make_unique<Bool>(juce::ParameterID { ParameterIds::gateEnabled, 1 },
+                                      "Noise gate", true));
+    addFloat(ParameterIds::gateThreshold, "Gate threshold", Range { -90.0f, -20.0f, 0.1f }, -58.0f, "dB");
+    // Depth rather than a fixed full mute: a shallow gate ducks hum between
+    // phrases without swallowing the tail of a note.
+    addFloat(ParameterIds::gateDepth, "Gate depth", Range { -90.0f, 0.0f, 0.1f }, -80.0f, "dB");
+    addFloat(ParameterIds::gateAttack, "Gate attack", Range { 0.1f, 50.0f, 0.1f }, 2.0f, "ms");
+    addFloat(ParameterIds::gateHold, "Gate hold", Range { 0.0f, 500.0f, 1.0f }, 60.0f, "ms");
+    addFloat(ParameterIds::gateRelease, "Gate release", Range { 5.0f, 2000.0f, 1.0f }, 250.0f, "ms");
     addFloat(ParameterIds::sag, "Sag", Range { 0.0f, 100.0f, 0.1f }, 35.0f, "%");
     addFloat(ParameterIds::feedback, "Feedback", Range { 0.0f, 100.0f, 0.1f }, 35.0f, "%");
     addFloat(ParameterIds::crossover, "Bass crossover", Range { 60.0f, 500.0f, 1.0f, 0.5f }, 180.0f, "Hz");
@@ -1688,6 +1719,12 @@ nts::amp::AmpParameters TubeForgeAudioProcessor::currentAmpParameters() const no
         ? automaticOversamplingFactor(parameters)
         : std::array { 1, 2, 4, 8 }[static_cast<std::size_t>(oversamplingIndex)];
     for (auto& stage : parameters.stages) stage.oversamplingFactor = oversamplingFactor;
+    parameters.gateEnabled = valueOf(parameterState, ParameterIds::gateEnabled) >= 0.5f;
+    parameters.gateThresholdDb = valueOf(parameterState, ParameterIds::gateThreshold);
+    parameters.gateDepthDb = valueOf(parameterState, ParameterIds::gateDepth);
+    parameters.gateAttackMs = valueOf(parameterState, ParameterIds::gateAttack);
+    parameters.gateHoldMs = valueOf(parameterState, ParameterIds::gateHold);
+    parameters.gateReleaseMs = valueOf(parameterState, ParameterIds::gateRelease);
     parameters.preEq.lowCutHz = valueOf(parameterState, ParameterIds::lowCut);
     parameters.preEq.highCutHz = valueOf(parameterState, ParameterIds::highCut);
     parameters.preEq.tightness = valueOf(parameterState, ParameterIds::tightness) * 0.1f;

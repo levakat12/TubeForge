@@ -1,4 +1,4 @@
-#include <nts/reconstruction/SourceReconstruction.h>
+﻿#include <nts/reconstruction/SourceReconstruction.h>
 
 #include <algorithm>
 #include <bit>
@@ -198,25 +198,56 @@ std::pair<GainCharacter, float> estimateGainCharacter(const StereoAudio& audio,
 {
     end = std::min(end, audio.samples());
     if (end <= begin) return { GainCharacter::clean, 0.0f };
-    const auto stride = std::max<std::size_t>(1, (end - begin) / 240000);
-    double energy {}, derivativeEnergy {};
-    float peak {}, previous {};
-    std::size_t samples {}, crossings {};
-    for (auto index = begin; index < end; index += stride)
+
+    // Distortion is identified by how fast the waveform moves between *adjacent*
+    // samples, so the analysis has to stay on adjacent samples. Reading every
+    // stride'th sample instead, as this previously did once a region exceeded
+    // five seconds, decimates with no low-pass and aliases away precisely the
+    // high-frequency content that separates a distorted tone from a clean one.
+    // Long regions therefore scored lower than they should and high-gain parts
+    // were classified as crunch or clean. Cost is bounded by covering a long
+    // region with contiguous windows spread across it instead.
+    constexpr std::size_t analysisBudget = 240000;
+    const auto span = end - begin;
+    const auto windowCount = span <= analysisBudget ? std::size_t { 1 } : std::size_t { 64 };
+    const auto windowLength = std::min(span / windowCount, analysisBudget / windowCount);
+
+    const auto monoAt = [&audio](std::size_t index)
     {
         const auto right = audio.right.empty() ? audio.left[index] : audio.right[index];
-        const auto value = 0.5f * (audio.left[index] + right);
-        energy += value * value;
-        const auto difference = value - previous;
-        derivativeEnergy += difference * difference;
-        if (samples > 0 && std::signbit(value) != std::signbit(previous)) ++crossings;
-        peak = std::max(peak, std::abs(value)); previous = value; ++samples;
+        return 0.5f * (audio.left[index] + right);
+    };
+
+    double energy {}, derivativeEnergy {};
+    float peak {};
+    std::size_t samples {}, crossings {};
+    for (std::size_t window = 0; window < windowCount; ++window)
+    {
+        const auto start = windowCount == 1
+            ? begin : begin + (span - windowLength) * window / (windowCount - 1);
+        const auto stop = std::min(end, start + windowLength);
+        auto previous = monoAt(start);
+        energy += static_cast<double>(previous) * previous;
+        peak = std::max(peak, std::abs(previous));
+        ++samples;
+        for (auto index = start + 1; index < stop; ++index)
+        {
+            const auto value = monoAt(index);
+            energy += static_cast<double>(value) * value;
+            const auto difference = value - previous;
+            derivativeEnergy += static_cast<double>(difference) * difference;
+            if (std::signbit(value) != std::signbit(previous)) ++crossings;
+            peak = std::max(peak, std::abs(value)); previous = value; ++samples;
+        }
     }
+
     const auto rms = std::sqrt(static_cast<float>(energy / std::max<std::size_t>(1, samples)));
     const auto crest = peak / std::max(rms, 1.0e-7f);
     const auto derivativeRatio = std::sqrt(static_cast<float>(derivativeEnergy / std::max(energy, 1.0e-12)));
-    const auto seconds = static_cast<float>(end - begin) / static_cast<float>(audio.sampleRate);
-    const auto crossingRate = static_cast<float>(crossings * stride) / std::max(seconds, 1.0e-6f);
+    // Crossings and duration now come from the same adjacent-sample material, so
+    // the rate needs no stride extrapolation to undo the decimation.
+    const auto seconds = static_cast<float>(samples) / static_cast<float>(audio.sampleRate);
+    const auto crossingRate = static_cast<float>(crossings) / std::max(seconds, 1.0e-6f);
     const auto score = clamp01(clamp01((derivativeRatio - 0.045f) / 0.22f) * 0.60f
         + clamp01((crossingRate - 450.0f) / 2600.0f) * 0.25f
         + clamp01((4.5f - crest) / 2.8f) * 0.15f);

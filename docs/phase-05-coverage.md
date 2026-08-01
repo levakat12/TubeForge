@@ -14,7 +14,7 @@ derived from the Phase 5 plan.
 | 7 | Preserve recovery behavior | Complete | Stateful chunks with history context |
 | 8 | Preserve silence stability | Complete | Silence loss, clip, and dBFS metric |
 | 9 | Baseline recurrent model | Complete | `ConditionedLstm` |
-| 10 | Alternative TCN model | Complete | Streaming `CausalTcn` |
+| 10 | Alternative TCN model | Complete | Streaming `RandomFeatureTcn` |
 | 11 | Capture wizard | Complete | `CaptureWizard` plus CLI and plug-in tab |
 | 12 | Automatic alignment | Complete | Phase 4 GCC-PHAT/local drift integrated into wizard |
 | 13 | Training and validation pipeline | Complete | Separate session sets enforced |
@@ -22,11 +22,11 @@ derived from the Phase 5 plan.
 | 15 | Real-time C++ inference | Complete | Four packed architectures |
 | 16 | LSTM mono input and one layer | Complete | Configurable hidden size, mono streaming |
 | 17 | LSTM hidden size 32-128 supported | Complete | Runtime range includes recommended sizes |
-| 18 | GRU comparison training | Partial | Deterministic GRU and learned output projection; full gate BPTT deferred |
+| 18 | GRU comparison training | Partial | Frozen GRU features with a trained linear readout (`RandomFeatureGru`); full gate BPTT deferred |
 | 19 | Linear output projection | Complete | All candidates |
 | 20 | Optional residual path | Complete | LSTM and TCN residual gain |
 | 21 | Optional control conditioning | Complete | Five-control normalized vector |
-| 22 | Fully trainable causal TCN | Partial | Dilated causal feature stack with learned output; kernel BPTT deferred |
+| 22 | Fully trainable causal TCN | Partial | Frozen dilated causal stack with a trained linear readout (`RandomFeatureTcn`); kernel BPTT deferred |
 | 23 | Explicit TCN receptive field | Complete | Calculated from layers/kernel/dilation |
 | 24 | Stateful TCN history handling | Complete | Per-layer circular histories |
 | 25 | Gain conditioning | Complete | Chunk metadata and runtime control |

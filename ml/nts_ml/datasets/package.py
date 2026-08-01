@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterator
 import hashlib
 import json
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 

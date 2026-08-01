@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
 import json
+from pathlib import Path
 
 from nts_ml.evaluation import create_abx_pack, load_abx_sources
-
 
 parser = argparse.ArgumentParser(description="Create a loudness-matched, randomized TubeForge ABX pack")
 parser.add_argument("manifest", type=Path)

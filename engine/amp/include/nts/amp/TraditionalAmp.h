@@ -183,6 +183,14 @@ struct AmpPreset
 };
 
 [[nodiscard]] AmpPreset makeOriginalPreset(Topology topology, Instrument instrument);
+
+/** The built-in synthesized cabinet responses, one per slot (0 = A, 1 = B).
+
+    Exposed so that a user-loaded response can be reverted without tearing down and
+    re-preparing the whole amplifier.
+*/
+[[nodiscard]] std::vector<float> makeDefaultCabinetImpulse(int slot);
+[[nodiscard]] CabinetMetadata defaultCabinetMetadata(int slot);
 [[nodiscard]] std::string serializePreset(const AmpPreset& preset, bool pretty = true);
 [[nodiscard]] std::optional<AmpPreset> deserializePreset(std::string_view json);
 
@@ -287,18 +295,37 @@ public:
     void prepare(const dsp::ProcessSpec& spec);
     void reset() noexcept;
     void setParameters(const CabinetParameters& parameters, std::size_t interpolationSamples = 64) noexcept;
-    bool loadImpulseA(std::span<const float> left, std::span<const float> right = {}, CabinetMetadata metadata = {});
-    bool loadImpulseB(std::span<const float> left, std::span<const float> right = {}, CabinetMetadata metadata = {});
+    /** Stages a response into the inactive side and asks the audio thread to fade across.
+
+        Safe to call while audio is running and from a worker thread, which is what makes
+        user IR loading possible. Pass zero crossfade samples at prepare time, when nothing
+        is sounding yet and an immediate swap is what is wanted. Returns false if a swap is
+        already in flight -- retry rather than overwrite it.
+    */
+    bool loadImpulseA(std::span<const float> left, std::span<const float> right = {},
+                      CabinetMetadata metadata = {}, std::size_t crossfadeSamples = 2048);
+    bool loadImpulseB(std::span<const float> left, std::span<const float> right = {},
+                      CabinetMetadata metadata = {}, std::size_t crossfadeSamples = 2048);
     void process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept;
     [[nodiscard]] const CabinetMetadata& metadataA() const noexcept { return firstMetadata; }
     [[nodiscard]] const CabinetMetadata& metadataB() const noexcept { return secondMetadata; }
+    /** Samples of audible decay left behind after the input goes silent. Hosts use this,
+        via getTailLengthSeconds, to decide how long to keep pulling blocks once transport
+        stops -- reporting zero truncates the cabinet decay of every offline render.
+    */
+    [[nodiscard]] std::size_t tailSamples() const noexcept;
+    /** Puts the built-in responses back in both slots. */
+    void restoreDefaultImpulses(std::size_t crossfadeSamples = 2048);
 
 private:
     dsp::ProcessSpec spec;
     CabinetParameters parameters;
     CabinetMetadata firstMetadata;
     CabinetMetadata secondMetadata;
-    dsp::DirectConvolver first, second;
+    dsp::CrossfadingDirectConvolver first, second;
+    // Tracked here rather than read back from the convolvers: a staged response is not yet
+    // the active one, and the tail has to cover it from the moment it is queued.
+    std::size_t firstLength {}, secondLength {};
     dsp::Biquad lowCut, highCut;
     std::vector<float> dryBuffer, firstBuffer, secondBuffer, delay;
     std::array<std::size_t, dsp::maximumChannels> delayPosition {};
@@ -314,6 +341,12 @@ public:
     void process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept;
     [[nodiscard]] CalibrationReading calibrationReading() const noexcept { return calibrator.reading(); }
     [[nodiscard]] std::size_t latencySamples() const noexcept;
+    [[nodiscard]] std::size_t tailSamples() const noexcept { return cabinet.tailSamples(); }
+    bool loadCabinetImpulse(int slot, std::span<const float> left, std::span<const float> right,
+                            CabinetMetadata metadata, std::size_t crossfadeSamples);
+    void restoreDefaultCabinet(std::size_t crossfadeSamples) { cabinet.restoreDefaultImpulses(crossfadeSamples); }
+    [[nodiscard]] const CabinetMetadata& cabinetMetadata(int slot) const noexcept
+    { return slot == 0 ? cabinet.metadataA() : cabinet.metadataB(); }
 
 private:
     void processDrivenPath(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept;
@@ -348,6 +381,21 @@ public:
     void process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept;
     [[nodiscard]] CalibrationReading calibrationReading() const noexcept;
     [[nodiscard]] std::size_t latencySamples() const noexcept;
+    /** The longer of the two voices rather than the active one: both run during a preset
+        crossfade, and a tail that shrank on a preset change would cut the outgoing decay.
+    */
+    [[nodiscard]] std::size_t tailSamples() const noexcept;
+    /** Loads a cabinet response into slot 0 (A) or 1 (B).
+
+        Applied to both voices, not just the sounding one: they alternate across preset
+        changes, so loading into one only would put the previous cabinet back the next time a
+        preset was recalled. Safe to call from a worker thread while audio is running.
+    */
+    bool loadCabinetImpulse(int slot, std::span<const float> left, std::span<const float> right = {},
+                            CabinetMetadata metadata = {}, std::size_t crossfadeSamples = 2048);
+    void restoreDefaultCabinet(std::size_t crossfadeSamples = 2048);
+    [[nodiscard]] const CabinetMetadata& cabinetMetadata(int slot) const noexcept
+    { return voices[crossfader.mode()].cabinetMetadata(slot); }
     [[nodiscard]] const AmpPreset& currentPreset() const noexcept { return presets[crossfader.mode()]; }
 
 private:

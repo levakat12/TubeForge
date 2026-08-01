@@ -155,7 +155,11 @@ void PartitionedConvolver::process(float* const* channels, std::size_t channelCo
 {
     const auto count = std::min(channelCount, configuredChannels);
     if (activePartitions == 0 || samples == 0) return;
-    const auto processSamples = std::min(samples, blockSize);
+    // Refused rather than truncated. Processing a short block would advance the spectrum
+    // history and overlap by a whole block anyway, leaving this instance permanently out of
+    // step with its input -- silently, and audibly. See the class comment.
+    if (samples != blockSize) return;
+    const auto processSamples = blockSize;
     for (std::size_t channel = 0; channel < count; ++channel)
     {
         std::fill(work.begin(), work.end(), std::complex<float> {});
@@ -180,6 +184,88 @@ void PartitionedConvolver::process(float* const* channels, std::size_t channelCo
             channelOverlap[index] = accumulator[index + blockSize].real();
     }
     spectrumPosition = (spectrumPosition + 1) % maximumPartitions;
+}
+
+void CrossfadingDirectConvolver::prepare(std::size_t maximumImpulseLength, std::size_t channels,
+                                         std::size_t blockSize)
+{
+    maximumBlockSize = std::max<std::size_t>(1, blockSize);
+    configuredChannels = std::clamp(channels, std::size_t { 1 }, maximumChannels);
+    convolvers[0].prepare(maximumImpulseLength, configuredChannels);
+    convolvers[1].prepare(maximumImpulseLength, configuredChannels);
+    oldBuffer.assign(maximumBlockSize * configuredChannels, 0.0f);
+    newBuffer.assign(maximumBlockSize * configuredChannels, 0.0f);
+    reset();
+}
+void CrossfadingDirectConvolver::reset() noexcept
+{
+    // Clears history, not the loaded response -- matching DirectConvolver::reset, which a
+    // caller reasonably expects to silence the tail without forgetting the cabinet. Resetting
+    // the active index here instead would discard a response staged just before the reset,
+    // leaving nothing loaded and the convolution silently passing its input through.
+    //
+    // Any swap that was staged or part-way through completes immediately: history is being
+    // cleared regardless, so there is nothing left to fade from.
+    if (swapRequested.exchange(false, std::memory_order_acq_rel) || crossfadeRemaining != 0)
+        activeIndex.store(1 - activeIndex.load(std::memory_order_relaxed), std::memory_order_release);
+    convolvers[0].reset(); convolvers[1].reset();
+    crossfadeActive.store(false, std::memory_order_release);
+    crossfadeRemaining = 0;
+}
+bool CrossfadingDirectConvolver::loadInactiveImpulse(std::span<const float> left,
+                                                     std::span<const float> right)
+{
+    if (crossfadeActive.load(std::memory_order_acquire)
+        || swapRequested.load(std::memory_order_acquire)) return false;
+    return convolvers[1 - activeIndex.load(std::memory_order_relaxed)].loadImpulse(left, right);
+}
+void CrossfadingDirectConvolver::requestSwap(std::size_t crossfadeSamples) noexcept
+{
+    fadeLength = std::max<std::size_t>(1, crossfadeSamples);
+    swapRequested.store(true, std::memory_order_release);
+}
+void CrossfadingDirectConvolver::process(float* const* channels, std::size_t channelCount,
+                                         std::size_t samples) noexcept
+{
+    const auto count = std::min(channelCount, configuredChannels);
+    const auto processSamples = std::min(samples, maximumBlockSize);
+    if (swapRequested.exchange(false, std::memory_order_acq_rel))
+    {
+        crossfadeRemaining = fadeLength;
+        crossfadeActive.store(true, std::memory_order_release);
+    }
+    const auto current = activeIndex.load(std::memory_order_relaxed);
+    if (crossfadeRemaining == 0)
+    {
+        convolvers[current].process(channels, count, processSamples);
+        return;
+    }
+    std::array<float*, maximumChannels> oldPointers {};
+    std::array<float*, maximumChannels> newPointers {};
+    for (std::size_t channel = 0; channel < count; ++channel)
+    {
+        oldPointers[channel] = oldBuffer.data() + channel * maximumBlockSize;
+        newPointers[channel] = newBuffer.data() + channel * maximumBlockSize;
+        std::copy_n(channels[channel], processSamples, oldPointers[channel]);
+        std::copy_n(channels[channel], processSamples, newPointers[channel]);
+    }
+    // Both sides must be driven with the same input every block, crossfade or not, so the
+    // incoming response's history is already filled when it becomes the only one sounding.
+    convolvers[current].process(oldPointers.data(), count, processSamples);
+    convolvers[1 - current].process(newPointers.data(), count, processSamples);
+    for (std::size_t sample = 0; sample < processSamples; ++sample)
+    {
+        const auto progress = 1.0f - static_cast<float>(crossfadeRemaining) / static_cast<float>(fadeLength);
+        for (std::size_t channel = 0; channel < count; ++channel)
+            channels[channel][sample] = oldPointers[channel][sample] * (1.0f - progress)
+                                      + newPointers[channel][sample] * progress;
+        if (crossfadeRemaining > 0) --crossfadeRemaining;
+    }
+    if (crossfadeRemaining == 0)
+    {
+        activeIndex.store(1 - current, std::memory_order_release);
+        crossfadeActive.store(false, std::memory_order_release);
+    }
 }
 
 void CrossfadingConvolver::prepare(std::size_t blockSize, std::size_t maximumImpulseLength,

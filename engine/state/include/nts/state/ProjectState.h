@@ -8,7 +8,7 @@
 
 namespace nts::state
 {
-inline constexpr int currentSchemaVersion = 2;
+inline constexpr int currentSchemaVersion = 3;
 inline constexpr std::string_view currentApplicationVersion = "0.10.0";
 
 struct EngineState
@@ -55,6 +55,12 @@ struct UiState
 struct AssetState
 {
     std::vector<std::string> relativePaths;
+    /** Project-relative paths to user cabinet impulse responses, empty when the built-in
+        response is in use. Held per slot rather than in relativePaths because which slot a
+        response belongs to is part of the setting, not incidental. Added in schema 3.
+    */
+    std::string cabinetIrPathA;
+    std::string cabinetIrPathB;
 
     bool operator==(const AssetState&) const = default;
 };

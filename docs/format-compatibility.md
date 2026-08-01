@@ -1,3 +1,19 @@
+## Neural Amp Modeler captures
+
+`.nam` captures are read by `nts_ml.nam` and converted to packed **NTSM v3**, which extends the
+packed model format with a WaveNet architecture code (5) and a per-layer `{kernelSize, dilation}`
+table following the header — WaveNet geometry cannot be expressed in the fixed v1/v2 headers.
+Versions 1 and 2 parse exactly as before.
+
+Supported: NAM format 0.7.0, `WaveNet` and `SlimmableContainer` architectures, single-channel input
+and condition, LeakyReLU(0.01) layers, an inline layer-array head. Refused with a named error: FiLM
+modulation, gated activations, grouped convolutions, an active head 1x1, secondary activations,
+bottleneck channels differing from layer channels, and any weight vector that disagrees with the
+declared geometry.
+
+See [nam-capture-guide.md](nam-capture-guide.md) for the tools and
+[nam-integration-plan.md](nam-integration-plan.md) for the format derivation.
+
 # Format compatibility
 
 Versions evolve independently. Application SemVer changes do not imply a package/model/schema change.

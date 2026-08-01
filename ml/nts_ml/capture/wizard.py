@@ -1,24 +1,30 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from enum import Enum
-from pathlib import Path
-from typing import Any
 import json
 import os
 import uuid
+from dataclasses import asdict, dataclass
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from ..alignment import align_pair
-from ..datasets import SessionPackage, StreamingPairedDataset, WaveReader, validate_session, write_pcm_wave
+from ..datasets import (
+    SessionPackage,
+    StreamingPairedDataset,
+    WaveReader,
+    validate_session,
+    write_pcm_wave,
+)
 from ..evaluation import generate_quality_report
 from ..export import export_model, validate_artifact
 from ..models import create_model, load_model_checkpoint
 from ..training import ExperimentConfig, train
 
 
-class CaptureStage(str, Enum):
+class CaptureStage(StrEnum):
     configured = "configured"
     material_ready = "material-ready"
     safety_verified = "safety-verified"

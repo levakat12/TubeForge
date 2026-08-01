@@ -6,8 +6,14 @@ from pathlib import Path
 
 import numpy as np
 
-from nts_ml.tone import (CONTROLLED_RIG_FAMILIES, DisentangledToneEncoder, InterpretableToneHeads,
-                         LinearToneEncoder, evaluate_tone_encoder, multi_resolution_representation)
+from nts_ml.tone import (
+    CONTROLLED_RIG_FAMILIES,
+    DisentangledToneEncoder,
+    InterpretableToneHeads,
+    LinearToneEncoder,
+    evaluate_tone_encoder,
+    multi_resolution_representation,
+)
 
 
 class Phase7ToneTests(unittest.TestCase):

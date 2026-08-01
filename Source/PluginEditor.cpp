@@ -3,6 +3,8 @@
 #include "TubeForgeTheme.h"
 
 #include "ui/AmplifierPage.h"
+#include "ui/CabinetPage.h"
+#include "ui/TunerPage.h"
 #include "ui/CircuitPage.h"
 #include "ui/NeuralCapturePage.h"
 #include "ui/ProfileLibraryPage.h"
@@ -19,35 +21,55 @@ namespace theme = tf::theme;
 
 namespace
 {
-/// The gear browser and the page header both read from this table, so a module can never show
-/// one name in the sidebar and another above its controls.
+/// The navigation icons and the caption above the page both read from this table, so a module
+/// can never show one name in the toolbar and another above its controls.
 struct ModuleDescriptor
 {
     const char* name;
     const char* tag;
     const char* blurb;
     int group;
+    tf::ui::Glyph glyph;
 };
 
 constexpr std::array<ModuleDescriptor, TubeForgeAudioProcessorEditor::moduleCount> moduleTable { {
     { "Amplifier", "Core tone",
-      "Set the sound here: drive, EQ and level. Everything else in TubeForge refines what you dial in on this page.", 0 },
+      "Set the sound here: drive, EQ and level. Everything else in TubeForge refines what you dial in on this page.",
+      0, tf::ui::Glyph::amplifier },
     { "Tone Shaping", "Fine control",
-      "Per-stage gain, filtering, feel, power-section behaviour and the noise gate. Reach for these once the amp is close.", 0 },
+      "Per-stage gain, filtering, feel, power-section behaviour and the noise gate. Reach for these once the amp is close.",
+      0, tf::ui::Glyph::toneShaping },
+    { "Tuner", "Get in tune",
+      "Tune up before anything else. Reads the input ahead of the amplifier, so gain and cabinet do not affect it.", 0 },
+    { "Cabinet", "Speaker response",
+      "Load your own impulse responses, or keep the built-in cabinets. Responses fade in, so you can swap one while playing.",
+      0, tf::ui::Glyph::cabinet },
     { "Neural Capture", "Amp models",
-      "Play through a captured amp. Load a model folder exported by the capture wizard, then choose what you monitor.", 1 },
+      "Play through a captured amp. Load a model folder exported by the capture wizard, then choose what you monitor.",
+      1, tf::ui::Glyph::neuralCapture },
     { "Tone Assistant", "Suggestions",
-      "Suggests bounded changes based on what it hears. Every suggestion is previewed first; nothing is applied without you.", 1 },
+      "Suggests bounded changes based on what it hears. Every suggestion is previewed first; nothing is applied without you.",
+      1, tf::ui::Glyph::toneAssistant },
     { "Profile Library", "Rigs & sharing",
-      "Browse, load and share .ntone rig profiles. Imports are validated before anything can reach the audio engine.", 1 },
+      "Browse, load and share .ntone rig profiles. Imports are validated before anything can reach the audio engine.",
+      1, tf::ui::Glyph::profileLibrary },
     { "Circuit", "Build the amp",
-      "Choose real components: tubes, power topology, tone stack. Changes compile off the audio thread and crossfade in.", 2 },
+      "Choose real components: tubes, power topology, tone stack. Changes compile off the audio thread and crossfade in.",
+      2, tf::ui::Glyph::circuit },
     { "Tone Analyzer", "Measure a clip",
-      "Analyse an isolated guitar or bass clip offline and read back its tonal fingerprint and how sure the analysis is.", 2 },
+      "Analyse an isolated guitar or bass clip offline and read back its tonal fingerprint and how sure the analysis is.",
+      2, tf::ui::Glyph::toneAnalyzer },
     { "Song Match", "Rebuild a tone",
-      "Import a song you own, pick the part you want, and get editable rigs that get close to it.", 2 } } };
+      "Import a song you own, pick the part you want, and get editable rigs that get close to it.",
+      2, tf::ui::Glyph::songMatch } } };
 
-constexpr std::array groupNames { "Play", "Tools", "Pro tools" };
+// Fixed heights for the three chrome bands. The page stage takes whatever is left over.
+constexpr int navBarHeight = 54;
+constexpr int railHeight = 116;
+constexpr int footerHeight = 28;
+constexpr int diagnosticsHeight = 20;
+/// Both rail clusters are this wide so the preset block between them is centred in the window.
+constexpr int railClusterWidth = 372;
 
 juce::String statusName(nts::diagnostics::AssetLoadStatus status)
 {
@@ -68,17 +90,20 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
 {
     setLookAndFeel(&lookAndFeel);
 
-    tf::ui::configureLabel(title, "TUBEFORGE", 21.0f, true, theme::textPrimary);
-    tf::ui::configureLabel(productTagline, "NEURAL AMPLIFIER STUDIO", 8.5f, true, theme::textTertiary);
-    tf::ui::configureFieldCaption(presetCaption, "Current rig");
-    tf::ui::configureLabel(presetName, "Default Rig", 15.0f, true, theme::textPrimary);
-    tf::ui::configureLabel(mode, processor.modeName(), 10.0f, true, theme::textSecondary);
-    tf::ui::configureLabel(deviceStatus, processor.deviceStatusText(), 9.0f, false, theme::textTertiary);
-    tf::ui::configureLabel(diagnosticsText, "Diagnostics waiting for audio...", 10.0f, false,
+    tf::ui::configureLabel(title, "TUBEFORGE", 16.0f, true, theme::textPrimary);
+    tf::ui::configureLabel(productTagline, "NEURAL AMPLIFIER STUDIO", 8.0f, true, theme::textTertiary);
+
+    tf::ui::configureFieldCaption(presetCaption, "Preset");
+    presetCaption.setJustificationType(juce::Justification::centred);
+    tf::ui::configureLabel(presetName, "Default Rig", 12.5f, false, theme::textPrimary);
+    presetName.setJustificationType(juce::Justification::centred);
+
+    tf::ui::configureFieldCaption(engineCaption, "Engine");
+    tf::ui::configureLabel(mode, processor.modeName(), 9.5f, true, theme::textSecondary);
+    tf::ui::configureLabel(deviceStatus, processor.deviceStatusText(), 9.5f, false, theme::textTertiary);
+    tf::ui::configureLabel(diagnosticsText, "Diagnostics waiting for audio...", 9.5f, false,
                            theme::textTertiary);
-    tf::ui::configureLabel(moduleTitle, moduleTable[0].name, 16.0f, true, theme::textPrimary);
-    tf::ui::configureLabel(moduleSubtitle, moduleTable[0].blurb, 11.5f, false, theme::textSecondary);
-    moduleSubtitle.setJustificationType(juce::Justification::topLeft);
+    diagnosticsText.setJustificationType(juce::Justification::centredRight);
 
     tf::ui::configureFieldCaption(inputLabel, "Input");
     tf::ui::configureFieldCaption(outputLabel, "Output");
@@ -96,17 +121,21 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     presetPrevious.setTooltip("Previous profile in the library");
     presetNext.setTooltip("Next profile in the library");
     presetBrowse.setTooltip("Open the profile library");
+    saveProject.setTooltip("Save the whole session as a .tforge project");
+    openProject.setTooltip("Open a .tforge project");
+    audioSettings.setTooltip("Audio device settings");
     engineModeSelector.setTooltip("Which engine renders the amp: the traditional model, a loaded "
                                   "neural capture, or the physical circuit solver.");
 
     buildPages();
-    buildGearBrowser();
+    buildNavigation();
 
     for (auto* component : std::initializer_list<juce::Component*> {
              &title, &productTagline, &presetCaption, &presetName, &presetPrevious, &presetNext,
-             &presetBrowse, &diagnosticsText, &inputLabel, &outputLabel, &browserPanel, &pageHost,
-             &signalChain, &studioMeter, &inputGain, &outputGain, &bypass, &proMode,
-             &engineModeSelector, &audioSettings, &openProject, &saveProject })
+             &presetBrowse, &engineCaption, &inputLabel, &outputLabel, &inputMeter, &outputMeter,
+             &pageHost, &mode, &deviceStatus, &signalChain, &diagnosticsText, &inputGain,
+             &outputGain, &bypass, &proMode, &engineModeSelector, &audioSettings, &openProject,
+             &saveProject })
         addAndMakeVisible(*component);
 
     inputAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
@@ -136,8 +165,8 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     applyProModeVisibility();
 
     setResizable(true, true);
-    setResizeLimits(1020, 700, 1700, 1160);
-    setSize(1260, 840);
+    setResizeLimits(1040, 700, 1800, 1200);
+    setSize(1240, 820);
     startTimerHz(20);
 }
 
@@ -151,14 +180,16 @@ void TubeForgeAudioProcessorEditor::buildPages()
     // Order must match moduleTable.
     pages[0] = std::make_unique<AmplifierPage>(processor);
     pages[1] = std::make_unique<ToneShapingPage>(processor);
-    pages[2] = std::make_unique<NeuralCapturePage>(processor);
-    pages[3] = std::make_unique<ToneAssistantPage>(processor);
+    pages[2] = std::make_unique<TunerPage>(processor);
+    pages[3] = std::make_unique<CabinetPage>(processor);
+    pages[4] = std::make_unique<NeuralCapturePage>(processor);
+    pages[5] = std::make_unique<ToneAssistantPage>(processor);
     auto profileLibrary = std::make_unique<ProfileLibraryPage>(processor);
     library = profileLibrary.get();
     pages[libraryModule] = std::move(profileLibrary);
-    pages[5] = std::make_unique<CircuitPage>(processor);
-    pages[6] = std::make_unique<ToneAnalyzerPage>(processor);
-    pages[7] = std::make_unique<SongMatchPage>(processor);
+    pages[7] = std::make_unique<CircuitPage>(processor);
+    pages[8] = std::make_unique<ToneAnalyzerPage>(processor);
+    pages[9] = std::make_unique<SongMatchPage>(processor);
 
     // The library is the only page with anything to say to the shell.
     library->onRigLoaded = [this](juce::String name)
@@ -171,29 +202,19 @@ void TubeForgeAudioProcessorEditor::buildPages()
 
     for (auto& page : pages)
         pageHost.addChildComponent(*page);
-    pageHost.addAndMakeVisible(moduleTitle);
-    pageHost.addAndMakeVisible(moduleSubtitle);
 }
 
-void TubeForgeAudioProcessorEditor::buildGearBrowser()
+void TubeForgeAudioProcessorEditor::buildNavigation()
 {
-    tf::ui::configureLabel(browserTitle, "GEAR", 10.0f, true, theme::accent);
-    for (std::size_t group = 0; group < browserGroupLabels.size(); ++group)
-    {
-        tf::ui::configureFieldCaption(browserGroupLabels[group], groupNames[group]);
-        browserPanel.addAndMakeVisible(browserGroupLabels[group]);
-    }
-    browserPanel.addAndMakeVisible(browserTitle);
-    browserPanel.addAndMakeVisible(mode);
-    browserPanel.addAndMakeVisible(deviceStatus);
     for (int index = 0; index < moduleCount; ++index)
     {
         const auto& descriptor = moduleTable[static_cast<std::size_t>(index)];
-        auto item = std::make_unique<tf::ui::GearBrowserItem>(descriptor.name, descriptor.tag);
-        item->setTooltip(descriptor.blurb);
+        auto item = std::make_unique<tf::ui::IconButton>(descriptor.glyph, descriptor.name, true);
+        // The icons carry no text, so the tooltip is the only place the description can live.
+        item->setTooltip(juce::String(descriptor.name) + " -- " + descriptor.blurb);
         item->onClick = [this, index] { setActiveModule(index); };
-        browserPanel.addAndMakeVisible(*item);
-        gearItems.push_back(std::move(item));
+        addAndMakeVisible(*item);
+        navIcons.push_back(std::move(item));
     }
 }
 
@@ -203,12 +224,11 @@ void TubeForgeAudioProcessorEditor::setActiveModule(int index)
     for (int page = 0; page < moduleCount; ++page)
     {
         pages[static_cast<std::size_t>(page)]->setVisible(page == activeModule);
-        gearItems[static_cast<std::size_t>(page)]->setToggleState(page == activeModule,
-                                                                  juce::dontSendNotification);
+        navIcons[static_cast<std::size_t>(page)]->setToggleState(page == activeModule,
+                                                                 juce::dontSendNotification);
     }
     const auto& descriptor = moduleTable[static_cast<std::size_t>(activeModule)];
-    moduleTitle.setText(descriptor.name, juce::dontSendNotification);
-    moduleSubtitle.setText(descriptor.blurb, juce::dontSendNotification);
+    moduleCaption = juce::String(descriptor.name) + "   /   " + descriptor.tag;
     // Pull state in now rather than leaving the page blank until the next tick.
     pages[static_cast<std::size_t>(activeModule)]->refresh();
     repaint();
@@ -218,8 +238,7 @@ void TubeForgeAudioProcessorEditor::applyProModeVisibility()
 {
     const auto pro = proMode.getToggleState();
     for (int index = firstProModule; index < moduleCount; ++index)
-        gearItems[static_cast<std::size_t>(index)]->setVisible(pro);
-    browserGroupLabels[2].setVisible(pro);
+        navIcons[static_cast<std::size_t>(index)]->setVisible(pro);
     diagnosticsText.setVisible(pro);
     if (! pro && activeModule >= firstProModule)
         setActiveModule(0);
@@ -233,106 +252,166 @@ void TubeForgeAudioProcessorEditor::paint(juce::Graphics& graphics)
                                                   0.0f, static_cast<float>(getHeight()), false));
     graphics.fillAll();
 
-    auto shell = getLocalBounds().toFloat().reduced(5.0f);
+    // The two chrome bands at the top are one continuous surface, lifted a shade off the
+    // backdrop and separated from each other -- and from the page -- by single hairlines.
     graphics.setColour(theme::shell);
-    graphics.fillRoundedRectangle(shell, 11.0f);
-    graphics.setColour(juce::Colours::white.withAlpha(0.05f));
-    graphics.drawRoundedRectangle(shell.reduced(0.5f), 11.0f, 1.0f);
+    graphics.fillRect(navBounds.getUnion(railBounds));
+    theme::rule(graphics, navBounds.withHeight(1).withY(navBounds.getBottom() - 1));
+    theme::rule(graphics, railBounds.withHeight(1).withY(railBounds.getBottom() - 1));
+    theme::rule(graphics, footerBounds.withHeight(1), 0.7f);
 
-    theme::glass(graphics, headerBounds.toFloat(), 9.0f, true);
-    // The brand mark: a lit bar rather than a logo file, so it scales with the header.
-    graphics.setColour(theme::accent);
-    graphics.fillRoundedRectangle(juce::Rectangle<float>(3.0f, 26.0f).withCentre(
-        { static_cast<float>(headerBounds.getX()) + 14.0f,
-          static_cast<float>(headerBounds.getCentreY()) }), 1.5f);
+    for (const auto x : navDividerX)
+        if (x > 0) theme::divider(graphics, x, navBounds.getCentreY(), 20, 0.9f);
+    for (const auto x : railDividerX)
+        if (x > 0) theme::divider(graphics, x, railBounds.getCentreY(), railBounds.getHeight() - 34);
 
-    theme::glass(graphics, browserPanel.getBounds().toFloat(), 10.0f);
-    theme::glass(graphics, pageHost.getBounds().toFloat(), 10.0f);
-    theme::glass(graphics, meterRailBounds.toFloat(), 10.0f);
+    theme::stage(graphics, stageBounds.toFloat(), 8.0f);
+    theme::caption(graphics, captionBounds, moduleCaption, theme::textSecondary);
 
-    if (diagnosticsText.isVisible())
-        theme::well(graphics, diagnosticsText.getBounds().toFloat().expanded(8.0f, 3.0f), 5.0f);
+    if (! presetName.getBounds().isEmpty())
+        theme::well(graphics, presetName.getBounds().toFloat().expanded(2.0f, 4.0f), 5.0f);
 }
 
 void TubeForgeAudioProcessorEditor::resized()
 {
-    auto area = getLocalBounds().reduced(14);
+    auto area = getLocalBounds();
 
-    headerBounds = area.removeFromTop(60);
-    auto header = headerBounds.reduced(10, 0);
-    auto brand = header.removeFromLeft(160).withTrimmedLeft(12);
-    title.setBounds(brand.removeFromTop(34).withTrimmedTop(6));
-    productTagline.setBounds(brand.withTrimmedTop(-4));
+    navBounds = area.removeFromTop(navBarHeight);
+    railBounds = area.removeFromTop(railHeight);
+    footerBounds = area.removeFromBottom(footerHeight
+                                         + (diagnosticsText.isVisible() ? diagnosticsHeight : 0));
+    stageBounds = area.reduced(16, 14);
 
-    audioSettings.setBounds(header.removeFromRight(66).reduced(4, 15));
-    saveProject.setBounds(header.removeFromRight(62).reduced(4, 15));
-    openProject.setBounds(header.removeFromRight(62).reduced(4, 15));
-    bypass.setBounds(header.removeFromRight(98).reduced(4, 14));
-    proMode.setBounds(header.removeFromRight(74).reduced(4, 14));
-    engineModeSelector.setBounds(header.removeFromRight(164).reduced(4, 15));
+    layOutNavigation();
+    layOutRail();
 
-    auto preset = header.removeFromLeft(std::min(360, header.getWidth())).reduced(6, 10);
-    presetPrevious.setBounds(preset.removeFromLeft(28).reduced(0, 4));
-    preset.removeFromLeft(4);
-    presetBrowse.setBounds(preset.removeFromRight(62).reduced(0, 4));
-    presetNext.setBounds(preset.removeFromRight(32).withTrimmedRight(4).reduced(0, 4));
-    presetCaption.setBounds(preset.removeFromTop(14).withTrimmedLeft(8));
-    presetName.setBounds(preset.withTrimmedLeft(8));
-
-    area.removeFromTop(10);
+    auto footer = footerBounds.reduced(18, 0);
     if (diagnosticsText.isVisible())
-    {
-        diagnosticsText.setBounds(area.removeFromBottom(26).reduced(10, 3));
-        area.removeFromBottom(8);
-    }
-    signalChain.setBounds(area.removeFromBottom(78));
-    area.removeFromBottom(10);
+        diagnosticsText.setBounds(footer.removeFromBottom(diagnosticsHeight));
+    audioSettings.setBounds(footer.removeFromLeft(22).withSizeKeepingCentre(22, 22));
+    footer.removeFromLeft(10);
+    mode.setBounds(footer.removeFromLeft(78));
+    deviceStatus.setBounds(footer.removeFromLeft(std::max(0, footer.getWidth() - 470)));
+    signalChain.setBounds(footer);
 
-    browserPanel.setBounds(area.removeFromLeft(198));
-    area.removeFromLeft(10);
-    meterRailBounds = area.removeFromRight(116);
-    area.removeFromRight(10);
-    pageHost.setBounds(area);
+    auto stage = stageBounds.reduced(18, 14);
+    captionBounds = stage.removeFromTop(14);
+    stage.removeFromTop(12);
+    pageHost.setBounds(stage);
+    for (auto& page : pages)
+        page->setBounds(pageHost.getLocalBounds());
+}
 
-    auto browserInside = browserPanel.getLocalBounds().reduced(11, 12);
-    browserTitle.setBounds(browserInside.removeFromTop(16));
-    browserInside.removeFromTop(6);
-    auto browserStatus = browserInside.removeFromBottom(38);
-    mode.setBounds(browserStatus.removeFromTop(16));
-    deviceStatus.setBounds(browserStatus);
-    browserInside.removeFromBottom(8);
-    int lastGroup = -1;
+void TubeForgeAudioProcessorEditor::layOutNavigation()
+{
+    constexpr int iconWidth = 44;
+    constexpr int iconHeight = 34;
+    constexpr int iconGap = 2;
+    constexpr int groupGap = 20;
+
+    auto brand = navBounds.withTrimmedLeft(20).withWidth(180).reduced(0, 9);
+    title.setBounds(brand.removeFromTop(18));
+    productTagline.setBounds(brand);
+
+    // Centre the whole strip of icons in the window, including the gaps between groups, so it
+    // stays centred when PRO mode adds or removes the last three.
+    auto width = 0;
+    auto lastGroup = -1;
     for (int index = 0; index < moduleCount; ++index)
     {
-        auto& item = *gearItems[static_cast<std::size_t>(index)];
-        if (! item.isVisible()) continue;
+        if (! navIcons[static_cast<std::size_t>(index)]->isVisible()) continue;
         const auto group = moduleTable[static_cast<std::size_t>(index)].group;
-        if (group != lastGroup)
-        {
-            if (lastGroup >= 0) browserInside.removeFromTop(6);
-            browserGroupLabels[static_cast<std::size_t>(group)].setBounds(
-                browserInside.removeFromTop(16).withTrimmedLeft(4));
-            browserInside.removeFromTop(2);
-            lastGroup = group;
-        }
-        item.setBounds(browserInside.removeFromTop(40).reduced(0, 1));
+        if (lastGroup >= 0) width += group == lastGroup ? iconGap : groupGap;
+        width += iconWidth;
+        lastGroup = group;
     }
 
-    auto meter = meterRailBounds.reduced(8, 12);
-    inputLabel.setBounds(meter.removeFromTop(14));
-    inputGain.setBounds(meter.removeFromTop(86).reduced(6, 0));
-    meter.removeFromTop(8);
-    outputLabel.setBounds(meter.removeFromTop(14));
-    outputGain.setBounds(meter.removeFromTop(86).reduced(6, 0));
-    meter.removeFromTop(10);
-    studioMeter.setBounds(meter);
+    auto x = navBounds.getCentreX() - width / 2;
+    const auto y = navBounds.getCentreY() - iconHeight / 2;
+    navDividerX = {};
+    auto divider = 0;
+    lastGroup = -1;
+    for (int index = 0; index < moduleCount; ++index)
+    {
+        auto& item = *navIcons[static_cast<std::size_t>(index)];
+        if (! item.isVisible()) continue;
+        const auto group = moduleTable[static_cast<std::size_t>(index)].group;
+        if (lastGroup >= 0)
+        {
+            if (group == lastGroup)
+            {
+                x += iconGap;
+            }
+            else
+            {
+                if (divider < static_cast<int>(navDividerX.size()))
+                    navDividerX[static_cast<std::size_t>(divider++)] = x + groupGap / 2;
+                x += groupGap;
+            }
+        }
+        item.setBounds(x, y, iconWidth, iconHeight);
+        x += iconWidth;
+        lastGroup = group;
+    }
+}
 
-    auto host = pageHost.getLocalBounds().reduced(16, 13);
-    moduleTitle.setBounds(host.removeFromTop(21));
-    moduleSubtitle.setBounds(host.removeFromTop(30));
-    host.removeFromTop(9);
-    for (auto& page : pages)
-        page->setBounds(host);
+void TubeForgeAudioProcessorEditor::layOutRail()
+{
+    auto rail = railBounds.reduced(20, 10);
+    auto leftCluster = rail.removeFromLeft(railClusterWidth);
+    auto rightCluster = rail.removeFromRight(railClusterWidth);
+    railDividerX = { leftCluster.getRight() + 10, rightCluster.getX() - 10 };
+
+    // Input trim: caption, knob with its value underneath, peak bar. The output cluster on the
+    // right is the same three rows mirrored, so the rail reads symmetrically.
+    auto inputCell = leftCluster.removeFromLeft(88);
+    inputLabel.setBounds(inputCell.removeFromTop(12));
+    inputCell.removeFromTop(2);
+    inputMeter.setBounds(inputCell.removeFromBottom(4).reduced(16, 0));
+    inputCell.removeFromBottom(4);
+    inputGain.setBounds(inputCell);
+
+    leftCluster.removeFromLeft(20);
+    auto engineCell = leftCluster.removeFromLeft(152).withSizeKeepingCentre(152, 44);
+    engineCaption.setBounds(engineCell.removeFromTop(12));
+    engineCell.removeFromTop(4);
+    engineModeSelector.setBounds(engineCell.removeFromTop(28));
+
+    leftCluster.removeFromLeft(18);
+    auto switchCell = leftCluster.removeFromLeft(94).withSizeKeepingCentre(94, 64);
+    bypass.setBounds(switchCell.removeFromTop(28));
+    switchCell.removeFromTop(8);
+    proMode.setBounds(switchCell.removeFromTop(28));
+
+    auto outputCell = rightCluster.removeFromRight(88);
+    outputLabel.setBounds(outputCell.removeFromTop(12));
+    outputCell.removeFromTop(2);
+    outputMeter.setBounds(outputCell.removeFromBottom(4).reduced(16, 0));
+    outputCell.removeFromBottom(4);
+    outputGain.setBounds(outputCell);
+
+    // Presets sit in the middle: caption, a row of actions, then the name between arrows. The
+    // inset keeps the arrows clear of the cluster dividers once the window is at its narrowest.
+    rail = rail.reduced(16, 0);
+    auto centre = rail.withSizeKeepingCentre(std::min(rail.getWidth(), 380), 78);
+    presetCaption.setBounds(centre.removeFromTop(12));
+    centre.removeFromTop(6);
+
+    constexpr int actionWidth = 26;
+    constexpr int actionGap = 10;
+    auto actions = centre.removeFromTop(24);
+    auto actionX = actions.getCentreX() - (actionWidth * 3 + actionGap * 2) / 2;
+    for (auto* action : { &saveProject, &openProject, &presetBrowse })
+    {
+        action->setBounds(actionX, actions.getY(), actionWidth, actions.getHeight());
+        actionX += actionWidth + actionGap;
+    }
+
+    centre.removeFromTop(6);
+    auto row = centre.removeFromTop(30);
+    presetPrevious.setBounds(row.removeFromLeft(26).reduced(0, 3));
+    presetNext.setBounds(row.removeFromRight(26).reduced(0, 3));
+    presetName.setBounds(row.reduced(8, 4));
 }
 
 void TubeForgeAudioProcessorEditor::timerCallback()
@@ -343,11 +422,13 @@ void TubeForgeAudioProcessorEditor::timerCallback()
     processor.refreshPhysicalCircuit();
     processor.refreshNonRealtimeDiagnostics();
     processor.refreshAssistant();
+    // The tuner's queue is written by the audio thread and has to be drained whether or not
+    // anyone is looking at it, or it fills and the reading goes stale the moment it is opened.
+    processor.updateTuner();
 
     const auto& meters = processor.meterState();
-    studioMeter.setLevels(
-        std::clamp(std::max(meters.inputPeak(0), meters.inputPeak(1)), 0.0f, 1.0f),
-        std::clamp(std::max(meters.outputPeak(0), meters.outputPeak(1)), 0.0f, 1.0f));
+    inputMeter.setLevel(std::max(meters.inputPeak(0), meters.inputPeak(1)));
+    outputMeter.setLevel(std::max(meters.outputPeak(0), meters.outputPeak(1)));
     signalChain.setEngineMode(static_cast<int>(std::lround(
         processor.getParameters().getRawParameterValue("engineMode")->load(std::memory_order_relaxed))));
 

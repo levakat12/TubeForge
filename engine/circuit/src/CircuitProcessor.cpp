@@ -112,4 +112,10 @@ std::size_t CircuitProcessor::latencySamples() const noexcept
         || slots[static_cast<std::size_t>(active)]->channels[0] == nullptr) return 0;
     return slots[static_cast<std::size_t>(active)]->channels[0]->latencySamples();
 }
+
+std::size_t CircuitProcessor::tailSamples() const noexcept
+{
+    if (activeSlot.load(std::memory_order_acquire) < 0) return 0;
+    return static_cast<std::size_t>(currentSpec.sampleRate * tailAllowanceSeconds);
+}
 } // namespace nts::circuit

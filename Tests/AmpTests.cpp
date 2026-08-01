@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <new>
 #include <numbers>
+#include <thread>
 #include <vector>
 
 namespace
@@ -218,6 +219,108 @@ void testTonePhaseAndPower(TestHarness& tests)
     tests.expect(power.supplyState(0) > sagged, "power-amp virtual supply recovers after load");
 }
 
+/// Replacing a cabinet response while audio is running -- what user IR loading needs.
+void testCabinetImpulseSwapping(TestHarness& tests)
+{
+    // A response can only be replaced safely if it is staged into an inactive buffer and
+    // faded across on the audio thread. Overwriting coefficients in place, which is what the
+    // section used to do, races the audio thread and produces garbage.
+    nts::amp::CabinetSection cabinet; cabinet.prepare(stereoSpec);
+    nts::amp::CabinetParameters parameters;
+    parameters.blend = 0.0f; parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
+    cabinet.setParameters(parameters, 0); cabinet.reset();
+
+    const auto drive = [&](std::size_t blocks, std::size_t samplesPerBlock)
+    {
+        std::vector<float> captured;
+        std::array<float, blockSize> left {}, right {};
+        float* channels[] { left.data(), right.data() };
+        for (std::size_t block = 0; block < blocks; ++block)
+        {
+            left.fill(0.0f); right.fill(0.0f);
+            for (std::size_t sample = 0; sample < samplesPerBlock; ++sample)
+                left[sample] = right[sample] = 0.25f;
+            cabinet.process(channels, 2, samplesPerBlock);
+            for (std::size_t sample = 0; sample < samplesPerBlock; ++sample) captured.push_back(left[sample]);
+        }
+        return captured;
+    };
+
+    static_cast<void>(drive(4, blockSize));
+    // Longer than the synthesized response in the other slot, so the tail assertion below is
+    // actually reading the replacement rather than whatever slot B still holds.
+    std::vector<float> replacement(512);
+    for (std::size_t index = 0; index < replacement.size(); ++index)
+        replacement[index] = (index == 0 ? 0.9f : 0.0f)
+                           + 0.2f * std::exp(-static_cast<float>(index) / 90.0f)
+                           * std::sin(0.27f * static_cast<float>(index));
+    tests.expect(cabinet.loadImpulseA(replacement, {}, { "Replacement", "57", 0.5f }, 256),
+                 "cabinet accepts a replacement response while running");
+
+    const auto during = drive(16, blockSize);
+    auto largestStep = 0.0f;
+    for (std::size_t index = 1; index < during.size(); ++index)
+        largestStep = std::max(largestStep, std::abs(during[index] - during[index - 1]));
+    tests.expect(std::isfinite(largestStep) && largestStep < 0.5f,
+                 "swapping the cabinet response fades rather than steps");
+    tests.expectEqual(cabinet.tailSamples(), replacement.size(),
+                      "tail follows the newly staged response");
+
+    // Short blocks are the case that rules out FFT partitioning here: a partitioned convolver
+    // advances its overlap by a whole block whatever it is handed, so anything less than a
+    // full block corrupts its state. Direct convolution is invariant to how the input is cut up.
+    nts::amp::CabinetSection uniform; uniform.prepare(stereoSpec);
+    nts::amp::CabinetSection chopped; chopped.prepare(stereoSpec);
+    uniform.setParameters(parameters, 0); chopped.setParameters(parameters, 0);
+    uniform.reset(); chopped.reset();
+    std::array<float, blockSize> a {}, b {}, c {}, d {};
+    for (std::size_t index = 0; index < blockSize; ++index)
+        a[index] = b[index] = c[index] = d[index] = 0.3f * std::sin(0.07f * static_cast<float>(index));
+    float* wholeChannels[] { a.data(), b.data() };
+    float* choppedChannels[] { c.data(), d.data() };
+    uniform.process(wholeChannels, 2, blockSize);
+    float* firstHalf[] { c.data(), d.data() };
+    chopped.process(firstHalf, 2, blockSize / 4);
+    float* secondPart[] { c.data() + blockSize / 4, d.data() + blockSize / 4 };
+    chopped.process(secondPart, 2, blockSize - blockSize / 4);
+    auto matches = true;
+    for (std::size_t index = 0; index < blockSize; ++index)
+        matches = matches && std::abs(a[index] - c[index]) < 1.0e-6f;
+    tests.expect(matches, "cabinet output does not depend on how the block is subdivided");
+
+    // The case the whole change exists for: a loader thread replacing responses while the
+    // audio thread keeps convolving. Worth running under the sanitizer leg, which is where a
+    // torn read would actually be caught rather than merely producing odd numbers.
+    nts::amp::CabinetSection shared; shared.prepare(stereoSpec);
+    shared.setParameters(parameters, 0); shared.reset();
+    std::atomic<bool> running { true };
+    std::atomic<bool> finite { true };
+    std::thread loader([&shared, &running]
+    {
+        std::vector<float> response(256);
+        for (int generation = 0; running.load(std::memory_order_relaxed); ++generation)
+        {
+            for (std::size_t index = 0; index < response.size(); ++index)
+                response[index] = 0.4f * std::sin(0.01f * static_cast<float>(index * (generation % 7 + 1)));
+            static_cast<void>(shared.loadImpulseA(response, {}, { "Live", "57", 0.5f }, 128));
+            std::this_thread::yield();
+        }
+    });
+    std::array<float, blockSize> sl {}, sr {};
+    float* sharedChannels[] { sl.data(), sr.data() };
+    for (int block = 0; block < 4000; ++block)
+    {
+        for (std::size_t index = 0; index < blockSize; ++index)
+            sl[index] = sr[index] = 0.2f * std::sin(0.05f * static_cast<float>(block * blockSize + index));
+        shared.process(sharedChannels, 2, blockSize);
+        for (std::size_t index = 0; index < blockSize; ++index)
+            finite = finite && std::isfinite(sl[index]) && std::abs(sl[index]) < 12.0f;
+    }
+    running.store(false, std::memory_order_relaxed);
+    loader.join();
+    tests.expect(finite.load(), "cabinet stays finite and bounded while responses are replaced concurrently");
+}
+
 void testCabinetAndPresets(TestHarness& tests)
 {
     nts::amp::CabinetSection cabinet; cabinet.prepare(stereoSpec);
@@ -233,8 +336,15 @@ void testCabinetAndPresets(TestHarness& tests)
     cabinet.process(channels, 2, blockSize);
     tests.expect(cabinet.metadataA().name == "A" && cabinet.metadataB().microphone == "121"
                  && finite(left), "dual cabinet blend, phase, alignment, and metadata are active");
+    // Tail has to cover the longer of the two IRs, and B is read through the alignment delay.
+    tests.expectEqual(cabinet.tailSamples(), impulseB.size() + 3,
+                      "cabinet tail covers the aligned second impulse");
     parameters.bypass = true; cabinet.setParameters(parameters, 0); left.fill(0.25f); right = left;
     cabinet.process(channels, 2, blockSize); tests.expectNear(left.front(), 0.25, 1.0e-7, "cabinet bypass is transparent");
+    tests.expectEqual(cabinet.tailSamples(), std::size_t {}, "bypassed cabinet reports no tail");
+    parameters.bypass = false; cabinet.setParameters(parameters, 0);
+
+    testCabinetImpulseSwapping(tests);
 
     auto original = nts::amp::makeOriginalPreset(nts::amp::Topology::vintageBloom, nts::amp::Instrument::bass);
     original.parameters.stages[0].memoryAmount = 0.731f;

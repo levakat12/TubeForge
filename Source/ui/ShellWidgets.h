@@ -2,41 +2,68 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
-#include <array>
-
 /// Chrome that belongs to the editor shell rather than to any one module page.
 namespace tf::ui
 {
-/// One entry in the left gear browser: name, one-line description, and an accent bar that
-/// lights up when its page is showing.
-class GearBrowserItem final : public juce::Button
+/// Every icon the shell can draw. They are line drawings built from paths rather than image
+/// assets so they stay crisp at any window size and pick up their colour from the state of
+/// the button that holds them.
+enum class Glyph
 {
-public:
-    GearBrowserItem(const juce::String& name, juce::String description);
-    void paintButton(juce::Graphics& graphics, bool isMouseOver, bool isButtonDown) override;
-private:
-    juce::String tag;
+    amplifier,
+    toneShaping,
+    cabinet,
+    neuralCapture,
+    toneAssistant,
+    profileLibrary,
+    circuit,
+    toneAnalyzer,
+    songMatch,
+    save,
+    open,
+    browse,
+    previous,
+    next,
+    settings
 };
 
-/// The always-visible strip along the bottom showing where the signal goes. It highlights the
-/// three stages the engine mode actually swaps out.
+/// Builds `glyph` as a stroked path fitted to `area`, centred and square.
+[[nodiscard]] juce::Path glyphPath(Glyph glyph, juce::Rectangle<float> area);
+
+/// A borderless icon button. Used both for the module navigation across the top of the window
+/// and for the small preset actions; `marksActive` is what tells the two apart, by underlining
+/// the icon whose page is currently showing.
+class IconButton final : public juce::Button
+{
+public:
+    IconButton(Glyph glyphToDraw, const juce::String& name, bool marksActive = false);
+    void paintButton(juce::Graphics& graphics, bool isMouseOver, bool isButtonDown) override;
+
+private:
+    Glyph glyph;
+    bool underlinesActive;
+};
+
+/// The status-bar breadcrumb showing where the signal goes. The three stages the engine mode
+/// actually swaps out are lit; the fixed ones stay quiet.
 class StudioSignalChain final : public juce::Component
 {
 public:
     void setEngineMode(int mode);
     void paint(juce::Graphics& graphics) override;
+
 private:
     int activeEngineMode {};
 };
 
-/// Input and output peak meters for the right-hand rail.
-class StudioLevelMeter final : public juce::Component
+/// A thin horizontal peak bar that sits under the input or output trim.
+class LevelBar final : public juce::Component
 {
 public:
-    void setLevels(float input, float output);
+    void setLevel(float newLevel);
     void paint(juce::Graphics& graphics) override;
+
 private:
-    float inputLevel {};
-    float outputLevel {};
+    float level {};
 };
 } // namespace tf::ui

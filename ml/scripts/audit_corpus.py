@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
 import json
+from pathlib import Path
 
 from nts_ml.datasets import SessionPackage, audit_real_corpus
-
 
 parser = argparse.ArgumentParser(description="Audit real-audio provenance and Phase 4 corpus diversity")
 parser.add_argument("--session", type=Path, action="append", required=True)

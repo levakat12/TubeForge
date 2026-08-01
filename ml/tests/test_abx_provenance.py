@@ -1,18 +1,23 @@
 from __future__ import annotations
 
-from pathlib import Path
 import csv
 import json
 import tempfile
 import unittest
 import uuid
+from pathlib import Path
 
 import numpy as np
-
 from _fixtures import create_session
+
 from nts_ml.datasets import SessionPackage, audit_real_corpus, file_sha256, write_pcm_wave
-from nts_ml.evaluation import (AbxSource, LISTENING_CATEGORIES, analyze_abx_results,
-                               create_abx_pack, integrated_loudness)
+from nts_ml.evaluation import (
+    LISTENING_CATEGORIES,
+    AbxSource,
+    analyze_abx_results,
+    create_abx_pack,
+    integrated_loudness,
+)
 
 
 class AbxProvenanceTests(unittest.TestCase):

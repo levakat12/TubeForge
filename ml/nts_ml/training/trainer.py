@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
-import time
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..datasets.streaming import PairedChunk
 from ..losses import combined_loss
-from ..models import (CausalTcn, ConditionedGru, ConditionedLstm, FeatureCache, LstmCache,
-                      RnnCache, TinyTanhRnn)
+from ..models import (
+    ConditionedLstm,
+    FeatureCache,
+    LstmCache,
+    RandomFeatureGru,
+    RandomFeatureTcn,
+    RnnCache,
+    TinyTanhRnn,
+)
 from .config import ExperimentConfig
 
 
@@ -45,17 +52,56 @@ class AdamW:
                                                 + self.weight_decay * parameter)
 
 
-def _tanh_gradients(model: TinyTanhRnn, cache: RnnCache, target: NDArray[np.floating],
-               history_samples: int) -> tuple[float, dict[str, NDArray[np.float32]]]:
+
+PRE_EMPHASIS_COEFFICIENT = 0.95
+"""Matches losses.audio.pre_emphasized_loss, so gradient and reported component agree."""
+
+
+def _error_signal(outputs, target, history_samples: int, pre_emphasis_weight: float):
+    """Loss and its derivative with respect to the model output.
+
+    Training used to minimise plain time-domain error while model selection scored the nine
+    component combined_loss, so the objective that chose a checkpoint was not the objective
+    that produced it. Pre-emphasis is the component that matters most for an amplifier: the
+    harmonic detail separating one distortion character from another carries little energy,
+    so an unweighted time-domain error barely sees it.
+
+    The weight is read from the same loss configuration the validation score uses rather than
+    from a knob of its own, so the two cannot drift apart. At the default weight of zero this
+    reduces exactly to the previous mean-squared error.
+    """
     expected = np.asarray(target, dtype=np.float32).reshape(-1)
     active = max(1, expected.size - history_samples)
-    errors = cache.outputs - expected
+    errors = (np.asarray(outputs, dtype=np.float32) - expected).astype(np.float32)
     errors[:history_samples] = 0.0
+
     loss = float(np.sum(np.square(errors)) / active)
+    gradient = (2.0 * errors / active).astype(np.float32)
+
+    if pre_emphasis_weight > 0.0:
+        # Pre-emphasis is linear, so filtering the error is the same as filtering both signals
+        # and subtracting -- one pass instead of two.
+        emphasised = errors.copy()
+        emphasised[1:] -= PRE_EMPHASIS_COEFFICIENT * errors[:-1]
+        loss += pre_emphasis_weight * float(np.sum(np.square(emphasised)) / active)
+        # Adjoint of that filter: each sample is fed by its own tap and by the next sample's.
+        adjoint = emphasised.copy()
+        adjoint[:-1] -= PRE_EMPHASIS_COEFFICIENT * emphasised[1:]
+        gradient += (2.0 * pre_emphasis_weight * adjoint / active).astype(np.float32)
+        gradient[:history_samples] = 0.0
+
+    return loss, active, gradient
+
+
+def _tanh_gradients(model: TinyTanhRnn, cache: RnnCache, target: NDArray[np.floating],
+               history_samples: int, pre_emphasis: float = 0.0
+               ) -> tuple[float, dict[str, NDArray[np.float32]]]:
+    expected = np.asarray(target, dtype=np.float32).reshape(-1)
+    loss, active, error_gradient = _error_signal(cache.outputs, target, history_samples, pre_emphasis)
     gradients = {name: np.zeros_like(value) for name, value in model.parameters().items()}
     next_state_gradient = np.zeros(model.state_size, dtype=np.float32)
     for index in range(expected.size - 1, -1, -1):
-        output_gradient = np.float32(2.0 * errors[index] / active)
+        output_gradient = np.float32(error_gradient[index])
         gradients["output_weight"] += output_gradient * cache.states[index + 1][None, :]
         gradients["output_bias"][0] += output_gradient
         state_gradient = model.output_weight[0] * output_gradient + next_state_gradient
@@ -70,16 +116,15 @@ def _tanh_gradients(model: TinyTanhRnn, cache: RnnCache, target: NDArray[np.floa
 
 
 def _lstm_gradients(model: ConditionedLstm, cache: LstmCache, target: NDArray[np.floating],
-                    history_samples: int) -> tuple[float, dict[str, NDArray[np.float32]]]:
+                    history_samples: int, pre_emphasis: float = 0.0
+                    ) -> tuple[float, dict[str, NDArray[np.float32]]]:
     expected = np.asarray(target, dtype=np.float32).reshape(-1)
-    active = max(1, expected.size - history_samples)
-    errors = cache.outputs - expected; errors[:history_samples] = 0.0
-    loss = float(np.sum(np.square(errors)) / active)
+    loss, _active, error_gradient = _error_signal(cache.outputs, target, history_samples, pre_emphasis)
     gradients = {name: np.zeros_like(value) for name, value in model.parameters().items()}
     next_hidden = np.zeros(model.state_size, dtype=np.float32)
     next_cell = np.zeros(model.state_size, dtype=np.float32)
     for index in range(expected.size - 1, -1, -1):
-        output_gradient = np.float32(2.0 * errors[index] / active)
+        output_gradient = np.float32(error_gradient[index])
         gradients["output_weight"] += output_gradient * cache.hidden[index + 1]
         gradients["output_bias"][0] += output_gradient
         gradients["residual_gain"][0] += output_gradient * cache.inputs[index, 0]
@@ -102,29 +147,27 @@ def _lstm_gradients(model: ConditionedLstm, cache: LstmCache, target: NDArray[np
     return loss, gradients
 
 
-def _feature_gradients(model: ConditionedGru | CausalTcn, cache: FeatureCache,
-                       target: NDArray[np.floating], history_samples: int
-                       ) -> tuple[float, dict[str, NDArray[np.float32]]]:
-    expected = np.asarray(target, dtype=np.float32).reshape(-1)
-    active = max(1, expected.size - history_samples)
-    errors = cache.outputs - expected; errors[:history_samples] = 0.0
-    output_gradient = (2.0 * errors / active).astype(np.float32)
+def _feature_gradients(model: RandomFeatureGru | RandomFeatureTcn, cache: FeatureCache,
+                       target: NDArray[np.floating], history_samples: int,
+                       pre_emphasis: float = 0.0) -> tuple[float, dict[str, NDArray[np.float32]]]:
+    loss, _active, output_gradient = _error_signal(cache.outputs, target, history_samples, pre_emphasis)
     gradients = {name: np.zeros_like(value) for name, value in model.parameters().items()}
     gradients["output_weight"] = cache.features.T @ output_gradient
     gradients["output_bias"][0] = np.sum(output_gradient)
     if "residual_gain" in gradients:
         gradients["residual_gain"][0] = output_gradient @ cache.inputs[:, 0]
     for gradient in gradients.values(): np.clip(gradient, -5.0, 5.0, out=gradient)
-    return float(np.sum(np.square(errors)) / active), gradients
+    return loss, gradients
 
 
-def _gradients(model, cache, target: NDArray[np.floating], history_samples: int):
+def _gradients(model, cache, target: NDArray[np.floating], history_samples: int,
+               pre_emphasis: float = 0.0):
     if isinstance(model, TinyTanhRnn) and isinstance(cache, RnnCache):
-        return _tanh_gradients(model, cache, target, history_samples)
+        return _tanh_gradients(model, cache, target, history_samples, pre_emphasis)
     if isinstance(model, ConditionedLstm) and isinstance(cache, LstmCache):
-        return _lstm_gradients(model, cache, target, history_samples)
-    if isinstance(model, (ConditionedGru, CausalTcn)) and isinstance(cache, FeatureCache):
-        return _feature_gradients(model, cache, target, history_samples)
+        return _lstm_gradients(model, cache, target, history_samples, pre_emphasis)
+    if isinstance(model, (RandomFeatureGru, RandomFeatureTcn)) and isinstance(cache, FeatureCache):
+        return _feature_gradients(model, cache, target, history_samples, pre_emphasis)
     raise TypeError("Unsupported model/cache combination")
 
 
@@ -137,6 +180,19 @@ def train(model, training_chunks: Iterable[PairedChunk],
     validation = list(validation_chunks)
     if not training or not validation:
         raise ValueError("Training and validation data cannot be empty")
+
+    backend = getattr(config.training, "backend", "numpy")
+    if backend in ("torch", "auto") and isinstance(model, ConditionedLstm):
+        from . import torch_backend
+        if torch_backend.is_available():
+            started = time.perf_counter()
+            report = torch_backend.train_lstm(model, training, validation, config, output_directory)
+            return TrainingResult(Path(report["best_checkpoint"]), report["best_validation_loss"],
+                                  time.perf_counter() - started, report["epoch_losses"])
+        if backend == "torch":
+            raise RuntimeError("backend is set to torch but it could not be imported: "
+                               + torch_backend.unavailable_reason())
+        # backend == "auto": fall through to the reference implementation below.
     optimizer = AdamW(model.parameters(), config.training.learning_rate, config.training.weight_decay)
     random = np.random.default_rng(config.training.seed)
     best_loss = float("inf")
@@ -153,7 +209,8 @@ def train(model, training_chunks: Iterable[PairedChunk],
             model.reset()
             if hasattr(model, "set_controls"): model.set_controls(chunk.reference.controls)
             output, cache = model.forward(chunk.input, retain_cache=True)
-            loss, gradients = _gradients(model, cache, chunk.target, chunk.reference.history_samples)
+            loss, gradients = _gradients(model, cache, chunk.target, chunk.reference.history_samples,
+                                         config.loss.pre_emphasis)
             for name in accumulated:
                 accumulated[name] += gradients[name]
             batch_count += 1

@@ -170,8 +170,11 @@ SimilarityBreakdown ToneSimilarity::compare(const ToneProfile& left, const ToneP
         + distance(ln.levelDependentSpectralChange, rn.levelDependentSpectralChange, 0.15f) * 0.18f
         + distance(ln.oddEvenBalance, rn.oddEvenBalance, 0.25f) * 0.12f);
     const auto bass = left.instrument == Instrument::bass || right.instrument == Instrument::bass;
-    const auto embeddingWeight = bass ? 0.30f : 0.30f;
-    const auto spectralWeight = bass ? 0.07f : 0.07f;
+    // Embedding and spectral weights are the same for both instruments; the rows below are
+    // what make the comparison instrument-aware. Written flat rather than as a ternary with
+    // two identical arms, which read as an unfinished edit.
+    constexpr auto embeddingWeight = 0.30f;
+    constexpr auto spectralWeight = 0.07f;
     const auto dynamicsWeight = bass ? 0.12f : 0.10f;
     const auto transientWeight = bass ? 0.07f : 0.06f;
     const auto lowWeight = bass ? 0.14f : 0.05f;

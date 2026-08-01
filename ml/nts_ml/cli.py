@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
 import json
 import uuid
+from pathlib import Path
 
 from .datasets import SessionPackage, StreamingPairedDataset, validate_session
 from .evaluation import evaluate, generate_evaluation_inputs, load_evaluation_pairs
 from .export import export_model
 from .models import create_model, load_model_checkpoint
+from .nam import distill
+from .nam.catalogue import build_catalogue
+from .nam.convert import convert_all
 from .training import ExperimentConfig, ExperimentTracker, train
 
 
@@ -55,6 +58,53 @@ def tiny_train(arguments: list[str] | None = None) -> int:
         tracker.finish(record, result.duration_seconds, result.best_checkpoint,
                        {"validationLoss": result.best_validation_loss}, manifest.sha256)
     print(options.output / run_id)
+    return 0
+
+
+def nam_distill(arguments: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Distil a Neural Amp Modeler capture into a packed TubeForge artifact")
+    parser.add_argument("--capture", type=Path, required=True, help="Path to a .nam file")
+    parser.add_argument("--di", type=Path, action="append", required=True,
+                        help="DI wav file or directory; repeatable. At least two distinct files.")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=Path("configs/nam-distill-lstm.toml"))
+    parser.add_argument("--tier", choices=("standard", "lite"), default="standard")
+    parser.add_argument("--sessions", type=int, default=2)
+    parser.add_argument("--repository", type=Path, default=Path.cwd())
+    options = parser.parse_args(arguments)
+    artifact = distill(options.capture, options.di, options.output, options.config,
+                       options.tier, options.sessions, options.repository)
+    print(artifact)
+    return 0
+
+
+def nam_import(arguments: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Convert Neural Amp Modeler captures into packed TubeForge artifacts")
+    parser.add_argument("captures", type=Path, nargs="+", help=".nam files or directories")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--tier", choices=("standard", "lite"), default="standard")
+    options = parser.parse_args(arguments)
+    converted, failed = convert_all(options.captures, options.output, options.tier)
+    for path, reason in failed:
+        print(f"skipped {path.name}: {reason}")
+    for result in converted:
+        print(result.artifact)
+    print(f"{len(converted)} converted, {len(failed)} skipped")
+    return 0 if converted or not failed else 2
+
+
+def nam_catalogue(arguments: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Index a folder of Neural Amp Modeler captures as a tone reference corpus")
+    parser.add_argument("roots", type=Path, nargs="+")
+    parser.add_argument("--output", type=Path, required=True)
+    options = parser.parse_args(arguments)
+    catalogue = build_catalogue(options.roots)
+    options.output.parent.mkdir(parents=True, exist_ok=True)
+    options.output.write_text(json.dumps(catalogue, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"{len(catalogue['captures'])} captures indexed from {len(options.roots)} root(s)")
     return 0
 
 

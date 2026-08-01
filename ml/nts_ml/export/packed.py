@@ -1,18 +1,27 @@
 from __future__ import annotations
 
-from pathlib import Path
 import hashlib
 import json
 import struct
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
 
-from ..models import CausalTcn, ConditionedGru, ConditionedLstm, TinyTanhRnn
+from ..models import ConditionedLstm, RandomFeatureGru, RandomFeatureTcn, TinyTanhRnn
 from ..schemas.model import ModelManifest
 
 PACKED_HEADER = struct.Struct("<4s6I")
 PACKED_HEADER_V2 = struct.Struct("<4s11I")
+# v3 exists because WaveNet geometry does not fit in a fixed header: kernel size and dilation vary
+# per layer, so the header is followed by a layer table of that many u32 pairs. Fields, in order:
+# version, architecture, sampleRate, inputChannels, channels, outputChannels, controlCount,
+# layerCount, flags, headKernel, reserved.
+PACKED_HEADER_V3 = struct.Struct("<4s11I")
+WAVENET_ARCHITECTURE = 5
+MAXIMUM_WAVENET_LAYERS = 64
+MAXIMUM_WAVENET_KERNEL = 64
+MAXIMUM_WAVENET_DILATION = 4096
 
 
 def pack_model(model) -> bytes:
@@ -20,7 +29,7 @@ def pack_model(model) -> bytes:
         header = PACKED_HEADER.pack(b"NTSM", 1, 1, model.sample_rate, 1, model.state_size, 1)
         parameters = model.parameters().values()
     else:
-        architecture = {ConditionedLstm: 2, ConditionedGru: 3, CausalTcn: 4}.get(type(model))
+        architecture = {ConditionedLstm: 2, RandomFeatureGru: 3, RandomFeatureTcn: 4}.get(type(model))
         if architecture is None: raise ValueError(f"Unsupported packed model: {type(model).__name__}")
         flags = int(bool(getattr(model, "residual", True)))
         auxiliary1 = int(getattr(model, "layers", 1)); auxiliary2 = int(getattr(model, "kernel_size", 1))
@@ -29,7 +38,7 @@ def pack_model(model) -> bytes:
                                        auxiliary1, auxiliary2)
         if isinstance(model, ConditionedLstm):
             parameters = model.parameters().values()
-        elif isinstance(model, ConditionedGru):
+        elif isinstance(model, RandomFeatureGru):
             parameters = (model.input_weight, model.recurrent_weight, model.bias,
                           model.output_weight, model.output_bias)
         else:
@@ -37,6 +46,96 @@ def pack_model(model) -> bytes:
                           model.output_weight, model.output_bias, model.residual_gain)
     payload = b"".join(np.asarray(parameter, dtype="<f4").tobytes(order="C") for parameter in parameters)
     return header + payload
+
+
+def pack_wavenet(spec) -> bytes:
+    """Pack a NAM WaveNet capture as NTSM v3.
+
+    The weight payload is copied through in the order the capture file already uses, so the
+    converter does not reinterpret weights it does not need to understand -- the runtime and
+    `nts_ml.nam.wavenet` agree on that order, and the exported test vectors prove it.
+    """
+    if len(spec.layers) > MAXIMUM_WAVENET_LAYERS:
+        raise ValueError(f"WaveNet captures are limited to {MAXIMUM_WAVENET_LAYERS} layers")
+    for layer in spec.layers:
+        if not 2 <= layer.kernel_size <= MAXIMUM_WAVENET_KERNEL:
+            raise ValueError(f"Kernel size {layer.kernel_size} is out of range")
+        if not 1 <= layer.dilation <= MAXIMUM_WAVENET_DILATION:
+            raise ValueError(f"Dilation {layer.dilation} is out of range")
+        if layer.activation != "LeakyReLU" or abs(layer.negative_slope - 0.01) > 1.0e-9:
+            raise ValueError("The packed runtime implements LeakyReLU(0.01) layers only")
+    if spec.input_size != 1 or spec.condition_size != 1:
+        raise ValueError("Packed WaveNet supports single-channel input and condition only")
+    header = PACKED_HEADER_V3.pack(b"NTSM", 3, WAVENET_ARCHITECTURE, spec.sample_rate, 1,
+                                   spec.channels, 1, 0, len(spec.layers), int(spec.head_bias),
+                                   spec.head_kernel_size, 0)
+    table = b"".join(struct.pack("<2I", layer.kernel_size, layer.dilation) for layer in spec.layers)
+    return header + table + np.asarray(spec.weights, dtype="<f4").tobytes(order="C")
+
+
+def export_wavenet(capture, destination: Path, tier: str = "standard",
+                   test_input: NDArray[np.floating] | None = None,
+                   expected_input_rms_db: float | None = None) -> ModelManifest:
+    """Convert a NAM capture into the artifact directory the plug-in already knows how to load.
+
+    The test vectors are rendered by `nts_ml.nam.wavenet`, which is checked against the reference
+    implementation. That makes the plug-in's existing test-vector validation a real correctness gate
+    on the C++ WaveNet rather than a formality: an inference bug on the runtime side cannot load.
+
+    The vector deliberately starts from a primed state, because that is what the runtime must
+    reproduce after a reset -- an implementation that zeroes its buffers instead disagrees for a
+    full receptive field and fails here, which is the intent.
+    """
+    from ..nam.wavenet import WaveNetModel
+
+    spec = capture.spec(tier)
+    destination.mkdir(parents=True, exist_ok=True)
+    vectors = destination / "test-vectors"
+    vectors.mkdir(exist_ok=True)
+    packed = pack_wavenet(spec)
+    (destination / "model.bin").write_bytes(packed)
+    if test_input is None:
+        random = np.random.default_rng(417)
+        test_input = random.normal(0.0, 0.08, 4096).astype(np.float32)
+    vector = np.asarray(test_input, dtype="<f4").reshape(-1)
+    model = WaveNetModel(spec)
+    model.reset()
+    expected = model.process(vector).astype("<f4")
+    vector.tofile(vectors / "input.f32")
+    expected.tofile(vectors / "output.f32")
+    (vectors / "metadata.json").write_text(json.dumps({
+        "samples": int(vector.size),
+        "maximumAbsoluteErrorTolerance": 1.0e-4,
+        "rmsErrorTolerance": 1.0e-5,
+        "accumulatedDriftTolerance": 1.0e-3,
+        "stateResetMaximumError": 1.0e-6,
+        "primedState": True,
+        "receptiveFieldSamples": spec.receptive_field,
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    loudness = capture.metadata.loudness
+    rms_db = expected_input_rms_db if expected_input_rms_db is not None else (
+        float(loudness) if loudness is not None else -21.0)
+    manifest = ModelManifest(
+        model_format_version=3,
+        architecture="wavenet",
+        sample_rate=spec.sample_rate,
+        input_channels=1,
+        output_channels=1,
+        state_size=spec.receptive_field,
+        latency_samples=0,
+        expected_input_rms_db=max(-60.0, min(0.0, rms_db)),
+        parameter_schema=[],
+        sha256=hashlib.sha256(packed).hexdigest(),
+    )
+    manifest.save(destination / "manifest.json")
+    (destination / "normalization.json").write_text(json.dumps({
+        "inputRmsDb": manifest.expected_input_rms_db,
+        "inputScale": 1.0,
+        "outputScale": 1.0,
+        "dcOffset": 0.0,
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (destination / "license.txt").write_text(capture.metadata.license_text(), encoding="utf-8")
+    return manifest
 
 
 def export_model(model, destination: Path,

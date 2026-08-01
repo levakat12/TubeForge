@@ -29,8 +29,15 @@ jobs:
         run: |
           python -m pip install pip-audit
           python -m pip_audit --requirement ml/requirements-audit.txt
+      # Lint only. `ruff format` is deliberately not run: the package is written in a
+      # compact style that the formatter would undo, and that is a change to make
+      # intentionally rather than as a side effect of adding a CI step.
+      - name: Lint Python
+        run: |
+          python -m pip install ruff
+          python -m ruff check ml
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DTUBEFORGE_WARNINGS_AS_ERRORS=ON
       - name: Build VST3, standalone, and tests
         run: cmake --build build --config ${{ matrix.configuration }} --parallel
       - name: Test
@@ -86,6 +93,47 @@ jobs:
         with:
           name: TubeForge-Windows-Unsigned-CI-Installer
           path: build/release/installer/TubeForge-0.10.0-Windows-x64.exe
+
+  # Advisory for now: reports findings without failing the build, so the initial backlog can be
+  # worked down deliberately. Promote to blocking once it is clear. Needs a compile database,
+  # which the Visual Studio generator does not emit, hence the separate Ninja configure.
+  windows-clang-tidy:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Generate compile database
+        run: >
+          cmake -S . -B build-tidy -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DTUBEFORGE_BUILD_TESTS=OFF
+      - name: Analyse engine sources
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem engine -Recurse -Filter *.cpp | ForEach-Object { $_.FullName }
+          clang-tidy -p build-tidy --quiet $files
+
+  # Address Sanitizer over the fast suites. Release only: MSVC's ASan cannot be combined with
+  # the /RTC checks Debug enables. The soak and VST3 host tests are excluded because their
+  # runtimes are impractical under the instrumentation slowdown.
+  windows-sanitizers:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure with Address Sanitizer
+        run: cmake -S . -B build-asan -G "Visual Studio 17 2022" -A x64 -DTUBEFORGE_ENABLE_SANITIZERS=ON
+      - name: Build sanitized suites
+        run: >
+          cmake --build build-asan --config Release --parallel
+          --target nts_unit_tests nts_dsp_tests nts_amp_tests nts_circuit_tests
+          nts_ml_runtime_tests nts_tone_analysis_tests nts_reconstruction_tests
+          nts_assistant_tests nts_ecosystem_tests
+      - name: Run sanitized suites
+        run: >
+          ctest --test-dir build-asan -C Release --output-on-failure
+          -R "nts_unit_tests|nts_dsp_tests|nts_amp_tests|nts_circuit_tests|nts_ml_runtime_tests|nts_tone_analysis_tests|nts_reconstruction_tests|nts_assistant_tests|nts_ecosystem_tests"
 
   windows-hour-soak:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

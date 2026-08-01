@@ -2,63 +2,103 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
-/// Shared visual language for the TubeForge editor. Every surface is built from the same
-/// small set of colours and the same two recipes -- a raised "glass" panel and a recessed
-/// "well" -- so the window reads as one instrument instead of a pile of debug widgets.
-/// Anything drawn by hand (meters, plots, schematics) pulls its colours from here rather
-/// than inventing another near-identical grey.
+/// Shared visual language for the TubeForge editor.
+///
+/// The whole window is built from four flat tones -- chrome, panel, stage, and a single
+/// hairline -- plus near-white text. There are no gradients, bevels or glows: depth comes
+/// from one-pixel rules and from how much light a surface reflects, the way a studio
+/// front panel does. Anything drawn by hand (meters, plots, schematics) pulls its colours
+/// from here rather than inventing another near-identical grey.
 namespace tf::theme
 {
-inline const juce::Colour backdropTop { 0xff1a1e26 };
-inline const juce::Colour backdropBottom { 0xff0a0b0e };
-inline const juce::Colour shell { 0xff0d0f14 };
-inline const juce::Colour panel { 0xff151920 };
-inline const juce::Colour panelRaised { 0xff1c212a };
-inline const juce::Colour sunken { 0xff090b0e };
-inline const juce::Colour hairline { 0xff272d37 };
+/// Warm charcoal rather than blue-black: a neutral grey turns faintly cyan next to the gold,
+/// which is what makes an amber-on-grey interface look cheap.
+inline const juce::Colour backdropTop { 0xff1b1917 };
+inline const juce::Colour backdropBottom { 0xff100f0e };
+inline const juce::Colour shell { 0xff161514 };
+inline const juce::Colour panel { 0xff1b1a18 };
+inline const juce::Colour panelRaised { 0xff242220 };
+inline const juce::Colour sunken { 0xff0b0a09 };
+inline const juce::Colour hairline { 0xff322f2b };
 
-inline const juce::Colour accent { 0xffff9a45 };
-inline const juce::Colour accentDim { 0xffb96a2e };
-inline const juce::Colour accentWash { 0xff33210f };
+/// One accent, and it is the only hue in the interface: golden orange, the colour of a lit
+/// valve. Everything that means "this is live, this is the value, this is where you are" uses
+/// it, and nothing else does -- so it never has to compete for attention.
+inline const juce::Colour accent { 0xfff0a340 };
+inline const juce::Colour accentDim { 0xff8f6a35 };
+inline const juce::Colour accentWash { 0xff2e2417 };
 
-inline const juce::Colour good { 0xff4fd08a };
-inline const juce::Colour warn { 0xfff0a94b };
-inline const juce::Colour bad { 0xffe8574b };
+inline const juce::Colour good { 0xff5cbf92 };
+/// Yellow rather than amber, so a warning cannot be mistaken for the accent.
+inline const juce::Colour warn { 0xffe3c04f };
+inline const juce::Colour bad { 0xffdc5348 };
 
-inline const juce::Colour textPrimary { 0xffe6e9ef };
-inline const juce::Colour textSecondary { 0xff98a1ae };
-inline const juce::Colour textTertiary { 0xff5f6875 };
+inline const juce::Colour textPrimary { 0xfff3f0ea };
+inline const juce::Colour textSecondary { 0xffa09a90 };
+inline const juce::Colour textTertiary { 0xff67625a };
 
 [[nodiscard]] inline juce::Font font(float height, bool bold = false)
 {
     return juce::Font(juce::FontOptions(height, bold ? juce::Font::bold : juce::Font::plain));
 }
 
-/// The one glass recipe: a soft top-lit gradient, a light seam on the edge, and a dark
-/// halo just outside it. Used for every panel that sits on the backdrop.
-inline void glass(juce::Graphics& graphics, juce::Rectangle<float> area, float radius = 10.0f,
+/// A flat panel that sits on the backdrop: one fill, one hairline. `raised` is the hover /
+/// emphasis variant -- it lightens the fill rather than adding an edge, so a row of them
+/// stays quiet until you point at one.
+inline void glass(juce::Graphics& graphics, juce::Rectangle<float> area, float radius = 8.0f,
                   bool raised = false)
 {
     if (area.isEmpty()) return;
-    const auto base = raised ? panelRaised : panel;
-    graphics.setGradientFill(juce::ColourGradient(base.brighter(0.10f), area.getX(), area.getY(),
-                                                  base.darker(0.24f), area.getX(), area.getBottom(), false));
+    graphics.setColour(raised ? panelRaised : panel);
     graphics.fillRoundedRectangle(area, radius);
-    graphics.setColour(juce::Colours::black.withAlpha(0.40f));
-    graphics.drawRoundedRectangle(area.expanded(0.5f), radius + 0.5f, 1.0f);
-    graphics.setColour(juce::Colours::white.withAlpha(0.06f));
+    graphics.setColour(hairline);
     graphics.drawRoundedRectangle(area.reduced(0.5f), radius, 1.0f);
 }
 
 /// A recessed well for content that lives inside a panel: meters, plots, lists, readouts.
-inline void well(juce::Graphics& graphics, juce::Rectangle<float> area, float radius = 6.0f)
+inline void well(juce::Graphics& graphics, juce::Rectangle<float> area, float radius = 5.0f)
 {
     if (area.isEmpty()) return;
-    graphics.setGradientFill(juce::ColourGradient(sunken.darker(0.30f), area.getX(), area.getY(),
-                                                  sunken.brighter(0.16f), area.getX(), area.getBottom(), false));
+    graphics.setColour(sunken);
     graphics.fillRoundedRectangle(area, radius);
-    graphics.setColour(juce::Colours::black.withAlpha(0.55f));
+    graphics.setColour(hairline.withAlpha(0.75f));
     graphics.drawRoundedRectangle(area.reduced(0.5f), radius, 1.0f);
+}
+
+/// The main content area: the darkest surface in the window, so the chrome around it reads
+/// as a frame and the module you are actually working in reads as the subject.
+inline void stage(juce::Graphics& graphics, juce::Rectangle<float> area, float radius = 8.0f)
+{
+    if (area.isEmpty()) return;
+    graphics.setColour(sunken);
+    graphics.fillRoundedRectangle(area, radius);
+    graphics.setColour(hairline.withAlpha(0.60f));
+    graphics.drawRoundedRectangle(area.reduced(0.5f), radius, 1.0f);
+}
+
+/// A one-pixel rule. Separators are how this interface groups things; it has no boxes.
+inline void rule(juce::Graphics& graphics, juce::Rectangle<int> area, float alpha = 1.0f)
+{
+    graphics.setColour(hairline.withAlpha(alpha));
+    graphics.fillRect(area);
+}
+
+/// A short vertical divider between two clusters of controls, inset from the top and bottom
+/// of the strip it sits in so it separates without drawing a full-height line.
+inline void divider(juce::Graphics& graphics, int x, int centreY, int height, float alpha = 0.9f)
+{
+    graphics.setColour(hairline.brighter(0.12f).withAlpha(alpha));
+    graphics.fillRect(x, centreY - height / 2, 1, height);
+}
+
+[[nodiscard]] inline float trackedWidth(const juce::Font& usedFont, const juce::String& text,
+                                        float tracking = 1.5f)
+{
+    if (text.isEmpty()) return 0.0f;
+    auto width = -tracking;
+    for (int index = 0; index < text.length(); ++index)
+        width += juce::GlyphArrangement::getStringWidth(usedFont, text.substring(index, index + 1)) + tracking;
+    return width;
 }
 
 /// Small-caps text with manual letter tracking. JUCE has no tracking of its own, and
@@ -68,9 +108,7 @@ inline void tracked(juce::Graphics& graphics, const juce::String& text, juce::Re
 {
     if (text.isEmpty()) return;
     const auto currentFont = graphics.getCurrentFont();
-    auto width = -tracking;
-    for (int index = 0; index < text.length(); ++index)
-        width += juce::GlyphArrangement::getStringWidth(currentFont, text.substring(index, index + 1)) + tracking;
+    const auto width = trackedWidth(currentFont, text, tracking);
 
     auto x = static_cast<float>(area.getX());
     if (justification.testFlags(juce::Justification::horizontallyCentred))

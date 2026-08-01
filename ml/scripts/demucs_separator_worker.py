@@ -8,9 +8,9 @@ import importlib.metadata
 import json
 import math
 import os
-from pathlib import Path
 import sys
 import traceback
+from pathlib import Path
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -29,8 +29,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        import torch
         import demucs.api
+        import torch
     except Exception as error:
         print(f"Demucs runtime unavailable: {error}", file=sys.stderr)
         return 3
@@ -126,7 +126,7 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None
     except Exception:
         traceback.print_exc()
-        raise SystemExit(1)
+        raise SystemExit(1) from None

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable
 import hashlib
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)

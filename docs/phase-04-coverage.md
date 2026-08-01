@@ -105,6 +105,83 @@ Scoring: `Complete = 1`, `Partial = 0.5`, `Missing = 0`.
 | 99 | Automated Phase 4 CI | Complete | Schema/alignment/train/export/parity/determinism/provenance/corpus tests |
 | 100 | Diverse rights-cleared real DI corpus | Partial | Provenance schema and strict eight-category corpus audit are complete; no real recordings are present locally |
 
+## Training backends
+
+The NumPy trainer is the reference implementation: no dependency beyond NumPy, and bit-exact for a
+given seed. Its cost is a Python loop over samples, so a realistic capture is impractical on it.
+
+An optional PyTorch backend is selected with `training.backend`, which accepts `numpy` (default),
+`torch`, or `auto`. It exists because the recurrence maps exactly onto `torch.nn.LSTM`: the gate
+blocks are ordered input, forget, cell, output in both, so the matrices transfer without
+permutation, and the NumPy model's single bias becomes torch's input-side bias with the hidden-side
+bias zeroed. Measured agreement between the two forward passes is ~2.7e-7 relative, which is float32
+rounding.
+
+Measured speedup on an RTX 5080, one epoch, 32-unit state:
+
+| Chunk samples | Total audio | NumPy | Torch | Speedup |
+|---:|---:|---:|---:|---:|
+| 2048 | 0.17 s | 0.48 s | 0.01 s | 35x |
+| 8192 | 0.68 s | 1.91 s | 0.02 s | 117x |
+| 32768 | 2.73 s | 7.68 s | 0.05 s | 151x |
+| 32768 (16 chunks) | 10.92 s | 25.99 s | 0.16 s | 164x |
+| 131072 | 21.85 s | 55.33 s | 0.30 s | 184x |
+
+### What hardware this actually needs
+
+The headline speedup conflates two separate wins, and separating them decides the advice. Same
+workload, 1.37 s of audio, two epochs, 32-unit state:
+
+| Backend | Time | vs NumPy |
+|---|---:|---:|
+| NumPy | 6.44 s | 1.0x |
+| torch, CPU | 0.27 s | 24x |
+| torch, RTX 5080 | 0.05 s | 136x |
+
+Extrapolated to five minutes of paired audio over 40 epochs: **NumPy ~7.9 hours, torch on CPU
+~20 minutes, torch on an RTX 5080 ~3 minutes.**
+
+So roughly 24x of the gain comes from leaving the per-sample Python loop, and only ~5.6x from the
+GPU. **A weak GPU, or no usable GPU at all, costs far less than it looks.** Anyone without CUDA
+should still set `backend = "torch"`; the CPU path alone turns an overnight job into a coffee break.
+
+The reason the GPU contributes so little is that an LSTM is a sequential recurrence — no amount of
+parallelism removes the dependency from one timestep to the next. Measured on the RTX 5080 at
+state 32:
+
+- Each timestep costs a near-constant **0.6–1.0 µs** whatever the sequence length, which is dispatch
+  and dependency latency rather than arithmetic.
+- Widening the batch from 1 to 64 — **64x the work** — costs only **2.9x the time**. The device is
+  better than 90% idle at ordinary batch sizes.
+- State 16 and state 32 take the same time despite 4x the arithmetic.
+
+A card with a fraction of the SMs runs a latency-bound workload at close to the same speed, so the
+practical range for any CUDA GPU is bounded below by the CPU figure and above by the numbers here:
+a factor of about six, not of a hundred. Clock speed matters more than core count.
+
+Two things do degrade on a smaller card:
+
+- **VRAM sets the maximum batch and chunk length**, because backpropagation through time keeps
+  activations for the whole sequence. Measured peaks: 144 MiB at batch 4 x 8192 samples, 504 MiB at
+  batch 8 x 16384, 1.9 GiB at batch 16 x 32768. The defaults (`chunk_samples = 4096`,
+  `batch_size = 4`) stay under 200 MiB and fit any card with 2 GB. Reduce batch size before chunk
+  length if memory is tight.
+- **Large states fall off a cliff.** Time is flat to state 64, rises to 37 ms at 128, then jumps to
+  457 ms at 256 — cuDNN dropping out of its persistent-RNN path, which needs the weights to fit in
+  registers across the whole device. That threshold arrives *earlier* on a smaller GPU. Staying
+  within the documented 32–128 range avoids it.
+
+Two caveats worth knowing:
+
+- **Reproducibility is weaker.** Seeded torch runs agree to about 1e-7, not bit-exactly, because
+  cuDNN's LSTM backward pass accumulates in a nondeterministic order. Train on the NumPy backend
+  where bit-exact reproduction is required.
+- **cuDNN has a sequence-length ceiling.** It handles 32768 timesteps and fails at 65536 with
+  `CUDNN_STATUS_NOT_SUPPORTED` on contiguous input. Longer sequences are fed through in windows with
+  the state carried across, which is numerically equivalent and keeps the fused kernel; disabling
+  cuDNN instead was measured to be no faster than the NumPy trainer.
+
+
 ## Score
 
 - Complete: 99

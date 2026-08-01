@@ -1,0 +1,34 @@
+# Deliberately narrow. The point of a first static-analysis pass is a list someone will
+# actually work through, not a wall that gets suppressed wholesale. bugprone and performance
+# are the high-yield families for this codebase: manual buffer indexing, raw pointer arrays
+# into vector storage, span plumbing, and structs passed by value through the DSP.
+#
+# HeaderFilterRegex is limited to engine/ so JUCE's headers are not analysed -- they are not
+# ours to fix and would bury anything real.
+#
+# misc-include-cleaner is off: it reports every name reached through a transitive include and
+# produced 83,000 findings across the JUCE headers on the first run, which is noise, not signal.
+# performance-enum-size is off: shrinking enum base types across the codebase is churn for no
+# measurable gain in code that stores no large arrays of them.
+Checks: >
+  bugprone-*,
+  cert-*,
+  performance-*,
+  misc-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -cert-err58-cpp,
+  -misc-non-private-member-variables-in-classes,
+  -misc-no-recursion,
+  -misc-include-cleaner,
+  -performance-enum-size
+
+HeaderFilterRegex: 'engine[/\\].*'
+
+# Advisory for now. Promote to a blocking CI job once the initial findings are triaged;
+# see item B3 in docs/improvement-plan.md.
+WarningsAsErrors: ''
+
+CheckOptions:
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: 'std::span;.*span'

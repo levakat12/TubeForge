@@ -48,7 +48,7 @@ void ToneAnalysisView::paint(juce::Graphics& graphics)
         + "   /   " + juce::String(nts::tone::toString(analysis.report.context.gainCategory).data()).toUpperCase();
     theme::tracked(graphics, context, summary.removeFromLeft(summary.getWidth() * 0.62f).toNearestInt(),
                    juce::Justification::centredLeft);
-    graphics.setColour(theme::good);
+    graphics.setColour(theme::textSecondary);
     graphics.drawText("CONFIDENCE " + juce::String(juce::roundToInt(analysis.report.confidence.aggregate * 100.0f)) + "%",
                       summary, juce::Justification::centredRight);
 
@@ -124,7 +124,7 @@ void ToneAnalysisView::paint(juce::Graphics& graphics)
                                             confidence.getY(), confidenceWidth - 4.0f, confidence.getHeight());
         auto label = cell.removeFromBottom(15.0f);
         theme::well(graphics, cell, 3.0f);
-        graphics.setColour(confidenceValues[index] > 0.65f ? theme::good : theme::warn);
+        graphics.setColour(confidenceValues[index] > 0.65f ? theme::accent : theme::warn);
         graphics.fillRoundedRectangle(cell.reduced(1.5f).withTop(
             cell.getBottom() - 1.5f - (cell.getHeight() - 3.0f) * confidenceValues[index]), 2.0f);
         graphics.setColour(theme::textTertiary);
@@ -134,7 +134,7 @@ void ToneAnalysisView::paint(juce::Graphics& graphics)
     featurePanel.removeFromTop(8.0f);
     juce::StringArray warningValues;
     for (const auto& warning : analysis.report.warnings) warningValues.add(warning);
-    graphics.setColour(warningValues.isEmpty() ? theme::good : theme::warn);
+    graphics.setColour(warningValues.isEmpty() ? theme::textTertiary : theme::warn);
     graphics.setFont(theme::font(10.0f));
     graphics.drawFittedText(warningValues.isEmpty() ? "No quality warnings"
                                                     : warningValues.joinIntoString("   /   "),

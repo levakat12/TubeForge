@@ -138,7 +138,7 @@ class LinearToneEncoder:
                  domain_mean=self.domain_mean, domain_scale=self.domain_scale)
 
     @classmethod
-    def load(cls, path: Path) -> "LinearToneEncoder":
+    def load(cls, path: Path) -> LinearToneEncoder:
         data = np.load(path)
         model = cls(int(data["input_dimensions"]), int(data["embedding_dimensions"]), str(data["version"]))
         model.projection[...] = data["projection"]
@@ -154,7 +154,7 @@ class DisentangledToneEncoder:
     production: LinearToneEncoder
 
     @classmethod
-    def create(cls, input_dimensions: int = 64, embedding_dimensions: int = 128) -> "DisentangledToneEncoder":
+    def create(cls, input_dimensions: int = 64, embedding_dimensions: int = 128) -> DisentangledToneEncoder:
         return cls(LinearToneEncoder(input_dimensions, embedding_dimensions, seed=7),
                    LinearToneEncoder(input_dimensions, embedding_dimensions, seed=17),
                    LinearToneEncoder(input_dimensions, embedding_dimensions, seed=29))

@@ -78,7 +78,7 @@ class TinyTanhRnn:
         np.savez(path, sample_rate=self.sample_rate, state_size=self.state_size, **self.parameters())
 
     @classmethod
-    def load_checkpoint(cls, path: Path) -> "TinyTanhRnn":
+    def load_checkpoint(cls, path: Path) -> TinyTanhRnn:
         data = np.load(path)
         model = cls(int(data["state_size"]), int(data["sample_rate"]), 0)
         for name, parameter in model.parameters().items():
@@ -91,8 +91,8 @@ def create_model(model_type: str, state_size: int, sample_rate: int, seed: int,
                  layers: int = 1, kernel_size: int = 3):
     if model_type in ("tiny_tanh_rnn", "conditioned_tanh_rnn"):
         return TinyTanhRnn(state_size, sample_rate, seed)
-    from .neural import CausalTcn, ConditionedGru, ConditionedLstm
+    from .neural import ConditionedLstm, RandomFeatureGru, RandomFeatureTcn
     if model_type == "conditioned_lstm": return ConditionedLstm(state_size, sample_rate, seed)
-    if model_type == "conditioned_gru": return ConditionedGru(state_size, sample_rate, seed)
-    if model_type == "causal_tcn": return CausalTcn(state_size, sample_rate, seed, layers, kernel_size)
+    if model_type == "conditioned_gru": return RandomFeatureGru(state_size, sample_rate, seed)
+    if model_type == "causal_tcn": return RandomFeatureTcn(state_size, sample_rate, seed, layers, kernel_size)
     raise ValueError(f"Unsupported model type: {model_type}")

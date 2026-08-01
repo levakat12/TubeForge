@@ -1,0 +1,40 @@
+# Student configuration for distilling a NAM WaveNet capture into the packed runtime format.
+#
+# Larger than phase5-lstm.toml's 32 units: the teacher is a 23-layer WaveNet with a 132 ms
+# receptive field, and a smaller student loses low-frequency behaviour first -- audible as a thin,
+# unstable bass response on high-gain captures. Raise hidden_size before blaming the loss weights.
+[model]
+type = "conditioned_lstm"
+hidden_size = 48
+layers = 1
+kernel_size = 3
+conditioning = "concatenate"
+residual = true
+
+[data]
+sample_rate = 48000
+chunk_samples = 8192
+history_samples = 4096
+
+[training]
+batch_size = 4
+optimizer = "adamw"
+learning_rate = 0.0003
+weight_decay = 0.0001
+epochs = 40
+seed = 505
+# Distilling a real capture is not a smoke test: the reference numpy trainer is orders of magnitude
+# slower and a budget small enough to finish under it produces a student that collapses towards
+# silence. "auto" uses torch when it is importable and still runs without it.
+backend = "auto"
+
+[loss]
+time_l1 = 1.0
+time_l2 = 0.0
+pre_emphasis = 0.1
+multi_resolution_stft = 0.5
+spectral_convergence = 0.0
+dc_penalty = 0.05
+loudness_difference = 0.0
+silence_stability = 0.05
+transient_weighted = 0.05

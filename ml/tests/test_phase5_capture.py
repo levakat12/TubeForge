@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
-
 from _fixtures import create_session
+
 from nts_ml.capture import CaptureConfig, CaptureWizard
-from nts_ml.datasets.audio import WaveReader
+from nts_ml.datasets.streaming import ChunkReference, PairedChunk
 from nts_ml.evaluation import generate_quality_report, render_ab_comparison
 from nts_ml.export import export_model, validate_artifact
-from nts_ml.models import CausalTcn, ConditionedGru, ConditionedLstm, load_model_checkpoint
+from nts_ml.models import ConditionedLstm, RandomFeatureGru, RandomFeatureTcn, load_model_checkpoint
 from nts_ml.training import ExperimentConfig, train
-from nts_ml.datasets.streaming import ChunkReference, PairedChunk
 
 
 def make_chunk(seed: int, history: int = 8) -> PairedChunk:
@@ -28,8 +27,8 @@ def make_chunk(seed: int, history: int = 8) -> PairedChunk:
 class Phase5CaptureTests(unittest.TestCase):
     def test_models_are_conditioned_stateful_and_block_independent(self) -> None:
         signal = np.random.default_rng(8).normal(0.0, 0.08, 257).astype(np.float32)
-        for model in (ConditionedLstm(4, seed=1), ConditionedGru(4, seed=2),
-                      CausalTcn(4, seed=3, layers=3, kernel_size=3)):
+        for model in (ConditionedLstm(4, seed=1), RandomFeatureGru(4, seed=2),
+                      RandomFeatureTcn(4, seed=3, layers=3, kernel_size=3)):
             model.set_controls([0.1, -0.2, 0.3, 0.0, 1.0]); model.reset(); whole = model.process(signal)
             model.reset(); partitioned = np.concatenate((model.process(signal[:13]), model.process(signal[13:91]),
                                                          model.process(signal[91:])))
@@ -39,6 +38,50 @@ class Phase5CaptureTests(unittest.TestCase):
             model.reset(); silence = model.process(np.zeros(512, dtype=np.float32))
             self.assertTrue(np.all(np.isfinite(silence)))
             self.assertLess(float(np.max(np.abs(silence))), 2.0)
+
+    def test_random_feature_models_keep_their_extractors_frozen(self) -> None:
+        """The frozen extractor is a design contract, so it is asserted rather than commented.
+
+        If someone later adds these tensors to parameters() expecting them to train, this
+        fails and points at the reason: the readout gradient in trainer._feature_gradients is
+        the only gradient these models have.
+        """
+        from nts_ml.datasets.streaming import ChunkReference, PairedChunk
+        from nts_ml.training import ExperimentConfig
+        from nts_ml.training.trainer import train
+
+        rng = np.random.default_rng(11)
+        for model in (RandomFeatureGru(4, seed=2),
+                      RandomFeatureTcn(4, seed=3, layers=2, kernel_size=3)):
+            frozen = {name: getattr(model, name).copy()
+                      for name in ("input_projection", "control_projection", "kernel",
+                                   "input_weight", "recurrent_weight", "bias")
+                      if hasattr(model, name)}
+            self.assertTrue(frozen, "expected at least one extractor tensor to check")
+            for name in frozen:
+                self.assertNotIn(name, model.parameters(),
+                                 f"{name} is exposed to the optimiser but has no gradient")
+
+            chunks = []
+            for index in range(3):
+                audio = rng.normal(0.0, 0.1, 256).astype(np.float32)
+                mask = np.ones(audio.size, dtype=np.bool_); mask[:16] = False
+                reference = ChunkReference(session_id="frozen", take_id=f"take-{index}",
+                                           input_path=Path("in.wav"), output_path=Path("out.wav"),
+                                           start=0, output_start=0, total_samples=audio.size,
+                                           history_samples=16,
+                                           controls=(0.2, -0.1, 0.4, 0.0, 1.0))
+                chunks.append(PairedChunk(audio, np.tanh(2.5 * audio).astype(np.float32),
+                                          mask, reference))
+            with tempfile.TemporaryDirectory() as temporary:
+                config = ExperimentConfig()
+                config.training.epochs = 3
+                train(model, chunks, chunks, config, Path(temporary))
+
+            for name, before in frozen.items():
+                np.testing.assert_array_equal(
+                    getattr(model, name), before,
+                    err_msg=f"{name} changed during training; these models train only a readout")
 
     def test_lstm_training_export_quality_and_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

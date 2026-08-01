@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
+import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-import json
-import tomllib
 
 
 @dataclass(slots=True)
@@ -32,6 +32,11 @@ class TrainingOptions:
     weight_decay: float = 0.0001
     epochs: int = 10
     seed: int = 1234
+    # "numpy" is the reference implementation and the default: it has no dependencies beyond
+    # numpy and its results are what the determinism guarantees were established against.
+    # "torch" requires the optional PyTorch backend and is orders of magnitude faster on real
+    # captures; "auto" uses it when importable and falls back silently when it is not.
+    backend: str = "numpy"
 
 
 @dataclass(slots=True)
@@ -55,7 +60,7 @@ class ExperimentConfig:
     loss: LossConfig = field(default_factory=LossConfig)
 
     @classmethod
-    def load(cls, path: Path) -> "ExperimentConfig":
+    def load(cls, path: Path) -> ExperimentConfig:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         config = cls(ModelConfig(**data.get("model", {})), DataConfig(**data.get("data", {})),
                      TrainingOptions(**data.get("training", {})), LossConfig(**data.get("loss", {})))
@@ -74,6 +79,8 @@ class ExperimentConfig:
             raise ValueError("Invalid TCN kernel or conditioning mode")
         if self.data.chunk_samples < 1 or self.data.history_samples < 0:
             raise ValueError("Invalid chunk or history size")
+        if self.training.backend not in ("numpy", "torch", "auto"):
+            raise ValueError("backend must be numpy, torch or auto")
         if self.training.optimizer != "adamw" or self.training.epochs < 1:
             raise ValueError("optimizer must be adamw and epochs must be positive")
         if self.training.learning_rate <= 0.0 or self.training.batch_size < 1:

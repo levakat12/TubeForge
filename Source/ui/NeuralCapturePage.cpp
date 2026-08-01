@@ -65,7 +65,7 @@ void NeuralCapturePage::refresh()
         + juce::String(reading.mismatchDb, 1) + " dB\n"
         + (reading.warning ? "Level mismatch: the model expects a different input level."
                            : "Calibrated."), juce::dontSendNotification);
-    calibration.setColour(juce::Label::textColourId, reading.warning ? theme::warn : theme::good);
+    calibration.setColour(juce::Label::textColourId, reading.warning ? theme::warn : theme::textSecondary);
 }
 
 void NeuralCapturePage::chooseModel()

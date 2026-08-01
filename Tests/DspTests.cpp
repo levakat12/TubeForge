@@ -6,11 +6,14 @@
 #include <nts/dsp/Common.h>
 #include <nts/dsp/Convolution.h>
 #include <nts/dsp/Dynamics.h>
+#include <nts/dsp/Effects.h>
 #include <nts/dsp/Filters.h>
 #include <nts/dsp/Metering.h>
+#include <nts/dsp/DelayLine.h>
 #include <nts/dsp/ModeCrossfader.h>
 #include <nts/dsp/Nonlinear.h>
 #include <nts/dsp/Oversampling.h>
+#include <nts/dsp/PitchDetector.h>
 #include <nts/dsp/Regression.h>
 #include <nts/dsp/Smoothing.h>
 #include <nts/dsp/Simd.h>
@@ -24,6 +27,8 @@
 #include <memory>
 #include <new>
 #include <numbers>
+#include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -369,6 +374,23 @@ void testConvolutionAndIr(TestHarness& tests)
     const auto metrics = nts::dsp::compareAudio(expected, actual);
     tests.expect(metrics.maximumAbsoluteError < 2.0e-4, "partitioned convolution matches direct reference");
 
+    // Fixed block size is a contract, not a suggestion: a short call would desynchronise the
+    // spectrum history and overlap. It is refused, so the failure is silence rather than
+    // plausible-looking wrong audio.
+    nts::dsp::PartitionedConvolver strict; strict.prepare(64, 128, 1);
+    std::array<float, 3> shortImpulse { 1.0f, 0.4f, -0.2f };
+    tests.expect(strict.loadImpulse(shortImpulse), "partitioned convolver accepts an impulse");
+    tests.expectEqual(strict.requiredBlockSize(), std::size_t { 64 },
+                      "partitioned convolver reports the block size it requires");
+    std::array<float, 64> shortBlock {}; shortBlock[0] = 1.0f;
+    float* shortChannel[] { shortBlock.data() };
+    strict.process(shortChannel, 1, 32);   // deliberately half a block
+    auto untouched = true;
+    for (std::size_t index = 1; index < shortBlock.size(); ++index)
+        untouched = untouched && shortBlock[index] == 0.0f;
+    tests.expect(untouched && shortBlock[0] == 1.0f,
+                 "a mismatched block is refused rather than corrupting the convolver");
+
     nts::dsp::ImpulseResponse decoded; decoded.sampleRate = 24000.0; decoded.channels = { { 0.1f, 0.1f, 1.1f, 0.1f, 0.1f } };
     nts::dsp::ImpulsePreparationOptions options; options.outputChannels = 2; options.trimThresholdDb = -20.0f;
     const auto prepared = nts::dsp::prepareImpulseResponse(decoded, 48000.0, options);
@@ -451,6 +473,234 @@ void testRegressionSystem(TestHarness& tests)
     tests.expectEqual(metrics.latencyOffset, std::ptrdiff_t { 7 }, "audio regression finds latency offset"); tests.expect(metrics.maximumAbsoluteError > 0.0 && metrics.rmsError > 0.0 && metrics.spectralErrorDb > 0.0, "audio regression reports numeric errors");
 }
 
+void testDelayLine(TestHarness& tests)
+{
+    nts::dsp::DelayLine delay; delay.prepare(64, 2);
+    delay.setDelay(5);
+    std::array<float, blockSize> left {}; left[0] = 1.0f; auto right = left;
+    const float* input[] { left.data(), right.data() };
+    float* output[] { left.data(), right.data() };
+    // Aliasing input and output is the way it is used in the processor, so test it that way.
+    delay.process(input, output, 2, blockSize);
+    tests.expectNear(left[5], 1.0, 1.0e-7, "delay line places the impulse at the requested offset");
+    tests.expectNear(left[0], 0.0, 1.0e-7, "delay line clears the samples ahead of the impulse");
+
+    // Zero delay has to be a straight pass-through, which is the case the bypass mix hits
+    // whenever the processing latency happens to be zero.
+    nts::dsp::DelayLine passthrough; passthrough.prepare(64, 2); passthrough.setDelay(0);
+    std::array<float, blockSize> flat; flat.fill(0.25f); auto flatRight = flat;
+    const float* flatIn[] { flat.data(), flatRight.data() };
+    float* flatOut[] { flat.data(), flatRight.data() };
+    passthrough.process(flatIn, flatOut, 2, blockSize);
+    tests.expectNear(flat[0], 0.25, 1.0e-7, "zero delay passes the input through unchanged");
+
+    // Continuity across block boundaries: an impulse late in one block must emerge in the next.
+    nts::dsp::DelayLine spanning; spanning.prepare(64, 1); spanning.setDelay(8);
+    std::array<float, 4> first { 1.0f, 0.0f, 0.0f, 0.0f }; std::array<float, 4> rest {};
+    const float* firstIn[] { first.data() }; float* firstOut[] { first.data() };
+    spanning.process(firstIn, firstOut, 1, first.size());
+    auto found = false;
+    for (int block = 0; block < 3; ++block)
+    {
+        rest.fill(0.0f);
+        const float* restIn[] { rest.data() }; float* restOut[] { rest.data() };
+        spanning.process(restIn, restOut, 1, rest.size());
+        for (std::size_t sample = 0; sample < rest.size(); ++sample)
+            if (std::abs(rest[sample] - 1.0f) < 1.0e-6f)
+                found = block == 1 && sample == 0;
+    }
+    tests.expect(found, "delay line carries a delayed impulse across block boundaries");
+
+    nts::dsp::DelayLine clamped; clamped.prepare(16, 1); clamped.setDelay(1000);
+    tests.expect(clamped.delay() <= 16, "delay line clamps a request beyond its capacity");
+}
+
+void testPitchDetection(TestHarness& tests)
+{
+    // Every open string a tuner has to handle, including the low B of a 5-string bass, which
+    // is the case that decides whether the analysis window is long enough.
+    struct Reference { const char* name; double frequency; int midi; };
+    constexpr std::array<Reference, 8> strings { {
+        { "B0 (5-string bass)", 30.868, 23 }, { "E1 (bass)", 41.203, 28 },
+        { "A1 (bass)", 55.000, 33 },          { "E2 (guitar)", 82.407, 40 },
+        { "A2", 110.000, 45 },                { "D3", 146.832, 50 },
+        { "G3", 195.998, 55 },                { "E4", 329.628, 64 } } };
+
+    nts::dsp::PitchDetector detector;
+    const auto frameSamples = std::size_t { 8192 };
+    detector.prepare(sampleRate, frameSamples, 28.0, 1400.0);
+
+    auto allWithinACent = true;
+    auto allNamedCorrectly = true;
+    for (const auto& reference : strings)
+    {
+        // A plucked string is not a sine: harmonics are what make a naive autocorrelation
+        // report an octave error, so the fixture has to contain them.
+        std::vector<float> frame(frameSamples);
+        for (std::size_t index = 0; index < frame.size(); ++index)
+        {
+            const auto t = static_cast<double>(index) / sampleRate;
+            const auto phase = 2.0 * std::numbers::pi * reference.frequency * t;
+            frame[index] = static_cast<float>(0.5 * std::sin(phase)
+                                              + 0.25 * std::sin(2.0 * phase + 0.4)
+                                              + 0.12 * std::sin(3.0 * phase + 1.1)
+                                              + 0.06 * std::sin(4.0 * phase + 2.0));
+        }
+        const auto reading = detector.analyse(frame);
+        if (! reading.voiced) { allWithinACent = false; allNamedCorrectly = false; continue; }
+
+        const auto errorCents = 1200.0 * std::log2(reading.frequencyHz / reference.frequency);
+        allWithinACent = allWithinACent && std::abs(errorCents) < 1.0;
+        const auto note = nts::dsp::nearestNote(reading.frequencyHz);
+        allNamedCorrectly = allNamedCorrectly && note.midiNote == reference.midi;
+    }
+    tests.expect(allWithinACent, "pitch detection is within one cent across the guitar and bass range");
+    tests.expect(allNamedCorrectly, "pitch detection names the right note, without octave errors");
+
+    // A tuner has to show which way to turn the peg, so the sign of the offset matters.
+    std::vector<float> sharp(frameSamples);
+    const auto detuned = 440.0 * std::pow(2.0, 15.0 / 1200.0);
+    for (std::size_t index = 0; index < sharp.size(); ++index)
+        sharp[index] = static_cast<float>(0.5 * std::sin(2.0 * std::numbers::pi * detuned
+                                                         * static_cast<double>(index) / sampleRate));
+    const auto sharpReading = detector.analyse(sharp);
+    const auto sharpNote = nts::dsp::nearestNote(sharpReading.frequencyHz);
+    tests.expect(sharpNote.midiNote == 69, "a sharp A4 still reads as A4");
+    tests.expectNear(sharpNote.cents, 15.0, 1.5, "cent offset reports how far sharp the note is");
+
+    // Silence and noise must not produce a confident reading, or the display will chatter.
+    std::vector<float> silence(frameSamples, 0.0f);
+    tests.expect(! detector.analyse(silence).voiced, "silence produces no pitch reading");
+
+    std::vector<float> noise(frameSamples);
+    std::mt19937 generator(1234);
+    std::uniform_real_distribution<float> spread(-0.3f, 0.3f);
+    for (auto& sample : noise) sample = spread(generator);
+    const auto noiseReading = detector.analyse(noise);
+    tests.expect(! noiseReading.voiced || noiseReading.confidence < 0.6f,
+                 "broadband noise does not produce a confident pitch reading");
+
+    tests.expect(std::string(nts::dsp::noteName(40)) == "E2"
+                 && std::string(nts::dsp::noteName(69)) == "A4"
+                 && std::string(nts::dsp::noteName(23)) == "B0",
+                 "note names match their MIDI numbers");
+    tests.expect(std::string(nts::dsp::noteName(-1)) == "--", "an invalid note has a safe name");
+}
+
+void testTimeBasedEffects(TestHarness& tests)
+{
+    constexpr std::size_t frame = 8192;
+    const nts::dsp::ProcessSpec fxSpec { sampleRate, frame, 2 };
+
+    // --- Delay -----------------------------------------------------------------------
+    nts::dsp::Delay delay;
+    delay.prepare(fxSpec);
+    nts::dsp::DelayParameters delayParameters;
+    delayParameters.timeMs = 100.0f;      // 4800 samples at 48 kHz
+    delayParameters.feedback = 0.0f;
+    delayParameters.mix = 1.0f;
+    delayParameters.dampingHz = 20000.0f; // out of the way, so the tap keeps its level
+    delay.setParameters(delayParameters);
+    delay.reset();
+
+    std::vector<float> left(frame, 0.0f), right(frame, 0.0f);
+    left[0] = 1.0f; right[0] = 1.0f;
+    float* channels[] { left.data(), right.data() };
+    delay.process(channels, 2, frame);
+
+    auto peakIndex = std::size_t {};
+    auto peak = 0.0f;
+    for (std::size_t index = 1; index < frame; ++index)
+        if (std::abs(left[index]) > peak) { peak = std::abs(left[index]); peakIndex = index; }
+    tests.expect(peakIndex >= 4780 && peakIndex <= 4820,
+                 "delay places its repeat at the requested time");
+    tests.expectNear(left[0], 1.0, 1.0e-6, "delay leaves the dry signal at unity");
+
+    // Feedback has to decay. A line that grows is the failure that destroys speakers.
+    nts::dsp::Delay runaway;
+    runaway.prepare(fxSpec);
+    delayParameters.feedback = 0.95f;     // the maximum the clamp allows
+    delayParameters.timeMs = 20.0f;
+    runaway.setParameters(delayParameters);
+    runaway.reset();
+    auto largest = 0.0f;
+    std::vector<float> burst(frame), burstRight(frame);
+    for (int block = 0; block < 40; ++block)
+    {
+        std::fill(burst.begin(), burst.end(), 0.0f);
+        std::fill(burstRight.begin(), burstRight.end(), 0.0f);
+        if (block == 0) { burst[0] = 1.0f; burstRight[0] = 1.0f; }
+        float* burstChannels[] { burst.data(), burstRight.data() };
+        runaway.process(burstChannels, 2, frame);
+        for (const auto value : burst) largest = std::max(largest, std::abs(value));
+    }
+    tests.expect(std::isfinite(largest) && largest < 25.0f,
+                 "delay feedback decays rather than running away");
+
+    // An out-of-range feedback request must be clamped, not trusted.
+    delayParameters.feedback = 5.0f;
+    runaway.setParameters(delayParameters);
+    runaway.reset();
+    largest = 0.0f;
+    for (int block = 0; block < 40; ++block)
+    {
+        std::fill(burst.begin(), burst.end(), 0.0f);
+        std::fill(burstRight.begin(), burstRight.end(), 0.0f);
+        if (block == 0) { burst[0] = 1.0f; burstRight[0] = 1.0f; }
+        float* burstChannels[] { burst.data(), burstRight.data() };
+        runaway.process(burstChannels, 2, frame);
+        for (const auto value : burst) largest = std::max(largest, std::abs(value));
+    }
+    tests.expect(std::isfinite(largest) && largest < 25.0f,
+                 "delay clamps a feedback request above unity");
+
+    // --- Reverb ----------------------------------------------------------------------
+    nts::dsp::Reverb reverb;
+    reverb.prepare(fxSpec);
+    nts::dsp::ReverbParameters reverbParameters;
+    reverbParameters.size = 0.8f; reverbParameters.damping = 0.3f;
+    reverbParameters.mix = 0.5f; reverbParameters.lowCutHz = 100.0f;
+    reverb.setParameters(reverbParameters);
+    reverb.reset();
+
+    std::vector<float> revLeft(frame, 0.0f), revRight(frame, 0.0f);
+    revLeft[0] = 1.0f; revRight[0] = 1.0f;
+    float* revChannels[] { revLeft.data(), revRight.data() };
+    reverb.process(revChannels, 2, frame);
+
+    // Energy well after the impulse is the tail; without one there is no reverb.
+    double late {};
+    for (std::size_t index = frame / 2; index < frame; ++index) late += revLeft[index] * revLeft[index];
+    tests.expect(late > 1.0e-9, "reverb produces a tail after the impulse has passed");
+
+    auto finiteTail = true;
+    for (const auto value : revLeft) finiteTail = finiteTail && std::isfinite(value) && std::abs(value) < 10.0f;
+    tests.expect(finiteTail, "reverb output stays finite and bounded");
+
+    // The two sides must differ, or it is mono reverb in a stereo wrapper.
+    auto identical = true;
+    for (std::size_t index = 0; index < frame; ++index)
+        identical = identical && std::abs(revLeft[index] - revRight[index]) < 1.0e-9f;
+    tests.expect(! identical, "reverb decorrelates the two channels");
+
+    // Zero mix has to be a true bypass: no tail, no filtering of the dry path.
+    nts::dsp::Reverb silent;
+    silent.prepare(fxSpec);
+    reverbParameters.mix = 0.0f;
+    silent.setParameters(reverbParameters);
+    silent.reset();
+    std::vector<float> flat(frame, 0.3f), flatRight(frame, 0.3f);
+    float* flatChannels[] { flat.data(), flatRight.data() };
+    silent.process(flatChannels, 2, frame);
+    auto untouched = true;
+    for (const auto value : flat) untouched = untouched && std::abs(value - 0.3f) < 1.0e-7f;
+    tests.expect(untouched, "a reverb at zero mix leaves the signal completely alone");
+
+    // A long decay must still settle rather than sustaining forever.
+    tests.expect(reverb.tailSamples() > 0 && delay.tailSamples() > 0,
+                 "both effects report a tail for the host");
+}
+
 void testNoRuntimeAllocations(TestHarness& tests)
 {
     nts::dsp::Biquad filter; filter.prepare(stereoSpec); filter.setCoefficients(nts::dsp::BiquadCoefficients::make(nts::dsp::FilterType::lowPass, sampleRate, 2000.0));
@@ -460,6 +710,10 @@ void testNoRuntimeAllocations(TestHarness& tests)
     nts::dsp::SpectrumAnalyzer spectrum; spectrum.prepare(64, 64);
     nts::dsp::MeterBank meters; meters.prepare(stereoSpec);
     nts::dsp::ModeCrossfader crossfader; crossfader.prepare(stereoSpec, 2);
+    nts::dsp::DelayLine delay; delay.prepare(2048, 2); delay.setDelay(128);
+    nts::dsp::PitchDetector pitch; pitch.prepare(sampleRate, blockSize, 60.0, 1000.0);
+    nts::dsp::Delay fxDelay; fxDelay.prepare(stereoSpec); fxDelay.setParameters({});
+    nts::dsp::Reverb fxReverb; fxReverb.prepare(stereoSpec); fxReverb.setParameters({});
     std::array<float, blockSize> left; left.fill(0.1f); auto right = left; float* channels[] { left.data(), right.data() };
     allocationCount.store(0); countAllocations = true;
     filter.process(channels, 2, blockSize); compressor.process(channels, 2, blockSize);
@@ -469,6 +723,9 @@ void testNoRuntimeAllocations(TestHarness& tests)
     crossfader.requestMode(1, blockSize);
     crossfader.process(channels, 2, blockSize,
         [](std::size_t, float* const*, std::size_t, std::size_t) noexcept {});
+    const float* delayIn[] { left.data(), right.data() }; delay.process(delayIn, channels, 2, blockSize);
+    static_cast<void>(pitch.analyse(left));
+    fxDelay.process(channels, 2, blockSize); fxReverb.process(channels, 2, blockSize);
     countAllocations = false;
     tests.expectEqual(allocationCount.load(), std::size_t { 0 }, "DSP processing performs no runtime allocation");
 }
@@ -479,6 +736,8 @@ int main()
     TestHarness tests;
     testGainAndSmoothing(tests); testFilters(tests); testCrossover(tests);
     testNonlinearAndOversampling(tests); testDynamics(tests); testModeSwitchAndSimd(tests); testConvolutionAndIr(tests);
-    testAnalysisAndMetering(tests); testRegressionSystem(tests); testNoRuntimeAllocations(tests);
+    testAnalysisAndMetering(tests); testRegressionSystem(tests); testDelayLine(tests); testPitchDetection(tests);
+    testTimeBasedEffects(tests);
+    testNoRuntimeAllocations(tests);
     return tests.result();
 }

@@ -663,26 +663,39 @@ float PowerAmp::supplyState(std::size_t channel) const noexcept
     return channel < dsp::maximumChannels ? supply[channel] : 1.0f;
 }
 
+std::vector<float> makeDefaultCabinetImpulse(int slot)
+{
+    std::vector<float> impulse(384);
+    for (std::size_t index = 0; index < impulse.size(); ++index)
+    {
+        const auto time = static_cast<float>(index);
+        impulse[index] = slot == 0
+            ? (index == 0 ? 0.72f : 0.0f) + 0.16f * std::exp(-time / 68.0f) * std::sin(0.31f * time)
+            : (index == 2 ? 0.62f : 0.0f) + 0.14f * std::exp(-time / 82.0f) * std::sin(0.24f * time + 0.4f);
+    }
+    return impulse;
+}
+CabinetMetadata defaultCabinetMetadata(int slot)
+{
+    return slot == 0 ? CabinetMetadata { "TubeForge 4x12 Edge", "Dynamic 57", 0.25f }
+                     : CabinetMetadata { "TubeForge 2x12 Center", "Ribbon 121", 0.65f };
+}
+void CabinetSection::restoreDefaultImpulses(std::size_t crossfadeSamples)
+{
+    static_cast<void>(loadImpulseA(makeDefaultCabinetImpulse(0), {}, defaultCabinetMetadata(0), crossfadeSamples));
+    static_cast<void>(loadImpulseB(makeDefaultCabinetImpulse(1), {}, defaultCabinetMetadata(1), crossfadeSamples));
+}
 void CabinetSection::prepare(const dsp::ProcessSpec& newSpec)
 {
     spec = newSpec; spec.channels = std::min(spec.channels, dsp::maximumChannels);
-    first.prepare(maximumIrLength, spec.channels); second.prepare(maximumIrLength, spec.channels);
+    first.prepare(maximumIrLength, spec.channels, spec.maximumBlockSize);
+    second.prepare(maximumIrLength, spec.channels, spec.maximumBlockSize);
     lowCut.prepare(spec); highCut.prepare(spec);
     dryBuffer.assign(spec.maximumBlockSize * spec.channels, 0.0f);
     firstBuffer.assign(spec.maximumBlockSize * spec.channels, 0.0f);
     secondBuffer.assign(spec.maximumBlockSize * spec.channels, 0.0f);
     delay.assign((maximumAlignmentSamples + 1) * spec.channels, 0.0f);
-    std::vector<float> irA(384), irB(384);
-    for (std::size_t index = 0; index < irA.size(); ++index)
-    {
-        const auto time = static_cast<float>(index);
-        irA[index] = (index == 0 ? 0.72f : 0.0f) + 0.16f * std::exp(-time / 68.0f)
-                   * std::sin(0.31f * time);
-        irB[index] = (index == 2 ? 0.62f : 0.0f) + 0.14f * std::exp(-time / 82.0f)
-                   * std::sin(0.24f * time + 0.4f);
-    }
-    static_cast<void>(loadImpulseA(irA, {}, { "TubeForge 4x12 Edge", "Dynamic 57", 0.25f }));
-    static_cast<void>(loadImpulseB(irB, {}, { "TubeForge 2x12 Center", "Ribbon 121", 0.65f }));
+    restoreDefaultImpulses(0);
     setParameters(parameters, 0); reset();
 }
 void CabinetSection::reset() noexcept
@@ -701,16 +714,26 @@ void CabinetSection::setParameters(const CabinetParameters& next, std::size_t in
         parameters.highCutHz, 0.707), interpolationSamples);
 }
 bool CabinetSection::loadImpulseA(std::span<const float> left, std::span<const float> right,
-                                  CabinetMetadata metadata)
+                                  CabinetMetadata metadata, std::size_t crossfadeSamples)
 {
-    if (! first.loadImpulse(left, right)) return false;
-    firstMetadata = std::move(metadata); return true;
+    if (! first.loadInactiveImpulse(left, right)) return false;
+    firstMetadata = std::move(metadata); firstLength = std::max(left.size(), right.size());
+    first.requestSwap(crossfadeSamples); return true;
 }
 bool CabinetSection::loadImpulseB(std::span<const float> left, std::span<const float> right,
-                                  CabinetMetadata metadata)
+                                  CabinetMetadata metadata, std::size_t crossfadeSamples)
 {
-    if (! second.loadImpulse(left, right)) return false;
-    secondMetadata = std::move(metadata); return true;
+    if (! second.loadInactiveImpulse(left, right)) return false;
+    secondMetadata = std::move(metadata); secondLength = std::max(left.size(), right.size());
+    second.requestSwap(crossfadeSamples); return true;
+}
+std::size_t CabinetSection::tailSamples() const noexcept
+{
+    if (parameters.bypass) return 0;
+    // The staged length rather than the sounding one, so a response that is mid-fade or about
+    // to fade in cannot report a tail shorter than the decay it is going to produce.
+    // B is read through the alignment delay, so its decay finishes that many samples later.
+    return std::max(firstLength, secondLength + parameters.delaySamplesB);
 }
 void CabinetSection::process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept
 {
@@ -987,6 +1010,31 @@ CalibrationReading TraditionalAmpProcessor::calibrationReading() const noexcept
 std::size_t TraditionalAmpProcessor::latencySamples() const noexcept
 {
     return voices[crossfader.mode()].latencySamples();
+}
+std::size_t TraditionalAmpProcessor::tailSamples() const noexcept
+{
+    return std::max(voices[0].tailSamples(), voices[1].tailSamples());
+}
+bool AmpVoice::loadCabinetImpulse(int slot, std::span<const float> left, std::span<const float> right,
+                                  CabinetMetadata metadata, std::size_t crossfadeSamples)
+{
+    return slot == 0 ? cabinet.loadImpulseA(left, right, std::move(metadata), crossfadeSamples)
+                     : cabinet.loadImpulseB(left, right, std::move(metadata), crossfadeSamples);
+}
+bool TraditionalAmpProcessor::loadCabinetImpulse(int slot, std::span<const float> left,
+                                                 std::span<const float> right, CabinetMetadata metadata,
+                                                 std::size_t crossfadeSamples)
+{
+    // Both voices: they alternate across preset changes, so loading into the sounding one
+    // alone would put the previous cabinet back the next time a preset was recalled.
+    auto loaded = true;
+    for (auto& voice : voices)
+        loaded = voice.loadCabinetImpulse(slot, left, right, metadata, crossfadeSamples) && loaded;
+    return loaded;
+}
+void TraditionalAmpProcessor::restoreDefaultCabinet(std::size_t crossfadeSamples)
+{
+    for (auto& voice : voices) voice.restoreDefaultCabinet(crossfadeSamples);
 }
 
 std::vector<float> renderOffline(TraditionalAmpProcessor& processor, std::span<const float> monoInput,

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Any
 import json
 import math
 import uuid
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -25,7 +25,7 @@ class SessionMetadata:
     notes: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "SessionMetadata":
+    def from_dict(cls, data: dict[str, Any]) -> SessionMetadata:
         required = (
             "schemaVersion", "sessionId", "sampleRate", "bitDepth", "instrument",
             "inputDevice", "targetType", "targetName",
@@ -52,7 +52,7 @@ class SessionMetadata:
         return metadata
 
     @classmethod
-    def load(cls, path: Path) -> "SessionMetadata":
+    def load(cls, path: Path) -> SessionMetadata:
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def validate(self) -> None:

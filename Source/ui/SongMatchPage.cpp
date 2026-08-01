@@ -106,7 +106,7 @@ void ReconstructionView::paint(juce::Graphics& graphics)
         graphics.setFont(theme::font(11.5f, true));
         graphics.drawFittedText(juce::String(static_cast<int>(index + 1)) + ".  " + rig.rigPreset.name,
                                 name.toNearestInt(), juce::Justification::centredLeft, 2);
-        graphics.setColour(theme::good);
+        graphics.setColour(theme::textSecondary);
         graphics.setFont(theme::font(11.0f, true));
         graphics.drawText("TONE " + juce::String(juce::roundToInt(rig.toneSimilarity * 100.0f)) + "%",
                           card.removeFromLeft(card.getWidth() * 0.45f), juce::Justification::centred);

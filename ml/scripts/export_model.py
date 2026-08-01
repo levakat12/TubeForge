@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
+from pathlib import Path
 
 from nts_ml.export import export_model
 from nts_ml.models import load_model_checkpoint
-
 
 parser = argparse.ArgumentParser(description="Export a checkpoint to the TubeForge packed registry format")
 parser.add_argument("checkpoint", type=Path)

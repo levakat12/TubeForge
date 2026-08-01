@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
-
 from _fixtures import create_session
+
+from nts_ml.alignment import write_alignment_html
 from nts_ml.datasets import SessionPackage, StreamingPairedDataset, WaveReader, validate_session
 from nts_ml.schemas import SessionMetadata
-from nts_ml.alignment import write_alignment_html
 
 
 class SchemaDatasetTests(unittest.TestCase):

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-import json
-import math
 
 
 @dataclass(slots=True)
@@ -21,10 +21,10 @@ class ModelManifest:
     sha256: str = ""
 
     def validate(self) -> None:
-        if self.model_format_version not in (1, 2):
+        if self.model_format_version not in (1, 2, 3):
             raise ValueError("Unsupported model format version")
         if self.architecture not in ("tiny_tanh_rnn", "conditioned_tanh_rnn", "conditioned_lstm",
-                                     "conditioned_gru", "causal_tcn"):
+                                     "conditioned_gru", "causal_tcn", "wavenet"):
             raise ValueError("Unsupported model architecture")
         if not 8_000 <= self.sample_rate <= 384_000:
             raise ValueError("Invalid model sample rate")
@@ -50,7 +50,7 @@ class ModelManifest:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ModelManifest":
+    def from_dict(cls, data: dict[str, Any]) -> ModelManifest:
         manifest = cls(
             model_format_version=int(data["modelFormatVersion"]),
             architecture=str(data["architecture"]),
@@ -67,7 +67,7 @@ class ModelManifest:
         return manifest
 
     @classmethod
-    def load(cls, path: Path) -> "ModelManifest":
+    def load(cls, path: Path) -> ModelManifest:
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def save(self, path: Path) -> None:

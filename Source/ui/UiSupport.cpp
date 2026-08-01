@@ -54,13 +54,16 @@ void populateFromParameter(juce::ComboBox& box, juce::AudioProcessorValueTreeSta
 
 void SectionPanel::paint(juce::Graphics& graphics)
 {
-    theme::glass(graphics, getLocalBounds().toFloat().reduced(0.5f), 9.0f);
-    theme::caption(graphics, getLocalBounds().reduced(13, 0).removeFromTop(26), title,
-                   theme::textSecondary);
+    theme::glass(graphics, getLocalBounds().toFloat().reduced(0.5f), 7.0f);
+    auto heading = getLocalBounds().reduced(14, 0).removeFromTop(28);
+    theme::caption(graphics, heading, title, theme::textSecondary);
+    // A rule under the heading rather than a second panel around the controls: it separates
+    // the title from its contents without adding another edge to the window.
+    theme::rule(graphics, heading.withHeight(1).withY(heading.getBottom() - 2), 0.8f);
 }
 
 juce::Rectangle<int> SectionPanel::contentArea() const
 {
-    return getLocalBounds().reduced(13, 10).withTrimmedTop(20);
+    return getLocalBounds().reduced(14, 10).withTrimmedTop(22);
 }
 } // namespace tf::ui

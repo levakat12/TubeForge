@@ -1,6 +1,9 @@
+#include "PackedFixtures.h"
 #include "TestHarness.h"
 #include <nts/ml/NeuralAmpProcessor.h>
+#include <nts/ml/NeuralModel.h>
 #include <nts/ml/PackedTanhModel.h>
+#include <nts/ml/PackedWaveNetModel.h>
 
 #include <algorithm>
 #include <atomic>
@@ -54,6 +57,8 @@ std::vector<std::byte> fixture()
     for (const auto value : { 0.5f, 0.25f, 0.1f, 0.75f, -0.05f }) appendFloat(bytes, value);
     return bytes;
 }
+
+using nts::test::wavenetFixture;
 }
 
 int main()
@@ -128,5 +133,89 @@ int main()
     countAllocations = false;
     tests.expectEqual(allocationCount.load(std::memory_order_relaxed), std::size_t { 0 },
                       "neural audio processing performs no heap allocation");
+
+    nts::ml::PackedWaveNetModel wavenet;
+    const auto wavenetBytes = wavenetFixture();
+    tests.expect(wavenet.load(wavenetBytes, error), "packed WaveNet loads: " + error);
+    tests.expectEqual(wavenet.channels(), std::size_t { 2 }, "WaveNet exposes its channel count");
+    tests.expectEqual(wavenet.layerCount(), std::size_t { 2 }, "WaveNet exposes its layer count");
+    // (2-1)*1 + (2-1)*2 + headKernel 2
+    tests.expectEqual(wavenet.receptiveField(), std::size_t { 5 }, "WaveNet reports its receptive field");
+    tests.expectEqual(wavenet.sampleRate(), 48000, "WaveNet exposes its sample rate");
+
+    std::array<float, 96> wavenetInput {};
+    for (std::size_t index = 0; index < wavenetInput.size(); ++index)
+        wavenetInput[index] = 0.1f * std::sin(static_cast<float>(index) * 0.31f);
+    std::array<float, 96> wavenetFirst {}, wavenetSecond {}, wavenetSplit {};
+    wavenet.reset();
+    tests.expect(wavenet.process(wavenetInput, wavenetFirst), "WaveNet processes a block");
+    tests.expect(std::all_of(wavenetFirst.begin(), wavenetFirst.end(),
+                             [](float value) { return std::isfinite(value); }),
+                 "WaveNet output is finite");
+    wavenet.reset();
+    wavenet.process(wavenetInput, wavenetSecond);
+    for (std::size_t index = 0; index < wavenetFirst.size(); ++index)
+        tests.expectNear(wavenetFirst[index], wavenetSecond[index], 1.0e-7,
+                         "WaveNet reset restores the primed state exactly");
+    wavenet.reset();
+    for (std::size_t offset = 0; offset < wavenetInput.size(); offset += 7)
+    {
+        const auto count = std::min<std::size_t>(7, wavenetInput.size() - offset);
+        wavenet.process(std::span(wavenetInput.data() + offset, count),
+                        std::span(wavenetSplit.data() + offset, count));
+    }
+    for (std::size_t index = 0; index < wavenetFirst.size(); ++index)
+        tests.expectNear(wavenetFirst[index], wavenetSplit[index], 1.0e-7,
+                         "WaveNet output is block-size independent");
+
+    // A primed model is at rest under silence: the biases have already propagated, so the output is
+    // a constant rather than a settling transient.
+    std::array<float, 64> silence {}, idle {};
+    wavenet.reset();
+    wavenet.process(silence, idle);
+    for (const auto value : idle)
+        tests.expectNear(value, idle[0], 1.0e-7, "a primed WaveNet is stationary under silence");
+
+    auto truncatedTable = wavenetBytes; truncatedTable.resize(4 + 11 * sizeof(std::uint32_t) + 4);
+    tests.expect(! wavenet.load(truncatedTable, error), "a truncated WaveNet layer table is rejected");
+    auto shortPayload = wavenetBytes; shortPayload.resize(shortPayload.size() - sizeof(float));
+    tests.expect(! wavenet.load(shortPayload, error), "a WaveNet payload of the wrong size is rejected");
+    auto wrongVersion = wavenetBytes; appendU32(wrongVersion, 0u);
+    std::memcpy(wrongVersion.data() + 4, "\x02\x00\x00\x00", 4);
+    tests.expect(! wavenet.load(wrongVersion, error), "a non-v3 header is rejected by the WaveNet loader");
+    auto hugeDilation = wavenetBytes;
+    const std::uint32_t outOfRange = 99999u;
+    std::memcpy(hugeDilation.data() + 4 + 11 * sizeof(std::uint32_t) + sizeof(std::uint32_t),
+                &outOfRange, sizeof(outOfRange));
+    tests.expect(! wavenet.load(hugeDilation, error), "an out-of-range dilation is rejected");
+
+    nts::ml::NeuralModel dispatched;
+    tests.expect(dispatched.load(wavenetBytes, error), "the shared model dispatches to WaveNet: " + error);
+    tests.expect(dispatched.isWaveNet(), "a v3 header selects the WaveNet implementation");
+    tests.expectEqual(dispatched.warmUpSamples(), std::size_t { 5 }, "WaveNet reports its warm-up length");
+    tests.expect(dispatched.load(bytes, error), "the shared model still loads recurrent packs: " + error);
+    tests.expect(! dispatched.isWaveNet(), "a v1 header selects the recurrent implementation");
+
+    nts::ml::NeuralAmpProcessor wavenetProcessor;
+    wavenetProcessor.prepare(48000.0, 64, 1);
+    nts::ml::PackedWaveNetModel wavenetReference;
+    tests.expect(wavenetReference.load(wavenetBytes, error), "WaveNet staging reference loads");
+    std::array<float, 64> stageInput {}, stageExpected {};
+    for (std::size_t index = 0; index < stageInput.size(); ++index)
+        stageInput[index] = 0.08f * std::sin(static_cast<float>(index) * 0.19f);
+    wavenetReference.reset();
+    wavenetReference.process(stageInput, stageExpected);
+    tests.expect(wavenetProcessor.stageModel(wavenetBytes, stageInput, stageExpected, 1.0e-6f, -21.0f, error),
+                 "a WaveNet model validates and stages: " + error);
+    std::array<float, 64> wavenetBlock {};
+    auto* wavenetChannel = wavenetBlock.data();
+    wavenetBlock.fill(0.1f); wavenetProcessor.process(&wavenetChannel, 1, wavenetBlock.size());
+    tests.expect(wavenetProcessor.hasActiveModel(), "the staged WaveNet activates");
+    tests.expect(wavenetProcessor.modelMemoryBytes() > 0, "WaveNet memory is reported");
+    allocationCount.store(0, std::memory_order_relaxed); countAllocations = true;
+    wavenetBlock.fill(0.1f); wavenetProcessor.process(&wavenetChannel, 1, wavenetBlock.size());
+    countAllocations = false;
+    tests.expectEqual(allocationCount.load(std::memory_order_relaxed), std::size_t { 0 },
+                      "WaveNet audio processing performs no heap allocation");
     return tests.result();
 }

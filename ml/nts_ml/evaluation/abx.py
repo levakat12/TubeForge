@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 import csv
 import hashlib
 import json
 import math
 import random
 import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from ..datasets.audio import WaveReader, write_pcm_wave
-
 
 LISTENING_CATEGORIES = (
     "clean-guitar-arpeggio",

@@ -56,7 +56,7 @@ void AssistantView::paint(juce::Graphics& graphics)
             graphics.fillRoundedRectangle(row.withWidth(3.0f).reduced(0.0f, 5.0f), 1.5f);
         }
         auto confidence = row.removeFromRight(52.0f);
-        graphics.setColour(theme::good);
+        graphics.setColour(theme::textSecondary);
         graphics.setFont(theme::font(10.0f, true));
         graphics.drawText(juce::String(juce::roundToInt(recommendation.confidence * 100.0f)) + "%", confidence,
                           juce::Justification::centred);
@@ -96,7 +96,7 @@ void AssistantView::paint(juce::Graphics& graphics)
                                               : changes.joinIntoString("\n"),
                             detail.removeFromTop(std::min(96.0f, detail.getHeight() * 0.50f)).toNearestInt(),
                             juce::Justification::topLeft, 7);
-    graphics.setColour(theme::good);
+    graphics.setColour(theme::textSecondary);
     graphics.setFont(theme::font(10.0f, true));
     graphics.drawFittedText("EXPECTED: " + recommendation.expectedEffect,
                             detail.toNearestInt(), juce::Justification::bottomLeft, 3);

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import hashlib
-import json
 
 from .package import SessionPackage, validate_session
-
 
 CORPUS_CATEGORIES = (
     "clean-guitar-arpeggio", "crunch-guitar-open-chords",
@@ -31,7 +30,7 @@ class TakeProvenance:
     input_sha256: str
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TakeProvenance":
+    def from_dict(cls, data: dict[str, Any]) -> TakeProvenance:
         required = ("takeId", "performanceId", "category", "creator", "licenseId", "licenseUri",
                     "releaseDocument", "rightsCleared", "synthetic", "inputSha256")
         missing = [field for field in required if field not in data]

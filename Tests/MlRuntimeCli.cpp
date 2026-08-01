@@ -1,10 +1,12 @@
-#include <nts/ml/PackedTanhModel.h>
+#include <nts/ml/NeuralModel.h>
 
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <cstddef>
 #include <cstring>
+#include <span>
 #include <vector>
 
 int main(int argumentCount, char** arguments)
@@ -14,13 +16,25 @@ int main(int argumentCount, char** arguments)
         std::cerr << "usage: nts_ml_runtime_cli model.bin input.f32 output.f32\n";
         return 2;
     }
-    nts::ml::PackedTanhModel model;
+    // Reads whatever the packed header declares, so the parity driver can drive every architecture
+    // the runtime supports through one executable.
+    std::ifstream modelStream(arguments[1], std::ios::binary);
+    if (! modelStream.is_open())
+    {
+        std::cerr << "Unable to open packed model\n";
+        return 3;
+    }
+    std::vector<char> modelBytes((std::istreambuf_iterator<char>(modelStream)),
+                                 std::istreambuf_iterator<char>());
+    nts::ml::NeuralModel model;
     std::string error;
-    if (! model.loadFile(std::filesystem::path(arguments[1]), error))
+    if (! model.load(std::span(reinterpret_cast<const std::byte*>(modelBytes.data()), modelBytes.size()),
+                     error))
     {
         std::cerr << error << '\n';
         return 3;
     }
+    model.reset();
     std::ifstream inputStream(arguments[2], std::ios::binary);
     if (! inputStream.is_open())
     {

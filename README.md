@@ -69,6 +69,13 @@ the [listening protocol](docs/phase-03-listening-protocol.md), and the executabl
   missing-output validation.
 - History-aware streaming data, leakage-safe performance splits, paired augmentation, composite losses,
   deterministic training, and SQLite experiment tracking.
+- Two training backends behind one interface. The default NumPy trainer has no dependency beyond
+  NumPy and is bit-exact for a given seed. An optional PyTorch backend (`training.backend = "torch"`)
+  trains the same weights roughly two orders of magnitude faster on a GPU and is what makes a
+  full-length capture practical; it is reproducible to float32 tolerance rather than bit-exactly,
+  because cuDNN's recurrent backward pass accumulates nondeterministically. Both produce the same
+  checkpoint format, and `nts_ml_torch_parity` holds a torch-trained model to the same C++ runtime
+  tolerance as a NumPy-trained one.
 - Fixed evaluation taxonomy, packed versioned model artifacts, SHA-256 validation, and C++ runtime parity.
 - Per-take rights provenance with immutable audio hashes, performer-release checks, duplicate detection,
   and strict coverage of eight guitar/bass performance categories.
@@ -78,7 +85,11 @@ the [dataset and corpus-audit guide](docs/phase-04-dataset-guide.md).
 
 ## Phase 5 neural amplifier capture
 
-- Conditioned LSTM, compact GRU, and streaming dilated causal-TCN candidates.
+- A conditioned LSTM trained end to end with backpropagation through time, plus GRU-shaped and
+  dilated causal-TCN feature extractors whose recurrent and convolutional weights stay at their
+  seeded values while only a linear readout is fitted. The latter two are echo-state models, named
+  `RandomFeatureGru` and `RandomFeatureTcn` to say so; use the LSTM when the recurrence itself has to
+  learn. See [Phase 5 coverage](docs/phase-05-coverage.md) rows 18 and 22.
 - Safety-gated capture wizard with prepared excitation, alignment, drift rejection, separate validation,
   automatic training/export, quality reporting, and atomic activation pointers.
 - Packed C++ inference with artifact SHA/test-vector validation, transport reset handling, input-level

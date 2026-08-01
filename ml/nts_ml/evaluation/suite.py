@@ -1,16 +1,15 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
-import json
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..datasets.audio import WaveReader, write_pcm_wave
-from ..losses import (dc_penalty, loudness_difference, spectral_convergence,
-                      waveform_l1, waveform_l2)
+from ..losses import dc_penalty, loudness_difference, spectral_convergence, waveform_l1, waveform_l2
 from ..models import AudioModel
 
 REQUIRED_CLIPS = (

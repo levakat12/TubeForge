@@ -62,7 +62,9 @@ void CircuitSchematicView::paint(juce::Graphics& graphics)
         if (telemetry != stages.end())
         {
             const auto& meter = telemetry->values;
-            graphics.setColour(meter.valid ? theme::good : theme::warn);
+            // A healthy stage is quiet. Eleven green "OK"s in a row say nothing and drown out
+            // the one node that is actually in trouble.
+            graphics.setColour(meter.valid ? theme::textTertiary : theme::warn);
             graphics.setFont(theme::font(9.5f));
             graphics.drawFittedText(juce::String(meter.outputRms, 3) + " rms\n" + (meter.valid ? "OK" : "CHECK"),
                                     box.translated(0.0f, 52.0f).withHeight(32.0f).toNearestInt(),
@@ -107,7 +109,7 @@ void CircuitSchematicView::paint(juce::Graphics& graphics)
     graphics.drawText("20 kHz", graphArea.reduced(8.0f, 4.0f), juce::Justification::bottomRight);
 
     const auto trouble = statusText.containsIgnoreCase("failed") || statusText.containsIgnoreCase("invalid");
-    graphics.setColour(trouble ? theme::warn : theme::good);
+    graphics.setColour(trouble ? theme::warn : theme::textSecondary);
     graphics.setFont(theme::font(11.5f, true));
     graphics.drawFittedText(statusText, bounds.toNearestInt(), juce::Justification::centredLeft, 2);
 }

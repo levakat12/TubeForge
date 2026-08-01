@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
+from pathlib import Path
 
 from nts_ml.alignment import write_alignment_html
-
 
 parser = argparse.ArgumentParser(description="Render an HTML alignment inspection report")
 parser.add_argument("validation_json", type=Path)

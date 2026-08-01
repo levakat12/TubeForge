@@ -274,13 +274,18 @@ int main()
         for (std::size_t a = 0; a < shortlist.candidates.size(); ++a)
             for (auto b = a + 1; b < shortlist.candidates.size(); ++b)
             {
-                const auto& first = shortlist.candidates[a].rigPreset.parameters;
-                const auto& second = shortlist.candidates[b].rigPreset.parameters;
-                const auto sameDrive = std::abs(first.stages[0].driveDb - second.stages[0].driveDb) < 1.0e-4f;
-                const auto sameTone = std::abs(first.toneStack.treble - second.toneStack.treble) < 1.0e-4f
-                                   && std::abs(first.toneStack.mid - second.toneStack.mid) < 1.0e-4f;
-                const auto samePreEq = std::abs(first.preEq.highCutHz - second.preEq.highCutHz) < 1.0e-4f
-                                    && std::abs(first.preEq.tightness - second.preEq.tightness) < 1.0e-4f;
+                const auto& candidateA = shortlist.candidates[a].rigPreset.parameters;
+                const auto& candidateB = shortlist.candidates[b].rigPreset.parameters;
+                const auto sameDrive = std::abs(candidateA.stages[0].driveDb
+                                                - candidateB.stages[0].driveDb) < 1.0e-4f;
+                const auto sameTone = std::abs(candidateA.toneStack.treble
+                                               - candidateB.toneStack.treble) < 1.0e-4f
+                                   && std::abs(candidateA.toneStack.mid
+                                               - candidateB.toneStack.mid) < 1.0e-4f;
+                const auto samePreEq = std::abs(candidateA.preEq.highCutHz
+                                                - candidateB.preEq.highCutHz) < 1.0e-4f
+                                    && std::abs(candidateA.preEq.tightness
+                                                - candidateB.preEq.tightness) < 1.0e-4f;
                 if (sameDrive && sameTone && samePreEq) allDistinct = false;
             }
         tests.expect(allDistinct, "shortlisted candidates are not duplicates of one another");

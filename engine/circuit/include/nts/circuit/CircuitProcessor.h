@@ -24,6 +24,12 @@ public:
     void process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept;
     [[nodiscard]] std::vector<NodeTelemetry> telemetrySnapshot() const;
     [[nodiscard]] std::size_t latencySamples() const noexcept;
+    /** The reactive cabinet and transformer stages are IIR approximations, so unlike a
+        convolved cabinet they have no finite impulse length to measure. This is a fixed
+        allowance comfortably beyond the decay of the filters involved, not a measurement.
+    */
+    [[nodiscard]] std::size_t tailSamples() const noexcept;
+    static constexpr double tailAllowanceSeconds = 0.05;
 
 private:
     struct Slot { std::array<std::unique_ptr<CompiledCircuitGraph>, 2> channels; };

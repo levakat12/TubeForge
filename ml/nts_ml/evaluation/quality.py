@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterable
 import json
 import math
 import time
+from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray

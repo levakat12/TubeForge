@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
 import json
+from pathlib import Path
 
 from nts_ml.evaluation import analyze_abx_results
-
 
 parser = argparse.ArgumentParser(description="Analyze completed TubeForge ABX response sheets")
 parser.add_argument("pack", type=Path)

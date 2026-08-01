@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-
 CONTROL_NAMES = ("gain", "tone", "master", "channel", "instrument_mode")
 
 
@@ -100,7 +99,7 @@ class ConditionedLstm(ConditionedModel):
                  state_size=self.state_size, residual=int(self.residual), **self.parameters())
 
     @classmethod
-    def load_checkpoint(cls, path: Path) -> "ConditionedLstm":
+    def load_checkpoint(cls, path: Path) -> ConditionedLstm:
         data = np.load(path)
         model = cls(int(data["state_size"]), int(data["sample_rate"]), residual=bool(data["residual"]))
         for name, value in model.parameters().items(): value[...] = data[name]
@@ -114,7 +113,21 @@ class FeatureCache:
     outputs: NDArray[np.float32]
 
 
-class ConditionedGru(ConditionedModel):
+class RandomFeatureGru(ConditionedModel):
+    """A GRU-shaped feature extractor with a trained linear readout.
+
+    The recurrent weights are drawn once from the seed and never updated: `parameters()`
+    exposes only the output layer, so that is all the optimiser can reach. This is an echo
+    state network, not a trained GRU, and it cannot learn an amplifier's nonlinearity no
+    matter how long it runs.
+
+    That is a real technique with a real advantage -- fitting the readout is convex and takes
+    seconds -- and the name says so rather than implying a capability the model does not have.
+    Use ConditionedLstm, which has full backpropagation through time, when the recurrence
+    itself has to learn something. The `architecture` string is unchanged because it is part
+    of the checkpoint and packed-export format.
+    """
+
     architecture = "conditioned_gru"
 
     def __init__(self, state_size: int = 24, sample_rate: int = 48_000, seed: int = 0):
@@ -152,14 +165,24 @@ class ConditionedGru(ConditionedModel):
                  output_weight=self.output_weight, output_bias=self.output_bias)
 
     @classmethod
-    def load_checkpoint(cls, path: Path) -> "ConditionedGru":
+    def load_checkpoint(cls, path: Path) -> RandomFeatureGru:
         data = np.load(path); model = cls(int(data["state_size"]), int(data["sample_rate"]))
         for name in ("input_weight", "recurrent_weight", "bias", "output_weight", "output_bias"):
             getattr(model, name)[...] = data[name]
         model.reset(); return model
 
 
-class CausalTcn(ConditionedModel):
+class RandomFeatureTcn(ConditionedModel):
+    """A dilated causal convolution stack with a trained linear readout.
+
+    As with RandomFeatureGru, the stack itself is frozen: `parameters()` exposes only
+    `output_weight`, `output_bias` and `residual_gain`, so `kernel`, `input_projection` and
+    `control_projection` keep their seeded values for the whole of training. Excluding them
+    from `parameters()` rather than merely from the gradient is deliberate -- the optimiser
+    applies weight decay to everything it is handed, so a tensor with no gradient but inside
+    the parameter set would decay towards zero.
+    """
+
     architecture = "causal_tcn"
 
     def __init__(self, state_size: int = 16, sample_rate: int = 48_000, seed: int = 0,
@@ -211,7 +234,7 @@ class CausalTcn(ConditionedModel):
                  output_weight=self.output_weight, output_bias=self.output_bias, residual_gain=self.residual_gain)
 
     @classmethod
-    def load_checkpoint(cls, path: Path) -> "CausalTcn":
+    def load_checkpoint(cls, path: Path) -> RandomFeatureTcn:
         data = np.load(path); model = cls(int(data["state_size"]), int(data["sample_rate"]), layers=int(data["layers"]), kernel_size=int(data["kernel_size"]))
         for name in ("input_projection", "control_projection", "kernel", "output_weight", "output_bias", "residual_gain"):
             getattr(model, name)[...] = data[name]
@@ -223,7 +246,7 @@ def load_model_checkpoint(path: Path):
     architecture = str(data["architecture"]) if "architecture" in data else "tiny_tanh_rnn"
     data.close()
     if architecture == ConditionedLstm.architecture: return ConditionedLstm.load_checkpoint(path)
-    if architecture == ConditionedGru.architecture: return ConditionedGru.load_checkpoint(path)
-    if architecture == CausalTcn.architecture: return CausalTcn.load_checkpoint(path)
+    if architecture == RandomFeatureGru.architecture: return RandomFeatureGru.load_checkpoint(path)
+    if architecture == RandomFeatureTcn.architecture: return RandomFeatureTcn.load_checkpoint(path)
     from .tiny_rnn import TinyTanhRnn
     return TinyTanhRnn.load_checkpoint(path)

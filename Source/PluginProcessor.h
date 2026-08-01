@@ -5,6 +5,13 @@
 #include <nts/amp/TraditionalAmp.h>
 #include <nts/circuit/CircuitProcessor.h>
 #include <nts/diagnostics/DiagnosticsCollector.h>
+#include <nts/diagnostics/SpscRingBuffer.h>
+#include <nts/dsp/DelayLine.h>
+#include <nts/dsp/Dynamics.h>
+#include <nts/dsp/Effects.h>
+#include <nts/dsp/PitchDetector.h>
+#include <nts/dsp/Smoothing.h>
+#include <nts/ir/CabinetIrLoader.h>
 #include <nts/diagnostics/LatencyBudget.h>
 #include <nts/diagnostics/StructuredLogger.h>
 #include <nts/ecosystem/TonePackage.h>
@@ -12,6 +19,8 @@
 #include <nts/reconstruction/SourceReconstruction.h>
 #include <nts/state/ProjectState.h>
 #include <nts/tone/ToneProfileDatabase.h>
+
+#include "StudioServices.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
@@ -22,6 +31,27 @@
 #include <optional>
 #include <span>
 #include <thread>
+
+/** The one place a runtime-read parameter is named.
+
+    Both the Param enumerators and the string-id table in the implementation file expand
+    from this list, so an enumerator cannot end up pointing at a different parameter's
+    value. Two parallel lists guarded by a test was the obvious alternative and it does
+    not work: any test able to reach the mapping has to go through the same table it is
+    checking, so a transposed pair agrees with itself and passes.
+
+    Each name here must match a constant in the ParameterIds namespace exactly.
+*/
+#define TUBEFORGE_RUNTIME_PARAMETERS(X)                                                  \
+    X(input) X(output) X(bypass) X(gain) X(bass) X(mid) X(treble) X(presence)             \
+    X(resonance) X(master) X(cabinet) X(instrument) X(topology) X(stage1) X(stage2)       \
+    X(stage3) X(stage4) X(bias) X(lowCut) X(highCut) X(oversampling) X(sag) X(feedback)   \
+    X(crossover) X(cleanBlend) X(cabinetAlignment) X(tightness) X(pickEmphasis)           \
+    X(engineMode) X(neuralMonitor) X(neuralCompensation) X(circuitPreampTube)             \
+    X(circuitPowerTube) X(circuitPowerTopology) X(circuitToneStack) X(circuitBackend)     \
+    X(circuitCabinetStyle) X(gateEnabled) X(gateThreshold) X(gateDepth) X(gateAttack)     \
+    X(gateHold) X(gateRelease) X(delayMix) X(delayTime) X(delayFeedback) X(delayTone)      \
+    X(reverbMix) X(reverbSize) X(reverbDamping) X(cabinetBlend) X(tunerMute)
 
 class TubeForgeAudioProcessor final : public juce::AudioProcessor,
                                       private juce::AsyncUpdater
@@ -53,6 +83,17 @@ public:
     void getStateInformation(juce::MemoryBlock& destinationData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
 
+    /** Hands the host the bypass control so it can drive it and keep its delay
+        compensation applied.
+
+        Returning non-null moves responsibility here: the host stops calling
+        processBlockBypassed and instead sets this parameter, so processBlock owns the
+        transition. It crossfades to a latency-aligned dry path rather than switching, and
+        processBlockBypassed is deliberately not implemented -- it would be dead code that
+        could drift away from the path that actually runs.
+    */
+    juce::AudioProcessorParameter* getBypassParameter() const override;
+
     [[nodiscard]] juce::Result saveProject(const juce::File& file) const;
     [[nodiscard]] juce::Result loadProject(const juce::File& file);
     [[nodiscard]] nts::diagnostics::DiagnosticsSnapshot diagnosticsSnapshot() const noexcept;
@@ -65,6 +106,34 @@ public:
     [[nodiscard]] juce::String neuralModelStatusText() const;
     [[nodiscard]] nts::ml::CalibrationReading neuralCalibrationReading() const noexcept
     { return neuralAmp.calibrationReading(); }
+    /** Loads a cabinet impulse response from an audio file into slot 0 (A) or 1 (B).
+
+        Decoding, resampling and preparation happen off the message thread; the prepared
+        response is then staged into the amplifier and faded in. The decoded response is kept
+        at its own sample rate so it can be re-prepared if the host changes rate.
+    */
+    void requestCabinetIrLoad(int slot, const juce::File& irFile);
+    /** Puts the built-in response back in one slot. */
+    void clearCabinetIr(int slot);
+    [[nodiscard]] juce::String cabinetIrStatusText(int slot) const;
+    [[nodiscard]] juce::File cabinetIrFile(int slot) const;
+
+    /** What the tuner display should show right now.
+
+        Detection runs off the audio thread; the callback only forwards decimated samples.
+    */
+    struct TunerReading
+    {
+        int midiNote { -1 };
+        float cents {};
+        float frequencyHz {};
+        float confidence {};
+        bool voiced {};
+    };
+    [[nodiscard]] TunerReading tunerReading() const noexcept;
+    /** Drains the tuner's audio-thread queue and re-runs detection. Called from the shell tick. */
+    void updateTuner();
+
     void refreshPhysicalCircuit();
     [[nodiscard]] std::vector<nts::circuit::NodeTelemetry> circuitTelemetrySnapshot() const
     { return physicalCircuit.telemetrySnapshot(); }
@@ -81,7 +150,7 @@ public:
     void cancelSongReconstruction();
     [[nodiscard]] juce::String reconstructionStatusText() const;
     [[nodiscard]] float reconstructionProgress() const noexcept
-    { return reconstructionProgressValue.load(std::memory_order_relaxed); }
+    { return studio.reconstructionProgress(); }
     [[nodiscard]] std::optional<nts::reconstruction::ReconstructionResult> reconstructionSnapshot() const;
     [[nodiscard]] std::vector<nts::reconstruction::PlayableRegion> reconstructionRegionsSnapshot() const;
     [[nodiscard]] bool requestReconstructionRegion(std::size_t index);
@@ -116,6 +185,30 @@ public:
     juce::AudioProcessorValueTreeState& getParameters() noexcept { return parameterState; }
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    /** Index into the cached raw-parameter pointer table.
+
+        Resolving a parameter by string costs a string-compare tree descent through the
+        value tree state's adapter table, and the audio callback does about fifty of them
+        per block. The pointers are stable for the lifetime of the value tree state, so
+        they are resolved once in the constructor and indexed by this enum instead.
+    */
+    enum class Param : std::size_t
+    {
+#define TUBEFORGE_DECLARE_PARAM_ENUMERATOR(name) name,
+        TUBEFORGE_RUNTIME_PARAMETERS(TUBEFORGE_DECLARE_PARAM_ENUMERATOR)
+#undef TUBEFORGE_DECLARE_PARAM_ENUMERATOR
+        count
+    };
+
+    /** Current value of a parameter. Allocation-free and lock-free; safe on the audio thread. */
+    [[nodiscard]] float parameterOf(Param id) const noexcept
+    {
+        return parameterPointers[static_cast<std::size_t>(id)]->load(std::memory_order_relaxed);
+    }
+
+    /** The string id backing an enumerator, so the mapping can be verified from a test. */
+    [[nodiscard]] static const char* parameterId(Param id) noexcept;
+
 private:
     static float valueOf(const juce::AudioProcessorValueTreeState& state, const char* parameterId) noexcept;
     static void setParameterValue(juce::AudioProcessorValueTreeState& state,
@@ -138,20 +231,12 @@ private:
     void handleAsyncUpdate() override;
     void loadNeuralArtifact(std::stop_token stopToken, juce::File artifactDirectory);
     void loadPackagedNeuralModel(std::stop_token stopToken, juce::File packageDirectory);
-    void analyzeToneFile(std::stop_token stopToken, juce::File audioFile);
-    void reconstructSongFile(std::stop_token stopToken, juce::File songFile,
-                             nts::reconstruction::TargetInstrument target,
-                             nts::reconstruction::StereoMode stereoMode,
-                             std::optional<std::size_t> regionOverride = std::nullopt);
-    [[nodiscard]] std::optional<nts::reconstruction::StemSet> runMlStemSeparation(
-        const juce::File& songFile, const nts::reconstruction::StereoAudio& mixture,
-        nts::reconstruction::TargetInstrument target, std::stop_token stopToken,
-        std::string& failureReason);
     [[nodiscard]] std::vector<nts::assistant::ParameterValue> assistantParameterValues() const;
     void applyAssistantParameterValues(std::span<const nts::assistant::ParameterValue> values);
     void saveAssistantPreferences() const;
 
     juce::AudioProcessorValueTreeState parameterState;
+    std::array<std::atomic<float>*, static_cast<std::size_t>(Param::count)> parameterPointers {};
     nts::audio::RuntimeParameters runtimeParameters;
     nts::audio::MeterState meters;
     juce::Image ampFaceplateImage;
@@ -170,9 +255,87 @@ private:
     juce::AudioBuffer<float> inputSnapshot;
     double currentSampleRate { 44100.0 };
     int currentBlockSize {};
+    // Applies the Input parameter for the engines that have no trim of their own. The
+    // traditional amplifier applies it inside AmpVoice, where its calibrator measures the
+    // untrimmed signal first; see the note at the call site in processBlock.
+    nts::dsp::SmoothedParameter inputTrimGain;
+    /// Gate for the neural and circuit engines; the traditional path keeps its own. See
+    /// the note at the call site for why the two are not merged.
+    nts::dsp::NoiseGate sharedGate;
+    /// Delay then reverb, after the amplifier and shared by every engine: effects belong to
+    /// the rig, not to one of the three ways of making the distortion.
+    nts::dsp::Delay delayEffect;
+    nts::dsp::Reverb reverbEffect;
+
+    /** Live pitch tracking.
+
+        The audio callback pushes decimated mono samples into a lock-free queue and does
+        nothing else; the correlation search runs on the message thread when the editor ticks.
+        Decimating to roughly 8 kHz first is what makes the search affordable -- it cuts the
+        lag range by six -- and costs nothing, because a guitar's fundamental is far below the
+        reduced Nyquist.
+    */
+    static constexpr std::size_t tunerQueueCapacity = 16384;
+    static constexpr double tunerAnalysisRate = 8000.0;
+    nts::diagnostics::SpscRingBuffer<float, tunerQueueCapacity> tunerQueue;
+    int tunerDecimationFactor { 6 };
+    int tunerDecimationCounter {};
+    float tunerDecimationAccumulator {};
+    nts::dsp::PitchDetector tunerDetector;
+    std::vector<float> tunerFrame;
+    std::size_t tunerFrameFill {};
+    mutable std::mutex tunerMutex;
+    TunerReading latestTunerReading;
+
+    /** Where a mode change is in its fade-out / switch / fade-in cycle. */
+    enum class EngineSwitch { idle, fadingOut, fadingIn };
+
+    // Bypass crossfades against a dry path delayed to match the latency the host has been
+    // told about, so engaging it neither clicks nor shifts the signal in time.
+    nts::dsp::DelayLine dryDelay;
+    nts::dsp::SmoothedParameter bypassMix;
+    juce::AudioBuffer<float> dryBuffer;
+    // Engine changes mute instead of crossfading: the three engines report different
+    // latencies, so overlapping two of them would comb-filter rather than blend.
+    nts::dsp::SmoothedParameter engineSwitchGain;
+    EngineSwitch engineSwitchPhase { EngineSwitch::idle };
+    int activeEngineMode {};
+    // Beyond any oversampling latency the amplifier can report, so the dry path never has
+    // to shorten and prepareToPlay is the only place this memory is claimed.
+    static constexpr std::size_t maximumDryDelaySamples = 8192;
+
+    /** The four factory voices, which are exactly the instrument x topology combinations.
+
+        Exposed as host programs so a MIDI foot controller can select them, which is how these
+        get switched on stage.
+    */
+    static constexpr int factoryProgramCount = 4;
+    /// Set by the audio thread from a MIDI program change, applied on the message thread.
+    std::atomic<int> pendingProgramChange { -1 };
+
     std::atomic<int> pendingOversamplingLatencySamples {};
     // Last factor chosen by Auto, kept so the choice has hysteresis across blocks.
     mutable std::atomic<int> autoOversamplingFactor { 4 };
+    /** One cabinet slot's user-loaded response.
+
+        The decoded audio is held at the rate it was decoded to, so a host sample-rate change
+        can re-prepare it rather than leaving a response that is silently the wrong length.
+    */
+    struct CabinetIrSlot
+    {
+        juce::File file;
+        nts::dsp::ImpulseResponse decoded;
+        std::string status { "Built-in cabinet response" };
+    };
+
+    void applyRecoveredRig(const nts::amp::AmpParameters& rig);
+    void refreshEffectParameters() noexcept;
+    void applyCabinetIr(int slot);
+    void restoreCabinetIrPaths(const std::string& pathA, const std::string& pathB);
+    nts::ir::CabinetIrLoader cabinetIrLoader;
+    mutable std::mutex cabinetIrMutex;
+    std::array<CabinetIrSlot, 2> cabinetIrSlots;
+
     std::atomic<nts::diagnostics::AssetLoadStatus> neuralLoadStatus { nts::diagnostics::AssetLoadStatus::idle };
     mutable std::mutex neuralStatusMutex;
     std::string neuralStatusDetail { "No neural model loaded" };
@@ -187,25 +350,7 @@ private:
     mutable std::mutex circuitGraphMutex;
     nts::circuit::CircuitGraphDescription desiredCircuitGraph;
     std::jthread circuitCompiler;
-    nts::tone::ToneAnalyzer toneAnalyzer;
-    nts::tone::ToneProfileDatabase toneProfiles;
-    mutable std::mutex toneAnalysisMutex;
-    std::optional<nts::tone::ToneAnalysisResult> latestToneAnalysis;
-    std::string toneAnalysisStatus { "Choose a guitar or bass recording to analyze" };
-    std::string toneNearestProfile { "Profile library is empty" };
-    std::jthread toneAnalysisWorker;
-    nts::reconstruction::StemSeparator stemSeparator;
-    nts::reconstruction::RigReconstructor rigReconstructor;
-    mutable std::mutex reconstructionMutex;
-    std::optional<nts::reconstruction::ReconstructionResult> latestReconstruction;
-    std::vector<nts::reconstruction::PlayableRegion> reconstructionRegions;
-    juce::File lastReconstructionSong;
-    nts::reconstruction::TargetInstrument lastReconstructionTarget { nts::reconstruction::TargetInstrument::guitar };
-    nts::reconstruction::StereoMode lastReconstructionStereoMode { nts::reconstruction::StereoMode::fullStereo };
-    std::size_t activeReconstructionRegion {};
-    std::string reconstructionStatus { "Import a song to begin source reconstruction" };
-    std::atomic<float> reconstructionProgressValue {};
-    std::jthread reconstructionWorker;
+    StudioServices studio;
     nts::assistant::SummaryQueue assistantSummaryQueue;
     nts::assistant::SummaryAccumulator assistantSummaryAccumulator;
     nts::assistant::RecommendationEngine assistantEngine;

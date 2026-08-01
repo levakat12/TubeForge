@@ -16,10 +16,14 @@ class ProfileLibraryPage;
 
 /// The editor shell.
 ///
-/// It owns the chrome that surrounds every page -- header, gear browser, I/O rail, signal
-/// chain, diagnostics -- and it owns the pages themselves, but it knows nothing about what is
-/// inside any of them. Its whole relationship with a page is: construct it, give it bounds,
-/// show or hide it, and call refresh() while it is showing.
+/// It owns the chrome that surrounds every page -- the icon navigation across the top, the
+/// global control rail beneath it, and the status bar -- and it owns the pages themselves,
+/// but it knows nothing about what is inside any of them. Its whole relationship with a page
+/// is: construct it, give it bounds, show or hide it, and call refresh() while it is showing.
+///
+/// The layout is three fixed-height horizontal bands with the page stage filling whatever is
+/// left. Nothing floats and nothing overlaps, which is what keeps a window with nine modules
+/// in it from reading as a pile of panels.
 class TubeForgeAudioProcessorEditor final : public juce::AudioProcessorEditor,
                                             private juce::Timer
 {
@@ -30,16 +34,18 @@ public:
     void paint(juce::Graphics& graphics) override;
     void resized() override;
 
-    static constexpr int moduleCount = 8;
+    static constexpr int moduleCount = 10;
     /// Modules from this index on are engineering surfaces, hidden until PRO is switched on.
-    static constexpr int firstProModule = 5;
+    static constexpr int firstProModule = 7;
     /// The page the header's preset controls talk to.
-    static constexpr int libraryModule = 4;
+    static constexpr int libraryModule = 6;
 
 private:
     void timerCallback() override;
     void buildPages();
-    void buildGearBrowser();
+    void buildNavigation();
+    void layOutNavigation();
+    void layOutRail();
     void setActiveModule(int index);
     void applyProModeVisibility();
     void chooseProjectToSave();
@@ -51,46 +57,55 @@ private:
 
     juce::Label title;
     juce::Label productTagline;
+
+    /// One icon per module, in module order. This is the only navigation in the window.
+    std::vector<std::unique_ptr<tf::ui::IconButton>> navIcons;
+
     juce::Label presetCaption;
     juce::Label presetName;
-    juce::TextButton presetPrevious { "<" };
-    juce::TextButton presetNext { ">" };
-    juce::TextButton presetBrowse { "Browse" };
+    tf::ui::IconButton presetPrevious { tf::ui::Glyph::previous, "Previous rig" };
+    tf::ui::IconButton presetNext { tf::ui::Glyph::next, "Next rig" };
+    tf::ui::IconButton presetBrowse { tf::ui::Glyph::browse, "Browse rigs" };
+    tf::ui::IconButton openProject { tf::ui::Glyph::open, "Open project" };
+    tf::ui::IconButton saveProject { tf::ui::Glyph::save, "Save project" };
+    tf::ui::IconButton audioSettings { tf::ui::Glyph::settings, "Audio settings" };
+
+    juce::Label engineCaption;
     juce::ComboBox engineModeSelector;
     juce::ToggleButton bypass { "BYPASS" };
     juce::ToggleButton proMode { "PRO" };
-    juce::TextButton audioSettings { "Audio" };
-    juce::TextButton openProject { "Open" };
-    juce::TextButton saveProject { "Save" };
-
-    juce::Component browserPanel;
-    juce::Label browserTitle;
-    juce::Label mode;
-    juce::Label deviceStatus;
-    std::array<juce::Label, 3> browserGroupLabels;
-    std::vector<std::unique_ptr<tf::ui::GearBrowserItem>> gearItems;
-
-    juce::Component pageHost;
-    juce::Label moduleTitle;
-    juce::Label moduleSubtitle;
-    /// Owned pages, in module order. The shell only ever touches them through ModulePage.
-    std::array<std::unique_ptr<ModulePage>, moduleCount> pages;
-    /// Borrowed view of pages[libraryModule], for the header's preset controls.
-    ProfileLibraryPage* library {};
-    int activeModule {};
-
-    /// Panels the shell paints itself rather than owning as components, cached by resized()
-    /// so paint() never has to re-derive the layout and drift out of step with it.
-    juce::Rectangle<int> headerBounds;
-    juce::Rectangle<int> meterRailBounds;
 
     juce::Label inputLabel;
     juce::Label outputLabel;
     juce::Slider inputGain;
     juce::Slider outputGain;
-    tf::ui::StudioLevelMeter studioMeter;
+    tf::ui::LevelBar inputMeter;
+    tf::ui::LevelBar outputMeter;
+
+    juce::Component pageHost;
+    /// Owned pages, in module order. The shell only ever touches them through ModulePage.
+    std::array<std::unique_ptr<ModulePage>, moduleCount> pages;
+    /// Borrowed view of pages[libraryModule], for the header's preset controls.
+    ProfileLibraryPage* library {};
+    int activeModule {};
+    /// The active module's name and tag, drawn above the page.
+    juce::String moduleCaption;
+
+    juce::Label mode;
+    juce::Label deviceStatus;
     tf::ui::StudioSignalChain signalChain;
     juce::Label diagnosticsText;
+
+    /// Bands the shell paints itself rather than owning as components, cached by resized() so
+    /// paint() never has to re-derive the layout and drift out of step with it.
+    juce::Rectangle<int> navBounds;
+    juce::Rectangle<int> railBounds;
+    juce::Rectangle<int> stageBounds;
+    juce::Rectangle<int> captionBounds;
+    juce::Rectangle<int> footerBounds;
+    /// Hairlines between the navigation groups and between the rail's control clusters.
+    std::array<int, 2> navDividerX {};
+    std::array<int, 2> railDividerX {};
 
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputAttachment;

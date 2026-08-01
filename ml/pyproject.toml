@@ -9,10 +9,18 @@ description = "Reproducible paired-audio dataset, training, evaluation, and expo
 requires-python = ">=3.11"
 dependencies = ["numpy>=1.26"]
 
+[project.optional-dependencies]
+# Only the NAM parity test needs these, and only to check nts_ml.nam against the implementation it
+# mirrors. The package itself stays numpy-only so CI does not grow a torch dependency.
+reference = ["neural-amp-modeler>=0.13"]
+
 [project.scripts]
 nts-validate-dataset = "nts_ml.cli:validate_dataset"
 nts-tiny-train = "nts_ml.cli:tiny_train"
 nts-evaluate = "nts_ml.cli:evaluate_model"
+nts-nam-distill = "nts_ml.cli:nam_distill"
+nts-nam-catalogue = "nts_ml.cli:nam_catalogue"
+nts-nam-import = "nts_ml.cli:nam_import"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -24,3 +32,21 @@ include = ["nts_ml*"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+# Pinned explicitly rather than relying on the default selection, so that upgrading ruff
+# cannot fail CI on rules nobody chose to adopt.
+#
+# This selects the rules that find defects and leaves the ones that only express a layout
+# preference. E5 (line length) and E7 (statements per line) are deliberately absent: the
+# package is written in a compact style throughout -- paired assignments and single-line
+# bodies -- and that is a consistent authorial choice, not an accident for a linter to
+# undo. Turn them on only alongside a decision to reformat.
+[tool.ruff.lint]
+select = [
+    "E4",  # pycodestyle: import placement
+    "E9",  # pycodestyle: syntax and runtime errors
+    "F",   # pyflakes: genuinely unused or undefined names
+    "I",   # import sorting
+    "UP",  # pyupgrade: this package is py311+ only
+    "B",   # bugbear: likely bugs
+]

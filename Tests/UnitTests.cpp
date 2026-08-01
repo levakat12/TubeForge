@@ -150,6 +150,24 @@ void testStateMigrationAndValidation(TestHarness& tests)
     std::string error;
     tests.expect(! nts::state::validate(invalid, error), "preset validation rejects absolute asset paths");
     tests.expect(! error.empty(), "preset validation returns an actionable error");
+
+    // A schema 2 project predates user cabinet responses. It has to keep loading, and the
+    // absent responses have to come through as empty rather than as anything invented.
+    const auto fromV2 = nts::state::deserialize(
+        R"({"schemaVersion":2,"applicationVersion":"0.10.0",)"
+        R"("engine":{"inputGainDb":1.5,"outputGainDb":-4.0,"bypass":false,"ampControls":[]},)"
+        R"("device":{},"graph":{"physicalCircuitJson":""},"ui":{},"assets":{"relativePaths":[]}})");
+    tests.expect(static_cast<bool>(fromV2), "a schema 2 project still loads");
+    if (fromV2)
+    {
+        tests.expectEqual(fromV2.state->schemaVersion, nts::state::currentSchemaVersion,
+                          "a schema 2 project is migrated to the current schema");
+        tests.expect(fromV2.state->assets.cabinetIrPathA.empty()
+                     && fromV2.state->assets.cabinetIrPathB.empty(),
+                     "migrating from schema 2 leaves the cabinet response slots empty");
+        tests.expectNear(fromV2.state->engine.inputGainDb, 1.5, 1.0e-6,
+                         "migrating from schema 2 preserves the engine settings");
+    }
 }
 
 void testStateRoundTrip(TestHarness& tests)
@@ -161,6 +179,8 @@ void testStateRoundTrip(TestHarness& tests)
     original.graph.physicalCircuitJson = R"({"schemaVersion":1,"id":"test-circuit"})";
     original.ui = { 900, 640, false };
     original.assets.relativePaths = { "irs/cab.wav", "models/amp.ntm" };
+    original.assets.cabinetIrPathA = "irs/greenback-57.wav";
+    original.assets.cabinetIrPathB = "irs/v30-ribbon.wav";
 
     const auto parsed = nts::state::deserialize(nts::state::serialize(original));
     tests.expect(static_cast<bool>(parsed), "serialized state parses successfully");

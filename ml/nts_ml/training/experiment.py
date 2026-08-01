@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 import json
 import platform
 import sqlite3
 import subprocess
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 
 def git_commit(repository: Path) -> str:
@@ -74,7 +74,7 @@ class ExperimentTracker:
     def close(self) -> None:
         self.connection.close()
 
-    def __enter__(self) -> "ExperimentTracker":
+    def __enter__(self) -> ExperimentTracker:
         return self
 
     def __exit__(self, *_: object) -> None:

@@ -4,8 +4,13 @@ import unittest
 
 import numpy as np
 
-from nts_ml.alignment import (align_pair, correct_clock_drift, estimate_latency,
-                              impulse_marker_latency, measure_alignment)
+from nts_ml.alignment import (
+    align_pair,
+    correct_clock_drift,
+    estimate_latency,
+    impulse_marker_latency,
+    measure_alignment,
+)
 from nts_ml.augmentation import AugmentationConfig, PairedAugmenter
 
 

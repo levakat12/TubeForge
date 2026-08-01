@@ -1,4 +1,6 @@
+#include "PackedFixtures.h"
 #include <nts/ml/NeuralAmpProcessor.h>
+#include <nts/ml/PackedWaveNetModel.h>
 
 #include <algorithm>
 #include <array>
@@ -88,6 +90,44 @@ int main()
                   << processor.modelMemoryBytes() << ',' << p99 / budgetUs * 100.0 << "\n";
         const auto targetFraction = channels == 1 ? 0.5 : 0.75;
         if (p99 >= budgetUs * targetFraction) return 3;
+    }
+
+    // The NAM corpus geometry: 23 layers, kernels of 6 with two of 15, dilations cycling to 239.
+    // The lite tier (3 channels) is the one held to a budget here because it is the tier a machine
+    // is expected to run several of; the standard tier is reported for reference. Measured on the
+    // development machine at 17.1% (standard) and 5.5% (lite) of one core, scalar and unoptimised.
+    for (const auto channels : { std::size_t { 3 }, std::size_t { 8 } })
+    {
+        const auto wavenetBytes = nts::test::wavenetFixture(static_cast<std::uint32_t>(channels), 16u,
+                                                            nts::test::namCorpusLayers());
+        nts::ml::PackedWaveNetModel wavenet;
+        if (! wavenet.load(wavenetBytes, error)) { std::cerr << error << '\n'; return 4; }
+        std::array<float, blockSize> wavenetInput {}, wavenetOutput {};
+        for (std::size_t index = 0; index < blockSize; ++index)
+            wavenetInput[index] = 0.08f * std::sin(static_cast<float>(index) * 0.17f);
+        wavenet.reset();
+        for (std::size_t iteration = 0; iteration < 256; ++iteration) wavenet.process(wavenetInput, wavenetOutput);
+        std::array<double, batches> averages {}, percentiles {};
+        for (std::size_t batch = 0; batch < batches; ++batch)
+        {
+            std::vector<double> timings; timings.reserve(iterations);
+            for (std::size_t iteration = 0; iteration < iterations; ++iteration)
+            {
+                const auto start = std::chrono::steady_clock::now();
+                wavenet.process(wavenetInput, wavenetOutput);
+                const auto end = std::chrono::steady_clock::now();
+                timings.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+            }
+            std::sort(timings.begin(), timings.end());
+            averages[batch] = std::accumulate(timings.begin(), timings.end(), 0.0) / timings.size();
+            percentiles[batch] = timings[static_cast<std::size_t>(0.99 * static_cast<double>(timings.size() - 1))];
+        }
+        std::sort(averages.begin(), averages.end()); std::sort(percentiles.begin(), percentiles.end());
+        const auto average = averages[batches / 2], p99 = percentiles[batches / 2];
+        const auto budgetUs = 1.0e6 * static_cast<double>(blockSize) / 48000.0;
+        std::cout << "wavenet" << channels << ",48000,64,1," << average << ',' << p99 << ','
+                  << wavenet.memoryBytes() << ',' << p99 / budgetUs * 100.0 << "\n";
+        if (channels == 3 && p99 >= budgetUs * 0.25) return 5;
     }
     return 0;
 }

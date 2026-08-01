@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
 import json
+from pathlib import Path
 
 from nts_ml.capture import CaptureConfig, CaptureWizard
-
 
 parser = argparse.ArgumentParser(description="TubeForge neural amplifier capture wizard")
 subcommands = parser.add_subparsers(dest="command", required=True)

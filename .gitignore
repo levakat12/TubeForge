@@ -21,3 +21,12 @@ Testing/
 __pycache__/
 *.py[cod]
 .aider*
+
+# Local model-runner config for assistant tooling, not part of the product.
+Modelfile.txt
+
+# Third-party NAM capture corpora used as training and conversion input. These are other
+# people's captures, they are large, and they are not ours to redistribute -- see
+# docs/nam-integration-plan.md.
+/amp_learning/
+/pedal_learning/

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "PackedTanhModel.h"
+#include "NeuralModel.h"
 
 #include <array>
 #include <atomic>
@@ -64,7 +64,7 @@ public:
     [[nodiscard]] int modelSampleRate() const noexcept;
 
 private:
-    struct Slot { std::array<PackedTanhModel, maximumChannels> models; float expectedRmsDb { -21.0f }; };
+    struct Slot { std::array<NeuralModel, maximumChannels> models; float expectedRmsDb { -21.0f }; };
     std::array<Slot, 2> slots;
     std::array<std::vector<float>, maximumChannels> dryScratch;
     std::array<std::vector<float>, maximumChannels> oldScratch;

@@ -102,6 +102,21 @@ juce::var migrateV1ToV2(const juce::var& source)
     return migrated;
 }
 
+juce::var migrateV2ToV3(const juce::var& source)
+{
+    // A version 2 project predates user cabinet responses, so it has none: the empty paths
+    // that fromVar defaults to are exactly right, and nothing needs moving.
+    auto migrated = source.clone();
+    auto* root = migrated.getDynamicObject();
+    root->setProperty("schemaVersion", 3);
+    auto assets = root->getProperty("assets");
+    if (! assets.isObject()) assets = juce::var(new juce::DynamicObject());
+    assets.getDynamicObject()->setProperty("cabinetIrPathA", "");
+    assets.getDynamicObject()->setProperty("cabinetIrPathB", "");
+    root->setProperty("assets", assets);
+    return migrated;
+}
+
 juce::var toVar(const ProjectState& state)
 {
     auto* root = new juce::DynamicObject();
@@ -139,6 +154,8 @@ juce::var toVar(const ProjectState& state)
 
     auto* assets = new juce::DynamicObject();
     assets->setProperty("relativePaths", stringArray(state.assets.relativePaths));
+    assets->setProperty("cabinetIrPathA", juce::String::fromUTF8(state.assets.cabinetIrPathA.c_str()));
+    assets->setProperty("cabinetIrPathB", juce::String::fromUTF8(state.assets.cabinetIrPathB.c_str()));
     root->setProperty("assets", juce::var(assets));
     return juce::var(root);
 }
@@ -176,6 +193,8 @@ ProjectState fromVar(const juce::var& root)
 
     const auto assets = root.getProperty("assets", {});
     state.assets.relativePaths = readStringArray(assets.getProperty("relativePaths", {}));
+    state.assets.cabinetIrPathA = assets.getProperty("cabinetIrPathA", "").toString().toStdString();
+    state.assets.cabinetIrPathB = assets.getProperty("cabinetIrPathB", "").toString().toStdString();
     return state;
 }
 } // namespace
@@ -198,6 +217,7 @@ StateResult deserialize(std::string_view json)
 
     if (sourceVersion == 0) parsed = migrateV0ToV1(parsed);
     if (sourceVersion <= 1) parsed = migrateV1ToV2(parsed);
+    if (sourceVersion <= 2) parsed = migrateV2ToV3(parsed);
 
     auto state = fromVar(parsed);
     std::string error;

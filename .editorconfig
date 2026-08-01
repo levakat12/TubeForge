@@ -1,0 +1,25 @@
+# Editor conventions only: indentation, line endings, encoding, trailing whitespace.
+# Deliberately does not set max_line_length or otherwise reflow code -- see item B2 in
+# docs/improvement-plan.md for why automatic C++ formatting is not enabled here.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,json}]
+indent_size = 2
+
+[*.md]
+# Two trailing spaces are a hard line break in Markdown.
+trim_trailing_whitespace = false
+
+[*.{bat,cmd,ps1}]
+end_of_line = crlf
+
+[Makefile]
+indent_style = tab

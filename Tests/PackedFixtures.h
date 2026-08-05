@@ -38,6 +38,29 @@ inline LayerGeometry namCorpusLayers()
     return layers;
 }
 
+/** An NTSM v2 conditioned LSTM.
+
+    The architecture Phase 5 recommends, and the one whose cost is dominated by gate activations:
+    three sigmoids and two tanh per hidden unit per sample, against the single tanh of the v1
+    architecture-1 model. Anything measuring or testing activation behaviour needs this rather
+    than the simpler fixture, or it is exercising the case with the least of them.
+*/
+inline std::vector<std::byte> lstmFixture(std::size_t hidden, std::uint32_t sampleRate = 48000)
+{
+    std::vector<std::byte> bytes { std::byte{'N'}, std::byte{'T'}, std::byte{'S'}, std::byte{'M'} };
+    // version, architecture, rate, inputChannels, stateCount, outputChannels, controlCount,
+    // two unused slots, layers, kernelSize -- eleven words, matching the v2 header length.
+    for (const auto value : { 2u, 2u, sampleRate, 1u, static_cast<std::uint32_t>(hidden), 1u,
+                              0u, 0u, 0u, 1u, 1u }) appendPackedU32(bytes, value);
+    for (std::size_t row = 0; row < 4 * hidden; ++row) appendPackedFloat(bytes, 0.02f);
+    for (std::size_t row = 0; row < 4 * hidden; ++row)
+        for (std::size_t column = 0; column < hidden; ++column)
+            appendPackedFloat(bytes, row % hidden == column ? 0.12f : 0.0f);
+    for (std::size_t row = 0; row < 4 * hidden; ++row) appendPackedFloat(bytes, 0.0f);
+    for (std::size_t row = 0; row < hidden; ++row) appendPackedFloat(bytes, 0.01f);
+    appendPackedFloat(bytes, 0.0f); appendPackedFloat(bytes, 0.0f); return bytes;
+}
+
 /** An NTSM v3 WaveNet with the given geometry and deterministic weights.
 
     The weights are a fixed sinusoid rather than random values so that a failure is reproducible and

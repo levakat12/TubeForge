@@ -16,6 +16,12 @@ constexpr std::array<std::size_t, 2> allPassSeeds { 225, 556 };
 constexpr std::size_t stereoOffset = 23;
 } // namespace
 
+void updateSendEngagement(bool& engaged, bool& needsReset, float mix) noexcept
+{
+    if (engaged) engaged = mix >= sendDisengageThreshold;
+    else if (mix > sendEngageThreshold) { engaged = true; needsReset = true; }
+}
+
 void Delay::prepare(const ProcessSpec& newSpec, float maximumTimeMs)
 {
     spec = newSpec;
@@ -54,40 +60,64 @@ void Delay::setParameters(const DelayParameters& newParameters) noexcept
         delaySamples[channel].setTarget(std::clamp(target, 1.0f, maximumSamples));
     }
 
-    const auto cutoff = clampFrequency(parameters.dampingHz, spec.sampleRate);
-    dampingCoefficient = static_cast<float>(
-        std::exp(-2.0 * 3.14159265358979323846 * cutoff / spec.sampleRate));
+    // Recomputed only when the cutoff actually moves. The plug-in refreshes effect parameters
+    // on every block, so this exp was running once a block for a value that changes when
+    // someone turns a knob.
+    const auto cutoff = static_cast<float>(clampFrequency(parameters.dampingHz, spec.sampleRate));
+    if (cutoff != dampingCoefficientHz)
+    {
+        dampingCoefficientHz = cutoff;
+        dampingCoefficient = static_cast<float>(
+            std::exp(-2.0 * 3.14159265358979323846 * cutoff / spec.sampleRate));
+    }
+
+    updateSendEngagement(engaged, needsReset, parameters.mix);
 }
 
 void Delay::process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept
 {
     if (capacity == 0 || buffer.empty()) return;
+    // At zero mix the wet signal is added at zero weight, so the whole fractional read, damping
+    // filter and feedback write produce nothing audible.
+    if (! engaged) return;
+    if (needsReset) { reset(); needsReset = false; }
     const auto count = std::min(channelCount, spec.channels);
 
     for (std::size_t channel = 0; channel < count; ++channel)
     {
         auto* line = buffer.data() + channel * capacity;
+        // Hoisted: these were array accesses inside the sample loop, and the three modulos
+        // below were three integer divisions per sample on a non-power-of-two capacity.
+        auto position = writePosition[channel];
+        auto dampedState = damped[channel];
         for (std::size_t sample = 0; sample < samples; ++sample)
         {
             const auto distance = delaySamples[channel].next();
-            const auto whole = static_cast<std::size_t>(distance);
+            // Bounded before it is used as an offset. setParameters clamps the target into
+            // range, but the modulo this replaces also happened to absorb anything that got
+            // through, and a conditional subtract does not.
+            const auto whole = std::min(static_cast<std::size_t>(distance), capacity - 1);
             const auto fraction = distance - static_cast<float>(whole);
 
             // Read fractionally: a smoothed delay time lands between samples, and rounding it
             // would step the pitch as the control moves.
-            const auto first = (writePosition[channel] + capacity - whole) % capacity;
-            const auto second = (first + capacity - 1) % capacity;
+            auto first = position + capacity - whole;
+            if (first >= capacity) first -= capacity;
+            auto second = first + capacity - 1;
+            if (second >= capacity) second -= capacity;
             const auto delayed = line[first] * (1.0f - fraction) + line[second] * fraction;
 
-            damped[channel] = delayed + dampingCoefficient * (damped[channel] - delayed);
-            line[writePosition[channel]] = suppressDenormal(
-                channels[channel][sample] + damped[channel] * parameters.feedback);
-            writePosition[channel] = (writePosition[channel] + 1) % capacity;
+            dampedState = delayed + dampingCoefficient * (dampedState - delayed);
+            line[position] = suppressDenormal(
+                channels[channel][sample] + dampedState * parameters.feedback);
+            if (++position == capacity) position = 0;
 
             // A send rather than a crossfade: the dry signal stays at unity so adding delay
             // never quietens the amplifier.
             channels[channel][sample] += delayed * parameters.mix;
         }
+        writePosition[channel] = position;
+        damped[channel] = dampedState;
     }
 }
 
@@ -151,21 +181,33 @@ void Reverb::setParameters(const ReverbParameters& newParameters) noexcept
     parameters.size = std::clamp(parameters.size, 0.0f, 1.0f);
     parameters.damping = std::clamp(parameters.damping, 0.0f, 1.0f);
     parameters.mix = std::clamp(parameters.mix, 0.0f, 1.0f);
+    updateSendEngagement(engaged, needsReset, parameters.mix);
 
     // Held below unity at the top of the range: a comb at exactly one is an oscillator.
     feedback = 0.70f + 0.28f * parameters.size;
     damping = 0.20f + 0.60f * parameters.damping;
 
-    lowCut.setCoefficients(BiquadCoefficients::make(
-        FilterType::highPass, spec.sampleRate,
-        clampFrequency(parameters.lowCutHz, spec.sampleRate), 0.707));
+    // Designed only when the cutoff moves. The plug-in refreshes effect parameters on every
+    // block, and this is a sin, a cos and a pow for a value that changes when someone turns a
+    // knob -- the same waste the delay's damping coefficient had.
+    const auto cutoff = static_cast<float>(clampFrequency(parameters.lowCutHz, spec.sampleRate));
+    if (cutoff != lowCutCoefficientHz)
+    {
+        lowCutCoefficientHz = cutoff;
+        lowCut.setCoefficients(BiquadCoefficients::make(
+            FilterType::highPass, spec.sampleRate, cutoff, 0.707));
+    }
 }
 
 void Reverb::process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept
 {
     // Guarded rather than assumed: a process call before prepare would otherwise index empty
     // comb buffers and read through a null pointer, which is exactly what happened once.
-    if (parameters.mix <= 0.0f || wetBuffer.empty() || combs[0][0].buffer.empty()) return;
+    if (! engaged || wetBuffer.empty() || combs[0][0].buffer.empty()) return;
+    // The skip at zero mix was already here; the clear is what was missing. Without it a send
+    // brought back up replays whatever the comb lines were holding when it went down, which for
+    // a long reverb is seconds of unrelated audio.
+    if (needsReset) { reset(); needsReset = false; }
     const auto count = std::min(channelCount, spec.channels);
     const auto processSamples = std::min(samples, spec.maximumBlockSize);
 

@@ -1,5 +1,7 @@
 #include "nts/dsp/Convolution.h"
 
+#include "nts/dsp/Simd.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -69,7 +71,7 @@ void DirectConvolver::prepare(std::size_t maximumImpulseLength, std::size_t chan
     maximumLength = std::max<std::size_t>(1, maximumImpulseLength);
     configuredChannels = std::clamp(channels, std::size_t { 1 }, maximumChannels);
     impulse.assign(maximumLength * configuredChannels, 0.0f);
-    history.assign(maximumLength * configuredChannels, 0.0f);
+    history.assign(2 * maximumLength * configuredChannels, 0.0f);
     reset();
 }
 void DirectConvolver::reset() noexcept { std::fill(history.begin(), history.end(), 0.0f); writePosition = 0; }
@@ -81,7 +83,13 @@ bool DirectConvolver::loadImpulse(std::span<const float> left, std::span<const f
     for (std::size_t channel = 0; channel < configuredChannels; ++channel)
     {
         const auto source = channel == 0 || right.empty() ? left : right;
-        std::copy(source.begin(), source.end(), impulse.begin() + static_cast<std::ptrdiff_t>(channel * maximumLength));
+        // Reversed, and right-aligned inside the active window. The alignment matters when the
+        // two sides differ in length: the shorter one's taps are the *earliest* of the active
+        // window, so its zero padding has to land at the front of the reversed layout, not the
+        // back, or the response is shifted in time against the other channel.
+        auto* destination = impulse.data() + channel * maximumLength
+                          + (activeLength - source.size());
+        std::reverse_copy(source.begin(), source.end(), destination);
     }
     reset(); return true;
 }
@@ -89,24 +97,31 @@ void DirectConvolver::process(float* const* channels, std::size_t channelCount, 
 {
     const auto count = std::min(channelCount, configuredChannels);
     if (activeLength == 0) return;
-    for (std::size_t sample = 0; sample < samples; ++sample)
+    // Channel outer: the dot product below streams two contiguous spans, and interleaving the
+    // channels would evict one channel's working set with the other's on every sample.
+    const auto startPosition = writePosition;
+    auto position = startPosition;
+    for (std::size_t channel = 0; channel < count; ++channel)
     {
-        for (std::size_t channel = 0; channel < count; ++channel)
+        auto* const channelHistory = history.data() + channel * 2 * maximumLength;
+        // The reversed active window sits at the front of each channel region, so the taps run
+        // from offset zero regardless of how much of the region the response actually fills.
+        const auto* const channelImpulse = impulse.data() + channel * maximumLength;
+        position = startPosition;
+        for (std::size_t sample = 0; sample < samples; ++sample)
         {
-            auto* channelHistory = history.data() + channel * maximumLength;
-            const auto* channelImpulse = impulse.data() + channel * maximumLength;
-            channelHistory[writePosition] = channels[channel][sample];
-            double output {};
-            auto position = writePosition;
-            for (std::size_t tap = 0; tap < activeLength; ++tap)
-            {
-                output += channelImpulse[tap] * channelHistory[position];
-                position = position == 0 ? maximumLength - 1 : position - 1;
-            }
-            channels[channel][sample] = static_cast<float>(output);
+            const auto value = channels[channel][sample];
+            channelHistory[position] = value;
+            channelHistory[position + maximumLength] = value;
+            // The window ends on the sample just written and runs backwards activeLength taps,
+            // which in the doubled buffer is always a valid forward span: its lowest index is
+            // maximumLength - activeLength + 1 at worst, and its highest 2 * maximumLength - 1.
+            const auto* const window = channelHistory + position + maximumLength - activeLength + 1;
+            channels[channel][sample] = dotProduct(channelImpulse, window, activeLength);
+            if (++position == maximumLength) position = 0;
         }
-        writePosition = (writePosition + 1) % maximumLength;
     }
+    writePosition = position;
 }
 
 void PartitionedConvolver::prepare(std::size_t newBlockSize, std::size_t maximumImpulseLength,
@@ -167,15 +182,31 @@ void PartitionedConvolver::process(float* const* channels, std::size_t channelCo
         fft.transform(work);
         auto* spectrum = inputSpectra.data() + (channel * maximumPartitions + spectrumPosition) * fftSize;
         std::copy(work.begin(), work.end(), spectrum);
+        // Both operands are transforms of real signals, so both are conjugate-symmetric, and so
+        // is their product: P[N-k] = conj(P[k]). Only the lower half plus DC and Nyquist carry
+        // information; the upper half is filled by reflection afterwards rather than computed,
+        // which halves the multiply-accumulate that dominates this loop.
+        const auto half = fftSize / 2;
         std::fill(accumulator.begin(), accumulator.end(), std::complex<float> {});
         for (std::size_t partition = 0; partition < activePartitions; ++partition)
         {
             const auto inputPosition = (spectrumPosition + maximumPartitions - partition) % maximumPartitions;
             const auto* inputSpectrum = inputSpectra.data() + (channel * maximumPartitions + inputPosition) * fftSize;
             const auto* filterSpectrum = filters.data() + (channel * maximumPartitions + partition) * fftSize;
-            for (std::size_t bin = 0; bin < fftSize; ++bin)
-                accumulator[bin] += inputSpectrum[bin] * filterSpectrum[bin];
+            // Written out rather than using operator*: the complex multiply is four products and
+            // two sums, and spelling it means the compiler is free to keep the parts in registers
+            // across the accumulate instead of round-tripping a temporary.
+            for (std::size_t bin = 0; bin <= half; ++bin)
+            {
+                const auto inputReal = inputSpectrum[bin].real(), inputImaginary = inputSpectrum[bin].imag();
+                const auto filterReal = filterSpectrum[bin].real(), filterImaginary = filterSpectrum[bin].imag();
+                accumulator[bin] += std::complex<float> {
+                    inputReal * filterReal - inputImaginary * filterImaginary,
+                    inputReal * filterImaginary + inputImaginary * filterReal };
+            }
         }
+        for (std::size_t bin = 1; bin < half; ++bin)
+            accumulator[fftSize - bin] = std::conj(accumulator[bin]);
         fft.transform(accumulator, true);
         auto* channelOverlap = overlap.data() + channel * blockSize;
         for (std::size_t index = 0; index < processSamples; ++index)
@@ -336,4 +367,71 @@ void CrossfadingConvolver::process(float* const* channels, std::size_t channelCo
         crossfadeActive.store(false, std::memory_order_release);
     }
 }
+void BufferedCrossfadingConvolver::prepare(std::size_t partitionSize, std::size_t maximumImpulseLength,
+                                           std::size_t channels)
+{
+    partition = std::max<std::size_t>(1, partitionSize);
+    configuredChannels = std::clamp(channels, std::size_t { 1 }, maximumChannels);
+    convolver.prepare(partition, maximumImpulseLength, configuredChannels);
+    inputBuffer.assign(partition * configuredChannels, 0.0f);
+    outputBuffer.assign(partition * configuredChannels, 0.0f);
+    reset();
+}
+
+void BufferedCrossfadingConvolver::reset() noexcept
+{
+    convolver.reset();
+    std::fill(inputBuffer.begin(), inputBuffer.end(), 0.0f);
+    std::fill(outputBuffer.begin(), outputBuffer.end(), 0.0f);
+    fill = 0;
+}
+
+bool BufferedCrossfadingConvolver::loadInactiveImpulse(std::span<const float> left,
+                                                       std::span<const float> right)
+{
+    if (! convolver.loadInactiveImpulse(left, right)) return false;
+    activeLength = std::max(left.size(), right.size());
+    return true;
+}
+
+void BufferedCrossfadingConvolver::requestSwap(std::size_t crossfadeSamples) noexcept
+{
+    convolver.requestSwap(crossfadeSamples);
+}
+
+void BufferedCrossfadingConvolver::process(float* const* channels, std::size_t channelCount,
+                                           std::size_t samples) noexcept
+{
+    const auto count = std::min(channelCount, configuredChannels);
+    if (count == 0 || partition == 0) return;
+
+    for (std::size_t sample = 0; sample < samples; ++sample)
+    {
+        for (std::size_t channel = 0; channel < count; ++channel)
+        {
+            auto* const input = inputBuffer.data() + channel * partition;
+            auto* const output = outputBuffer.data() + channel * partition;
+            // Read before write, and at the same index: the slot holds the result produced a
+            // whole partition ago, which is exactly the latency this class reports.
+            const auto processed = output[fill];
+            input[fill] = channels[channel][sample];
+            channels[channel][sample] = processed;
+        }
+        if (++fill < partition) continue;
+
+        // A full partition. Convolve it in place and hand the result to the output side; the
+        // wrapped convolver is only ever called with the block size it was prepared for, which
+        // is the contract that makes it usable at all.
+        for (std::size_t channel = 0; channel < count; ++channel)
+        {
+            auto* const input = inputBuffer.data() + channel * partition;
+            auto* const output = outputBuffer.data() + channel * partition;
+            std::copy_n(input, partition, output);
+            partitionPointers[channel] = output;
+        }
+        convolver.process(partitionPointers.data(), count, partition);
+        fill = 0;
+    }
+}
+
 } // namespace nts::dsp

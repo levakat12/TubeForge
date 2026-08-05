@@ -219,6 +219,215 @@ void testTonePhaseAndPower(TestHarness& tests)
     tests.expect(power.supplyState(0) > sagged, "power-amp virtual supply recovers after load");
 }
 
+/// Width splits the two cabinet slots left and right. The two things that must hold: it is inert
+/// at its default, so no stored preset changes; and it reports honestly what folding to mono will
+/// cost, because an inter-channel delay is wide on speakers and comb-filtered on a mix bus.
+void testCabinetStereoWidth(TestHarness& tests)
+{
+    const auto renderWith = [](float width, std::size_t delaySamplesB, bool differentSlots)
+    {
+        nts::amp::CabinetSection cabinet; cabinet.prepare(stereoSpec);
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.5f; parameters.width = width;
+        parameters.delaySamplesB = delaySamplesB;
+        parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
+        cabinet.setParameters(parameters, 0);
+        if (differentSlots)
+        {
+            // Two audibly different responses, which is the point of the feature: one bright and
+            // short, one darker with a longer tail.
+            std::vector<float> bright(192), dark(192);
+            for (std::size_t index = 0; index < bright.size(); ++index)
+            {
+                const auto position = static_cast<float>(index);
+                bright[index] = (index == 0 ? 0.9f : 0.0f) + 0.10f * std::exp(-position / 12.0f);
+                dark[index] = 0.35f * std::exp(-position / 70.0f) * std::cos(0.07f * position);
+            }
+            cabinet.loadImpulseA(bright, {}, { "Bright", "57", 0.2f }, 0);
+            cabinet.loadImpulseB(dark, {}, { "Dark", "121", 0.8f }, 0);
+        }
+        cabinet.reset();
+
+        std::array<float, blockSize> left {}, right {};
+        float* channels[] { left.data(), right.data() };
+        std::vector<float> capturedLeft, capturedRight;
+        for (std::size_t block = 0; block < 400; ++block)
+        {
+            for (std::size_t sample = 0; sample < blockSize; ++sample)
+            {
+                const auto phase = static_cast<float>(block * blockSize + sample) * 0.05f;
+                left[sample] = right[sample] = 0.5f * std::sin(phase);
+            }
+            cabinet.process(channels, 2, blockSize);
+            for (std::size_t sample = 0; sample < blockSize; ++sample)
+            { capturedLeft.push_back(left[sample]); capturedRight.push_back(right[sample]); }
+        }
+        struct Result { std::vector<float> left, right; float monoLossDb; };
+        return Result { std::move(capturedLeft), std::move(capturedRight), cabinet.monoCompatibility() };
+    };
+
+    // Inert at the default. A mono-fed stereo signal through summed slots must stay identical
+    // across the channels, which is what every existing preset relies on.
+    const auto summed = renderWith(0.0f, 0, true);
+    auto identical = true;
+    for (std::size_t index = 0; index < summed.left.size(); ++index)
+        identical = identical && summed.left[index] == summed.right[index];
+    tests.expect(identical, "width defaults to inert: the two channels stay bit-identical");
+    tests.expectNear(summed.monoLossDb, 0.0, 0.05,
+                     "identical channels fold to mono with no loss");
+
+    // Up, with two different responses: the channels must actually differ, and they must still be
+    // largely mono-compatible, because two responses decorrelate spectrally rather than by delay.
+    const auto split = renderWith(1.0f, 0, true);
+    auto differs = false;
+    for (std::size_t index = 0; index < split.left.size(); ++index)
+        differs = differs || std::abs(split.left[index] - split.right[index]) > 1.0e-6f;
+    tests.expect(differs, "width up sends a different response to each channel");
+    tests.expect(split.monoLossDb > -3.0f,
+                 "two responses split across the field stay broadly mono-safe: "
+                     + std::to_string(split.monoLossDb) + " dB");
+
+    // The hazard the meter exists for. An inter-channel delay is a comb filter under summing, and
+    // it must read materially worse than the undelayed split rather than silently the same.
+    const auto delayed = renderWith(1.0f, 96, true);
+    tests.expect(delayed.monoLossDb < split.monoLossDb - 1.0f,
+                 "an inter-channel delay reports a real mono-fold penalty: "
+                     + std::to_string(delayed.monoLossDb) + " dB against "
+                     + std::to_string(split.monoLossDb) + " dB");
+}
+
+/// The blend control parks one convolver at a weight of zero; skipping it is worth half the
+/// cabinet's cost, and the risk it carries is the delay line going stale while it is skipped.
+void testCabinetBlendEngagement(TestHarness& tests)
+{
+    nts::amp::CabinetSection cabinet; cabinet.prepare(stereoSpec);
+    nts::amp::CabinetParameters parameters;
+    parameters.blend = 0.0f; parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
+    cabinet.setParameters(parameters, 0); cabinet.reset();
+
+    std::array<float, blockSize> left {}, right {};
+    float* channels[] { left.data(), right.data() };
+    const auto drive = [&](std::size_t blocks, float amplitude)
+    {
+        std::vector<float> captured;
+        for (std::size_t block = 0; block < blocks; ++block)
+        {
+            for (std::size_t sample = 0; sample < blockSize; ++sample)
+            {
+                const auto phase = static_cast<float>(block * blockSize + sample) * 0.05f;
+                left[sample] = right[sample] = amplitude * std::sin(phase);
+            }
+            cabinet.process(channels, 2, blockSize);
+            for (std::size_t sample = 0; sample < blockSize; ++sample) captured.push_back(left[sample]);
+        }
+        return captured;
+    };
+
+    // Park at blend 0 long enough that side B, which contributes nothing there, has a delay
+    // line full of samples that are no longer adjacent to what comes next.
+    static_cast<void>(drive(24, 0.3f));
+
+    // Now hand the output entirely to B. If a skipped side were re-engaged without clearing
+    // its history, this is where the stale line would fold into the output as a step.
+    parameters.blend = 1.0f;
+    cabinet.setParameters(parameters, 0);
+    const auto afterSwing = drive(8, 0.3f);
+    auto largestStep = 0.0f;
+    for (std::size_t index = 1; index < afterSwing.size(); ++index)
+        largestStep = std::max(largestStep, std::abs(afterSwing[index] - afterSwing[index - 1]));
+    tests.expect(std::isfinite(largestStep) && largestStep < 0.5f,
+                 "re-engaging a blend-skipped cabinet side does not step");
+
+    // And the skip must not have changed what blend 0 actually produces. A section that never
+    // parks either side is the reference: same input, same responses, same output.
+    nts::amp::CabinetSection reference; reference.prepare(stereoSpec);
+    nts::amp::CabinetParameters halfway = parameters;
+    halfway.blend = 0.0f;
+    reference.setParameters(halfway, 0); reference.reset();
+    cabinet.setParameters(halfway, 0); cabinet.reset();
+
+    auto matches = true;
+    std::array<float, blockSize> referenceLeft {}, referenceRight {};
+    float* referenceChannels[] { referenceLeft.data(), referenceRight.data() };
+    for (std::size_t block = 0; block < 8 && matches; ++block)
+    {
+        for (std::size_t sample = 0; sample < blockSize; ++sample)
+        {
+            const auto phase = static_cast<float>(block * blockSize + sample) * 0.05f;
+            const auto value = 0.3f * std::sin(phase);
+            left[sample] = right[sample] = value;
+            referenceLeft[sample] = referenceRight[sample] = value;
+        }
+        cabinet.process(channels, 2, blockSize);
+        reference.process(referenceChannels, 2, blockSize);
+        for (std::size_t sample = 0; sample < blockSize; ++sample)
+            matches = matches && std::abs(left[sample] - referenceLeft[sample]) < 1.0e-6f;
+    }
+    tests.expect(matches, "blend 0 output is unchanged by skipping the idle cabinet side");
+}
+
+/// A long response moves the whole section onto the partitioned path, which costs latency. The
+/// thing that must not break is that both sides move together: a blend of one buffered and one
+/// unbuffered response would comb-filter rather than mix.
+void testCabinetLongImpulsePath(TestHarness& tests)
+{
+    nts::amp::CabinetSection cabinet; cabinet.prepare(stereoSpec);
+    nts::amp::CabinetParameters parameters;
+    parameters.blend = 0.5f; parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
+    cabinet.setParameters(parameters, 0); cabinet.reset();
+
+    tests.expectEqual(cabinet.latencySamples(), std::size_t { 0 },
+                      "the built-in responses stay on the zero-latency direct path");
+
+    const auto makeResponse = [](std::size_t length, float decay)
+    {
+        std::vector<float> response(length);
+        for (std::size_t index = 0; index < length; ++index)
+            response[index] = (index == 0 ? 0.8f : 0.0f)
+                            + 0.2f * std::exp(-static_cast<float>(index) / decay)
+                            * std::sin(0.23f * static_cast<float>(index));
+        return response;
+    };
+
+    // Long enough to cross the threshold, which must move *both* slots.
+    const auto longResponse = makeResponse(2048, 260.0f);
+    tests.expect(cabinet.loadImpulseA(longResponse, {}, { "Long", "57", 0.5f }, 64),
+                 "cabinet accepts a response long enough to want the partitioned path");
+    tests.expect(cabinet.latencySamples() > 0,
+                 "a long response puts the section on the buffered path and reports its latency");
+
+    std::array<float, blockSize> left {}, right {};
+    float* channels[] { left.data(), right.data() };
+    auto largestStep = 0.0f;
+    auto previous = 0.0f;
+    auto finite = true;
+    for (int block = 0; block < 64; ++block)
+    {
+        for (std::size_t sample = 0; sample < blockSize; ++sample)
+        {
+            const auto phase = static_cast<float>(block * static_cast<int>(blockSize) + static_cast<int>(sample));
+            left[sample] = right[sample] = 0.3f * std::sin(0.04f * phase);
+        }
+        cabinet.process(channels, 2, blockSize);
+        for (const auto value : left)
+        {
+            finite = finite && std::isfinite(value);
+            largestStep = std::max(largestStep, std::abs(value - previous));
+            previous = value;
+        }
+    }
+    tests.expect(finite, "the buffered cabinet path stays finite");
+    tests.expect(largestStep < 0.5f, "switching to the buffered path does not step the output");
+
+    // Back to a short response: the section must return to the direct path and give the latency
+    // back, or a user who tries a long impulse and undoes it is left paying for it forever.
+    const auto shortResponse = makeResponse(256, 60.0f);
+    tests.expect(cabinet.loadImpulseA(shortResponse, {}, { "Short", "57", 0.5f }, 64),
+                 "cabinet accepts a short response again");
+    tests.expectEqual(cabinet.latencySamples(), std::size_t { 0 },
+                      "returning to short responses returns to the zero-latency path");
+}
+
 /// Replacing a cabinet response while audio is running -- what user IR loading needs.
 void testCabinetImpulseSwapping(TestHarness& tests)
 {
@@ -321,6 +530,79 @@ void testCabinetImpulseSwapping(TestHarness& tests)
     tests.expect(finite.load(), "cabinet stays finite and bounded while responses are replaced concurrently");
 }
 
+/** The topology table: names, round-tripping, and that no two voicings are the same amplifier.
+
+    Worth its own test because a voicing is a block of literals. A copy-paste that left two
+    entries identical would still build, still serialize, still load, and still sound wrong --
+    the only thing that catches it is asking whether the seven are actually seven.
+*/
+void testTopologyTable(TestHarness& tests)
+{
+    using nts::amp::Topology;
+
+    auto namesDistinct = true;
+    auto namesPresent = true;
+    for (std::size_t first = 0; first < nts::amp::topologyCount; ++first)
+    {
+        const auto a = static_cast<Topology>(first);
+        namesPresent = namesPresent && ! nts::amp::topologyKey(a).empty()
+                                    && ! nts::amp::topologyName(a).empty();
+        for (std::size_t second = first + 1; second < nts::amp::topologyCount; ++second)
+        {
+            const auto b = static_cast<Topology>(second);
+            namesDistinct = namesDistinct && nts::amp::topologyKey(a) != nts::amp::topologyKey(b)
+                                          && nts::amp::topologyName(a) != nts::amp::topologyName(b);
+        }
+    }
+    tests.expect(namesPresent, "every topology has a preset key and a display name");
+    tests.expect(namesDistinct, "no two topologies share a key or a name");
+
+    auto keysRoundTrip = true;
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+    {
+        const auto topology = static_cast<Topology>(index);
+        keysRoundTrip = keysRoundTrip
+            && nts::amp::topologyFromKey(nts::amp::topologyKey(topology)) == topology;
+    }
+    tests.expect(keysRoundTrip, "a topology key parses back to the topology that wrote it");
+
+    // The forward-compatibility case: a preset naming a voicing this build has never heard of
+    // loads as the default rather than failing, so the rest of its values survive.
+    tests.expect(! nts::amp::topologyFromKey("someFutureVoicing").has_value(),
+                 "an unknown topology key does not parse to a guess");
+
+    auto presetsRoundTrip = true;
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+    {
+        const auto topology = static_cast<Topology>(index);
+        for (const auto instrument : { nts::amp::Instrument::guitar, nts::amp::Instrument::bass })
+        {
+            const auto preset = nts::amp::makeOriginalPreset(topology, instrument);
+            const auto restored = nts::amp::deserializePreset(nts::amp::serializePreset(preset));
+            presetsRoundTrip = presetsRoundTrip && restored.has_value()
+                            && restored->parameters.topology == topology
+                            && restored->parameters.instrument == instrument
+                            && restored->parameters == preset.parameters;
+        }
+    }
+    tests.expect(presetsRoundTrip, "every topology's factory preset survives a serialize/restore");
+
+    auto voicingsDiffer = true;
+    for (std::size_t first = 0; first < nts::amp::topologyCount; ++first)
+        for (std::size_t second = first + 1; second < nts::amp::topologyCount; ++second)
+        {
+            auto a = nts::amp::makeOriginalPreset(static_cast<Topology>(first),
+                                                  nts::amp::Instrument::guitar).parameters;
+            auto b = nts::amp::makeOriginalPreset(static_cast<Topology>(second),
+                                                  nts::amp::Instrument::guitar).parameters;
+            // Cleared, because topology is stored on the parameters and would make every pair
+            // differ trivially. What is being asked is whether the *amplifier* differs.
+            a.topology = b.topology = Topology::tightModern;
+            voicingsDiffer = voicingsDiffer && ! (a == b);
+        }
+    tests.expect(voicingsDiffer, "no two topologies produce the same amplifier settings");
+}
+
 void testCabinetAndPresets(TestHarness& tests)
 {
     nts::amp::CabinetSection cabinet; cabinet.prepare(stereoSpec);
@@ -345,6 +627,9 @@ void testCabinetAndPresets(TestHarness& tests)
     parameters.bypass = false; cabinet.setParameters(parameters, 0);
 
     testCabinetImpulseSwapping(tests);
+    testCabinetBlendEngagement(tests);
+    testCabinetStereoWidth(tests);
+    testCabinetLongImpulsePath(tests);
 
     auto original = nts::amp::makeOriginalPreset(nts::amp::Topology::vintageBloom, nts::amp::Instrument::bass);
     original.parameters.stages[0].memoryAmount = 0.731f;
@@ -519,6 +804,7 @@ int main()
 {
     TestHarness tests;
     testCalibrationAndPreEq(tests); testPreampStages(tests); testTonePhaseAndPower(tests);
+    testTopologyTable(tests);
     testCabinetAndPresets(tests); testCompleteGraphs(tests); testAudioRegressionAndRealtime(tests);
     return tests.result();
 }

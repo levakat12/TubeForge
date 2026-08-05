@@ -17,6 +17,7 @@ public:
 
     void resized() override;
     void refresh() override;
+    void setPerformanceLimits(int maximumOversamplingFactor, bool singleCabinet) override;
 
 private:
     /// One cabinet slot's controls. Two of these, differing only in which slot they drive.
@@ -35,14 +36,17 @@ private:
     std::array<SlotControls, 2> slots;
 
     juce::ToggleButton cabinetEnabled { "Cabinet section active" };
-    juce::Label alignmentCaption, blendCaption;
-    juce::Slider alignment, blend;
+    juce::Label alignmentCaption, blendCaption, widthCaption;
+    juce::Slider alignment, blend, width;
+    /// What a mix bus will do to the stereo image. See CabinetPage::refresh.
+    juce::Label monoFold;
     juce::Label help;
 
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> cabinetAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> alignmentAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> blendAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> widthAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(CabinetPage)
 };

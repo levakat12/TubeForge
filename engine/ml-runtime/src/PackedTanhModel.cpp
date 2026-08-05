@@ -1,5 +1,8 @@
 #include "nts/ml/PackedTanhModel.h"
 
+#include "nts/dsp/Nonlinear.h"
+#include "nts/dsp/Simd.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -154,24 +157,18 @@ float PackedTanhModel::processSample(float input) noexcept
 {
     if (! loaded || ! std::isfinite(input)) return 0.0f;
     const auto h = hiddenSize, c = controls.size();
+    // Resolved once per sample rather than per gate, and it already accounts for the
+    // architectures where the approximation is not worth taking.
+    const auto useApproximation = approximatesActivations();
     if (modelArchitecture == PackedArchitecture::tanhRnn)
     {
         for (std::size_t row = 0; row < h; ++row)
         {
-            auto sum = inputWeight[row] * input + bias[row];
-            const auto* weights = recurrentWeight.data() + row * h;
-            float lane0 {}, lane1 {}, lane2 {}, lane3 {};
-            std::size_t column {};
-            for (; column + 3 < h; column += 4)
-            {
-                lane0 += weights[column] * state[column];
-                lane1 += weights[column + 1] * state[column + 1];
-                lane2 += weights[column + 2] * state[column + 2];
-                lane3 += weights[column + 3] * state[column + 3];
-            }
-            sum += (lane0 + lane1) + (lane2 + lane3);
-            for (; column < h; ++column) sum += weights[column] * state[column];
-            nextState[row] = std::tanh(sum);
+            // Was hand-unrolled into four accumulators here and nowhere else; dsp::dotProduct
+            // is the same idea with SSE2 behind it, and now every architecture below gets it.
+            const auto sum = inputWeight[row] * input + bias[row]
+                           + dsp::dotProduct(recurrentWeight.data() + row * h, state.data(), h);
+            nextState[row] = useApproximation ? dsp::fastTanh(sum) : std::tanh(sum);
         }
         state.swap(nextState);
     }
@@ -182,14 +179,19 @@ float PackedTanhModel::processSample(float input) noexcept
             auto sum = inputWeight[row * (1 + c)] * input + bias[row];
             for (std::size_t control = 0; control < c; ++control)
                 sum += inputWeight[row * (1 + c) + 1 + control] * controls[control];
-            for (std::size_t column = 0; column < h; ++column) sum += recurrentWeight[row * h + column] * state[column];
+            sum += dsp::dotProduct(recurrentWeight.data() + row * h, state.data(), h);
             gateValues[row] = sum;
         }
         for (std::size_t row = 0; row < h; ++row)
         {
-            const auto i = sigmoid(gateValues[row]), f = sigmoid(gateValues[h + row]);
-            const auto g = std::tanh(gateValues[2 * h + row]), o = sigmoid(gateValues[3 * h + row]);
-            nextCell[row] = f * cell[row] + i * g; nextState[row] = o * std::tanh(nextCell[row]);
+            // Hoisted out of the loop body as function pointers would cost a call per gate, so
+            // the branch is on the flag and the compiler keeps both bodies straight-line.
+            const auto i = useApproximation ? dsp::fastSigmoid(gateValues[row]) : sigmoid(gateValues[row]);
+            const auto f = useApproximation ? dsp::fastSigmoid(gateValues[h + row]) : sigmoid(gateValues[h + row]);
+            const auto g = useApproximation ? dsp::fastTanh(gateValues[2 * h + row]) : std::tanh(gateValues[2 * h + row]);
+            const auto o = useApproximation ? dsp::fastSigmoid(gateValues[3 * h + row]) : sigmoid(gateValues[3 * h + row]);
+            nextCell[row] = f * cell[row] + i * g;
+            nextState[row] = o * (useApproximation ? dsp::fastTanh(nextCell[row]) : std::tanh(nextCell[row]));
         }
         state.swap(nextState); cell.swap(nextCell);
     }
@@ -204,16 +206,18 @@ float PackedTanhModel::processSample(float input) noexcept
         }
         for (std::size_t row = 0; row < h; ++row)
         {
-            auto rr = 0.0f, rz = 0.0f, rn = 0.0f;
-            for (std::size_t column = 0; column < h; ++column)
-            {
-                rr += recurrentWeight[row * h + column] * state[column];
-                rz += recurrentWeight[(h + row) * h + column] * state[column];
-                rn += recurrentWeight[(2 * h + row) * h + column] * state[column];
-            }
-            const auto resetGate = sigmoid(gateValues[row] + rr);
-            const auto updateGate = sigmoid(gateValues[h + row] + rz);
-            const auto candidate = std::tanh(gateValues[2 * h + row] + resetGate * rn);
+            // Three separate passes rather than one fused loop over the three weight rows. The
+            // fused form was chosen for state locality, but state is h floats and stays in L1
+            // across all three regardless, so the vector width is worth more than the reuse.
+            const auto rr = dsp::dotProduct(recurrentWeight.data() + row * h, state.data(), h);
+            const auto rz = dsp::dotProduct(recurrentWeight.data() + (h + row) * h, state.data(), h);
+            const auto rn = dsp::dotProduct(recurrentWeight.data() + (2 * h + row) * h, state.data(), h);
+            const auto resetInput = gateValues[row] + rr;
+            const auto updateInput = gateValues[h + row] + rz;
+            const auto resetGate = useApproximation ? dsp::fastSigmoid(resetInput) : sigmoid(resetInput);
+            const auto updateGate = useApproximation ? dsp::fastSigmoid(updateInput) : sigmoid(updateInput);
+            const auto candidateInput = gateValues[2 * h + row] + resetGate * rn;
+            const auto candidate = useApproximation ? dsp::fastTanh(candidateInput) : std::tanh(candidateInput);
             nextState[row] = (1.0f - updateGate) * candidate + updateGate * state[row];
         }
         state.swap(nextState);
@@ -237,7 +241,7 @@ float PackedTanhModel::processSample(float input) noexcept
                 for (std::size_t tap = 0; tap < tcnKernelSize; ++tap)
                     sum += recurrentWeight[(layer * h + row) * tcnKernelSize + tap]
                          * tcnHistory[offset + row * length + (position + length - (tap * dilation) % length) % length];
-                gateValues[row] = std::tanh(sum);
+                gateValues[row] = useApproximation ? dsp::fastTanh(sum) : std::tanh(sum);
             }
             for (std::size_t row = 0; row < h; ++row) nextState[row] += gateValues[row];
             tcnPositions[layer] = (position + 1) % length;

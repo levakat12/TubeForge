@@ -1,5 +1,7 @@
 #include "nts/amp/TraditionalAmp.h"
 
+#include <nts/dsp/Nonlinear.h>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -116,6 +118,50 @@ void InputCalibrator::process(const float* const* channels, std::size_t channelC
     lastReading.suggestedTrimDb = std::clamp(std::min(rmsTrim, peakTrim + 3.0f), -24.0f, 24.0f);
 }
 
+namespace
+{
+/** The two names each voicing has, indexed by `Topology`.
+
+    One table rather than a chain of ternaries at each of the four places that used to need
+    one. The static_assert is the guard that matters: an entry appended to the enum without an
+    entry here would otherwise read past the end at run time.
+*/
+struct TopologyLabels
+{
+    std::string_view key;
+    std::string_view name;
+};
+
+constexpr std::array<TopologyLabels, topologyCount> topologyLabels { {
+    { "tightModern", "Tight Modern" },
+    { "vintageBloom", "Vintage Bloom" },
+    { "americanClean", "American Clean" },
+    { "britishCrunch", "British Crunch" },
+    { "classAChime", "Class-A Chime" },
+    { "saggingRectifier", "Sagging Rectifier" },
+    { "studioDirect", "Studio Direct" }
+} };
+static_assert(topologyLabels.size() == topologyCount,
+              "every Topology needs a preset key and a display name");
+
+const TopologyLabels& labelsFor(Topology topology) noexcept
+{
+    const auto index = static_cast<std::size_t>(topology);
+    return topologyLabels[index < topologyLabels.size() ? index : 0];
+}
+} // namespace
+
+std::string_view topologyKey(Topology topology) noexcept { return labelsFor(topology).key; }
+
+std::string_view topologyName(Topology topology) noexcept { return labelsFor(topology).name; }
+
+std::optional<Topology> topologyFromKey(std::string_view key) noexcept
+{
+    for (std::size_t index = 0; index < topologyLabels.size(); ++index)
+        if (topologyLabels[index].key == key) return static_cast<Topology>(index);
+    return std::nullopt;
+}
+
 AmpPreset makeOriginalPreset(Topology topology, Instrument instrument)
 {
     AmpPreset preset;
@@ -126,38 +172,133 @@ AmpPreset makeOriginalPreset(Topology topology, Instrument instrument)
         ? CalibrationProfile { -24.0f, -18.0f, -12.0f, PickupProfile::passive }
         : CalibrationProfile { -26.0f, -19.0f, -10.0f, PickupProfile::passive };
     auto& p = preset.parameters;
-    if (topology == Topology::tightModern)
+    const auto guitar = instrument == Instrument::guitar;
+    // Every voicing but Studio Direct takes the passive stack on guitar and the bass
+    // semi-parametric on bass. Studio Direct is the exception on purpose -- see its case.
+    const auto passiveStack = guitar ? ToneStackType::passiveCoupled
+                                     : ToneStackType::bassSemiParametric;
+    switch (topology)
     {
-        preset.name = instrument == Instrument::guitar ? "Original Tight Guitar" : "Original Tight Bass";
-        p.stageCount = instrument == Instrument::guitar ? 4 : 3;
-        p.preEq = { instrument == Instrument::guitar ? 95.0f : 48.0f, 16500.0f, 0.72f,
+    case Topology::tightModern:
+        preset.name = guitar ? "Original Tight Guitar" : "Original Tight Bass";
+        p.stageCount = guitar ? 4 : 3;
+        p.preEq = { guitar ? 95.0f : 48.0f, 16500.0f, 0.72f,
                     2.5f, true, -1.5f, true, 1.5f };
         for (std::size_t index = 0; index < p.stages.size(); ++index)
         {
             p.stages[index] = { 11.0f + static_cast<float>(index) * 2.5f,
                 index % 2 == 0 ? 0.04f : -0.025f, 0.12f + 0.03f * static_cast<float>(index),
-                instrument == Instrument::guitar ? 90.0f : 45.0f, 12500.0f - 800.0f * index,
+                guitar ? 90.0f : 45.0f, 12500.0f - 800.0f * index,
                 -7.0f, 4, 0.28f, 0.28f, 0.22f, 0.32f };
         }
-        p.toneStack = { instrument == Instrument::bass ? ToneStackType::bassSemiParametric
-                                                       : ToneStackType::passiveCoupled,
-                        0.5f, 0.56f, 0.58f, instrument == Instrument::bass ? 650.0f : 850.0f, 0.85f };
+        p.toneStack = { passiveStack, 0.5f, 0.56f, 0.58f, guitar ? 850.0f : 650.0f, 0.85f };
         p.phaseInverter = { 1.7f, 0.78f, 0.14f, 0.06f, 0.3f };
         p.powerAmp = { -4.0f, 0.48f, 0.7f, 0.3f, 0.03f, 0.58f, 0.55f, 0.4f, 28.0f, 360.0f };
-    }
-    else
-    {
-        preset.name = instrument == Instrument::guitar ? "Original Vintage Bloom" : "Original Bass Bloom";
+        break;
+
+    case Topology::vintageBloom:
+        preset.name = guitar ? "Original Vintage Bloom" : "Original Bass Bloom";
         p.stageCount = 2;
-        p.preEq = { instrument == Instrument::guitar ? 62.0f : 38.0f, 19000.0f, 0.25f,
+        p.preEq = { guitar ? 62.0f : 38.0f, 19000.0f, 0.25f,
                     -1.0f, false, 0.0f, true, -1.0f };
         p.stages[0] = { 14.0f, -0.06f, 0.18f, 55.0f, 15000.0f, -5.0f, 4, 0.4f, 0.18f, 0.12f, 0.5f };
         p.stages[1] = { 10.0f, 0.08f, 0.24f, 48.0f, 13000.0f, -4.0f, 4, 0.45f, 0.22f, 0.1f, 0.58f };
-        p.toneStack = { instrument == Instrument::bass ? ToneStackType::bassSemiParametric
-                                                       : ToneStackType::passiveCoupled,
-                        0.62f, 0.45f, 0.52f, 520.0f, 0.7f };
+        p.toneStack = { passiveStack, 0.62f, 0.45f, 0.52f, 520.0f, 0.7f };
         p.phaseInverter = { 1.35f, 0.9f, 0.2f, 0.09f, 0.18f };
         p.powerAmp = { -1.5f, 0.62f, 0.42f, 0.62f, -0.08f, 0.48f, 0.65f, 0.22f, 55.0f, 650.0f };
+        break;
+
+    case Topology::americanClean:
+        /* Headroom is the character. Two low-gain stages and a power section that refuses to
+           move: high damping and heavy global feedback hold the output stiff, and the
+           saturation term is the lowest of any voicing here. The scooped mid and the +3.5 dB
+           pick emphasis are the bright-cap-and-scoop shape a blackface circuit has before
+           anything is turned up. */
+        preset.name = guitar ? "Original American Clean" : "Original Clean Bass";
+        p.stageCount = 2;
+        p.preEq = { guitar ? 78.0f : 42.0f, 18000.0f, 0.45f,
+                    3.5f, true, -2.0f, true, -2.0f };
+        p.stages[0] = { 6.0f, 0.02f, 0.06f, 75.0f, 14000.0f, -3.0f, 2, 0.18f, 0.1f, 0.08f, 0.15f };
+        p.stages[1] = { 7.5f, -0.02f, 0.08f, 70.0f, 13000.0f, -3.5f, 2, 0.2f, 0.12f, 0.06f, 0.18f };
+        p.toneStack = { passiveStack, 0.55f, 0.38f, 0.62f, guitar ? 620.0f : 480.0f, 0.6f };
+        p.phaseInverter = { 1.1f, 1.15f, 0.06f, 0.03f, 0.35f };
+        p.powerAmp = { -2.0f, 0.28f, 0.85f, 0.22f, 0.02f, 0.62f, 0.45f, 0.55f, 45.0f, 300.0f };
+        break;
+
+    case Topology::britishCrunch:
+        /* Not Vintage Bloom with more gain. The distortion is meant to come from the power
+           section rather than from a stack of preamp stages, so this runs the highest power
+           saturation of the seven against the *lowest* global feedback and damping -- an
+           output stage with nothing holding it down. The mid emphasis and the mid-forward
+           stack are the other half: this is the voicing that cuts rather than scoops. */
+        preset.name = guitar ? "Original British Crunch" : "Original British Bass";
+        p.stageCount = 3;
+        p.preEq = { guitar ? 70.0f : 40.0f, 17500.0f, 0.4f,
+                    1.5f, false, 0.0f, true, 2.0f };
+        p.stages[0] = { 10.0f, 0.05f, 0.14f, 68.0f, 13500.0f, -6.0f, 4, 0.3f, 0.24f, 0.16f, 0.34f };
+        p.stages[1] = { 12.5f, -0.04f, 0.18f, 64.0f, 12800.0f, -6.0f, 4, 0.32f, 0.26f, 0.14f, 0.38f };
+        p.stages[2] = { 13.0f, 0.06f, 0.22f, 60.0f, 12000.0f, -5.5f, 4, 0.34f, 0.28f, 0.12f, 0.42f };
+        p.toneStack = { passiveStack, 0.45f, 0.62f, 0.6f, guitar ? 720.0f : 560.0f, 0.9f };
+        p.phaseInverter = { 1.9f, 0.7f, 0.22f, 0.11f, 0.12f };
+        p.powerAmp = { -2.5f, 0.68f, 0.35f, 0.45f, -0.04f, 0.55f, 0.6f, 0.12f, 40.0f, 480.0f };
+        break;
+
+    case Topology::classAChime:
+        /* Cathode-biased and running no global feedback worth the name: `feedback` at 0.03 and
+           `damping` at 0.15 are the defining numbers, not the EQ. Positive `biasCharacter` is
+           the cathode bias, the high cut is open to 20 kHz, and presence sits high against a
+           low resonance -- bright and airy rather than big. */
+        preset.name = guitar ? "Original Class-A Chime" : "Original Class-A Bass";
+        p.stageCount = 2;
+        p.preEq = { guitar ? 85.0f : 46.0f, 20000.0f, 0.35f,
+                    4.0f, false, 0.0f, false, 0.0f };
+        p.stages[0] = { 9.0f, 0.07f, 0.2f, 80.0f, 15500.0f, -4.5f, 4, 0.36f, 0.16f, 0.1f, 0.3f };
+        p.stages[1] = { 11.0f, -0.05f, 0.26f, 76.0f, 14500.0f, -4.0f, 4, 0.4f, 0.2f, 0.08f, 0.36f };
+        p.toneStack = { passiveStack, 0.35f, 0.5f, 0.72f, guitar ? 900.0f : 700.0f, 0.7f };
+        p.phaseInverter = { 1.4f, 0.65f, 0.28f, 0.18f, 0.05f };
+        p.powerAmp = { -1.0f, 0.72f, 0.15f, 0.7f, 0.14f, 0.7f, 0.3f, 0.03f, 30.0f, 520.0f };
+        break;
+
+    case Topology::saggingRectifier:
+        /* The loose counterpart to Tight Modern: same four stages, opposite power section.
+           Sag is the highest here at 0.72 with a 70 ms attack and a 900 ms recovery, so the
+           supply is still coming back when the next chord lands. The stages carry high
+           `memoryAmount` and `attackReduction` for the blocking distortion that goes with it.
+           The low cut is *higher* than Tight Modern's, not lower -- the bloom is meant to come
+           from the supply, and letting the bottom octave through as well only makes it mud. */
+        preset.name = guitar ? "Original Sagging Rectifier" : "Original Sagging Bass";
+        p.stageCount = 4;
+        p.preEq = { guitar ? 105.0f : 52.0f, 15500.0f, 0.55f,
+                    1.0f, true, -1.0f, true, -2.5f };
+        for (std::size_t index = 0; index < p.stages.size(); ++index)
+        {
+            p.stages[index] = { 12.0f + static_cast<float>(index) * 2.7f,
+                index % 2 == 0 ? -0.05f : 0.03f, 0.16f + 0.035f * static_cast<float>(index),
+                guitar ? 100.0f : 50.0f, 12800.0f - 700.0f * index,
+                -7.0f, 4, 0.34f, 0.3f, 0.35f, 0.5f };
+        }
+        p.toneStack = { passiveStack, 0.6f, 0.3f, 0.62f, guitar ? 500.0f : 420.0f, 1.0f };
+        p.phaseInverter = { 1.6f, 0.72f, 0.16f, 0.07f, 0.24f };
+        p.powerAmp = { -5.0f, 0.55f, 0.5f, 0.72f, -0.1f, 0.5f, 0.72f, 0.3f, 70.0f, 900.0f };
+        break;
+
+    case Topology::studioDirect:
+        /* An active front end rather than a valve one, and the only voicing that takes
+           `activeThreeBand` on both instruments -- a flat, non-interacting three-band is what
+           an active preamp has, and a passive stack here would contradict the whole idea.
+           Everything else is set to get out of the way: minimal drive and asymmetry, almost no
+           supply sag, and the stiffest output stage of the seven. This is the DI voicing. */
+        preset.name = guitar ? "Original Studio Direct" : "Original Studio Bass";
+        p.stageCount = 2;
+        p.preEq = { guitar ? 60.0f : 30.0f, 20000.0f, 0.5f,
+                    0.0f, false, 0.0f, false, 0.0f };
+        p.stages[0] = { 4.0f, 0.0f, 0.02f, 40.0f, 18000.0f, -2.0f, 2, 0.05f, 0.05f, 0.02f, 0.05f };
+        p.stages[1] = { 5.0f, 0.0f, 0.03f, 36.0f, 17000.0f, -2.0f, 2, 0.06f, 0.05f, 0.02f, 0.06f };
+        p.toneStack = { ToneStackType::activeThreeBand, 0.5f, 0.5f, 0.5f,
+                        guitar ? 800.0f : 600.0f, 0.9f };
+        p.phaseInverter = { 1.0f, 1.4f, 0.02f, 0.01f, 0.4f };
+        p.powerAmp = { -1.0f, 0.12f, 0.9f, 0.05f, 0.0f, 0.5f, 0.5f, 0.6f, 20.0f, 200.0f };
+        break;
     }
     if (instrument == Instrument::bass)
     {
@@ -176,7 +317,7 @@ std::string serializePresetLegacy(const AmpPreset& preset, bool pretty)
            << "\"schemaVersion\":" << preset.schemaVersion << ',' << separator
            << "\"name\":\"" << preset.name << "\"," << separator
            << "\"instrument\":\"" << (preset.parameters.instrument == Instrument::guitar ? "guitar" : "bass") << "\"," << separator
-           << "\"topology\":\"" << (preset.parameters.topology == Topology::tightModern ? "tightModern" : "vintageBloom") << "\"," << separator
+           << "\"topology\":\"" << topologyKey(preset.parameters.topology) << "\"," << separator
            << "\"pickup\":\"" << (preset.parameters.pickup == PickupProfile::passive ? "passive" : "active") << "\"," << separator
            << "\"inputCalibrationDb\":" << preset.parameters.manualInputTrimDb << ',' << separator
            << "\"targetRmsLowDb\":" << preset.calibration.targetRmsLowDb << ',' << separator
@@ -206,6 +347,7 @@ std::string serializePresetLegacy(const AmpPreset& preset, bool pretty)
            << "\"crossoverHz\":" << preset.parameters.bass.crossoverHz << ',' << separator
            << "\"cleanBlend\":" << preset.parameters.bass.cleanBlend << ',' << separator
            << "\"cabinetBlend\":" << preset.parameters.cabinet.blend << ',' << separator
+           << "\"cabinetWidth\":" << preset.parameters.cabinet.width << ',' << separator
            << "\"cabinetBypass\":" << (preset.parameters.cabinet.bypass ? "true" : "false") << ',' << separator
            << "\"cabinetAlignment\":" << preset.parameters.cabinet.delaySamplesB << ',' << separator
            << "\"postLowDb\":" << preset.parameters.postLowDb << ',' << separator
@@ -225,7 +367,7 @@ std::string serializePreset(const AmpPreset& preset, bool pretty)
            << indent << "\"schemaVersion\":" << preset.schemaVersion << ',' << newline
            << indent << "\"name\":\"" << preset.name << "\"," << newline
            << indent << "\"instrument\":\"" << (p.instrument == Instrument::guitar ? "guitar" : "bass") << "\"," << newline
-           << indent << "\"topology\":\"" << (p.topology == Topology::tightModern ? "tightModern" : "vintageBloom") << "\"," << newline
+           << indent << "\"topology\":\"" << topologyKey(p.topology) << "\"," << newline
            << indent << "\"pickup\":\"" << (p.pickup == PickupProfile::passive ? "passive" : "active") << "\"," << newline
            << indent << "\"inputCalibration\":{"
            << "\"inputCalibrationDb\":" << p.manualInputTrimDb
@@ -280,6 +422,7 @@ std::string serializePreset(const AmpPreset& preset, bool pretty)
            << ",\"feedback\":" << p.powerAmp.feedback << ",\"sagAttackMs\":" << p.powerAmp.sagAttackMs
            << ",\"sagRecoveryMs\":" << p.powerAmp.sagRecoveryMs << "}," << newline
            << indent << "\"cabinet\":{\"cabinetBlend\":" << p.cabinet.blend
+           << ",\"cabinetWidth\":" << p.cabinet.width
            << ",\"phaseInvertB\":" << (p.cabinet.phaseInvertB ? "true" : "false")
            << ",\"cabinetAlignment\":" << p.cabinet.delaySamplesB
            << ",\"cabinetLowCutHz\":" << p.cabinet.lowCutHz
@@ -303,8 +446,12 @@ std::optional<AmpPreset> deserializePreset(std::string_view json)
     const auto name = jsonString(json, "name");
     if (! version || static_cast<int>(*version) != 1 || ! name) return std::nullopt;
     const auto instrumentName = jsonString(json, "instrument").value_or("guitar");
-    const auto topologyName = jsonString(json, "topology").value_or("tightModern");
-    auto preset = makeOriginalPreset(topologyName == "vintageBloom" ? Topology::vintageBloom : Topology::tightModern,
+    // An unrecognised name falls back rather than failing the load: a preset written by a
+    // later build naming a voicing this one has never heard of still carries usable values for
+    // every other field, and rejecting the file outright would lose all of them.
+    const auto topology = topologyFromKey(jsonString(json, "topology").value_or("tightModern"))
+                              .value_or(Topology::tightModern);
+    auto preset = makeOriginalPreset(topology,
                                      instrumentName == "bass" ? Instrument::bass : Instrument::guitar);
     preset.name = *name;
     auto& p = preset.parameters;
@@ -368,6 +515,9 @@ std::optional<AmpPreset> deserializePreset(std::string_view json)
     p.bass.crossoverHz = numberOr(json, "crossoverHz", p.bass.crossoverHz);
     p.bass.cleanBlend = numberOr(json, "cleanBlend", p.bass.cleanBlend);
     p.cabinet.blend = numberOr(json, "cabinetBlend", p.cabinet.blend);
+    // Absent in presets saved before the control existed, and its default of 0 is the behaviour
+    // they were saved with, so an old preset reads back exactly as it sounded.
+    p.cabinet.width = numberOr(json, "cabinetWidth", p.cabinet.width);
     p.cabinet.bypass = jsonBool(json, "cabinetBypass", p.cabinet.bypass);
     p.cabinet.phaseInvertB = jsonBool(json, "phaseInvertB", p.cabinet.phaseInvertB);
     p.cabinet.delaySamplesB = static_cast<std::size_t>(numberOr(json, "cabinetAlignment", 0.0f));
@@ -422,7 +572,10 @@ void ResponsivePreampStage::prepare(const dsp::ProcessSpec& newSpec)
     lowCut.prepare(spec); highCut.prepare(spec); dcBlock.prepare(spec);
     const std::array factors { dsp::OversamplingFactor::x1, dsp::OversamplingFactor::x2,
                                dsp::OversamplingFactor::x4, dsp::OversamplingFactor::x8 };
-    for (std::size_t index = 0; index < oversamplers.size(); ++index) oversamplers[index].prepare(spec, factors[index]);
+    // Sized for 8x, which is the largest any of the four can ask for.
+    oversamplerWork.assign(dsp::Oversampler::workFloatsFor(spec, 8), 0.0f);
+    for (std::size_t index = 0; index < oversamplers.size(); ++index)
+        oversamplers[index].prepare(spec, factors[index], &oversamplerWork);
     drive.prepare(spec.sampleRate, 8.0, dsp::SmoothingMode::logarithmic);
     trim.prepare(spec.sampleRate, 8.0, dsp::SmoothingMode::logarithmic);
     setConfig(config, 0); reset();
@@ -446,6 +599,18 @@ void ResponsivePreampStage::setConfig(const PreampStageConfig& next, std::size_t
     config.frequencySaturation = clamp01(config.frequencySaturation);
     config.attackReduction = clamp01(config.attackReduction);
     config.oversamplingFactor = static_cast<int>(factorFromInt(config.oversamplingFactor));
+    // Exactly the two values the saturator's second tanh can take, given the branch on the sign
+    // of the biased input. Computing them here rather than per oversampled sample removes one of
+    // the two transcendental calls from the hottest loop in the amplifier without changing a bit
+    // of the output.
+    // Derived through whichever tanh the stage is actually going to use. Mixing the two would
+    // leave the subtraction failing to cancel, and the stage would develop a standing DC offset.
+    biasOffsetPositive = config.approximateSaturation
+        ? dsp::fastTanh(config.bias * (1.0f + config.asymmetry))
+        : std::tanh(config.bias * (1.0f + config.asymmetry));
+    biasOffsetNegative = config.approximateSaturation
+        ? dsp::fastTanh(config.bias * (1.0f - config.asymmetry))
+        : std::tanh(config.bias * (1.0f - config.asymmetry));
     lowCut.setCoefficients(dsp::BiquadCoefficients::make(dsp::FilterType::highPass, spec.sampleRate,
         config.lowCutHz, 0.707), interpolationSamples);
     highCut.setCoefficients(dsp::BiquadCoefficients::make(dsp::FilterType::lowPass, spec.sampleRate,
@@ -495,12 +660,34 @@ void ResponsivePreampStage::process(float* const* channels, std::size_t channelC
                 * stageDrive * recoveryGain[channel] * transientGain) + biasMemory[channel];
         }
     }
-    selectedOversampler().process(channels, count, samples, [this](float input) noexcept
-    {
-        const auto biased = input + config.bias;
-        const auto polarity = biased >= 0.0f ? 1.0f + config.asymmetry : 1.0f - config.asymmetry;
-        return std::tanh(biased * polarity) - std::tanh(config.bias * polarity);
-    });
+    // Hoisted out of the lambda so the saturator reads immutable locals rather than chasing
+    // `this` for four values on every oversampled sample.
+    const auto bias = config.bias;
+    const auto positivePolarity = 1.0f + config.asymmetry;
+    const auto negativePolarity = 1.0f - config.asymmetry;
+    const auto positiveOffset = biasOffsetPositive;
+    const auto negativeOffset = biasOffsetNegative;
+    // Two whole loop bodies rather than a branch inside one: this runs at up to eight times the
+    // sample rate for every stage, and a per-sample test on a value fixed for the block is the
+    // kind of thing that eats an approximation's saving before it arrives.
+    if (config.approximateSaturation)
+        selectedOversampler().process(channels, count, samples,
+            [bias, positivePolarity, negativePolarity, positiveOffset, negativeOffset](float input) noexcept
+        {
+            const auto biased = input + bias;
+            const auto positive = biased >= 0.0f;
+            const auto polarity = positive ? positivePolarity : negativePolarity;
+            return dsp::fastTanh(biased * polarity) - (positive ? positiveOffset : negativeOffset);
+        });
+    else
+        selectedOversampler().process(channels, count, samples,
+            [bias, positivePolarity, negativePolarity, positiveOffset, negativeOffset](float input) noexcept
+        {
+            const auto biased = input + bias;
+            const auto positive = biased >= 0.0f;
+            const auto polarity = positive ? positivePolarity : negativePolarity;
+            return std::tanh(biased * polarity) - (positive ? positiveOffset : negativeOffset);
+        });
     dcBlock.process(channels, count, samples);
     for (std::size_t sample = 0; sample < samples; ++sample)
     {
@@ -701,31 +888,141 @@ void CabinetSection::prepare(const dsp::ProcessSpec& newSpec)
 void CabinetSection::reset() noexcept
 {
     first.reset(); second.reset(); lowCut.reset(); highCut.reset();
+    if (bufferedPrepared) { firstBuffered.reset(); secondBuffered.reset(); }
     std::fill(delay.begin(), delay.end(), 0.0f); delayPosition.fill(0);
+    // Both histories are clean now, so nothing is owed a clear. Engagement is re-derived from
+    // the blend rather than assumed, or a reset while parked at a rail would silently re-enable
+    // the idle side.
+    firstNeedsHistoryReset = false; secondNeedsHistoryReset = false;
+    // Width needs both responses running whatever the blend says: at blend 0 the second side would
+    // otherwise be skipped and zeroed, and asking for a stereo split would produce silence on the
+    // right rather than cabinet B.
+    firstEngaged = std::max(1.0f - parameters.blend, parameters.width) >= disengageThreshold;
+    secondEngaged = std::max(parameters.blend, parameters.width) >= disengageThreshold;
+    monoSumEnergy = 0.0; channelEnergy = 0.0;
+    monoLossDb.store(0.0f, std::memory_order_relaxed);
+}
+void CabinetSection::measureMonoCompatibility(float* const* channels, std::size_t count,
+                                              std::size_t samples) noexcept
+{
+    /* How much level the output loses if a mix bus folds it to mono.
+
+       This is the number the width control needs alongside it. Two different cabinet responses
+       decorrelate mostly harmlessly, but `delaySamplesB` becomes an inter-channel delay once
+       width is up, and an inter-channel delay is a comb filter under summing -- wide on
+       speakers, hollow in mono, and the user cannot hear which until something sums it.
+
+       Measured rather than predicted: the ratio between the energy of the actual mono sum and the
+       mean channel energy. 0 dB means the channels are identical and nothing is lost. -3 dB is
+       the uncorrelated case. Large negative numbers mean cancellation, which is what a comb
+       filter does to the bands it nulls.
+
+       One-pole averaged over about a second so it reads as a meter rather than flickering, and
+       held rather than decayed towards a default when the signal is too quiet to measure -- the
+       same reason the loudness matcher should not read silence as evidence. */
+    if (count < 2) { monoLossDb.store(0.0f, std::memory_order_relaxed); return; }
+    double sum {}, mean {};
+    for (std::size_t sample = 0; sample < samples; ++sample)
+    {
+        const auto left = static_cast<double>(channels[0][sample]);
+        const auto right = static_cast<double>(channels[1][sample]);
+        const auto monoSum = 0.5 * (left + right);
+        sum += monoSum * monoSum;
+        mean += 0.5 * (left * left + right * right);
+    }
+    const auto blocks = std::max(1.0, spec.sampleRate / std::max(1.0, static_cast<double>(samples)));
+    const auto coefficient = std::exp(-1.0 / blocks);
+    monoSumEnergy = sum + coefficient * (monoSumEnergy - sum);
+    channelEnergy = mean + coefficient * (channelEnergy - mean);
+    if (channelEnergy <= 1.0e-9) return;
+    const auto ratio = std::max(monoSumEnergy / channelEnergy, 1.0e-6);
+    monoLossDb.store(static_cast<float>(std::clamp(10.0 * std::log10(ratio), -60.0, 0.0)),
+                     std::memory_order_relaxed);
+}
+
+void CabinetSection::updateEngagement(bool& engaged, bool& needsHistoryReset, float weight) noexcept
+{
+    if (engaged) engaged = weight >= disengageThreshold;
+    else if (weight > engageThreshold) { engaged = true; needsHistoryReset = true; }
 }
 void CabinetSection::setParameters(const CabinetParameters& next, std::size_t interpolationSamples) noexcept
 {
     parameters = next; parameters.blend = clamp01(parameters.blend);
+    parameters.width = clamp01(parameters.width);
     parameters.bassDiBlend = clamp01(parameters.bassDiBlend);
     parameters.delaySamplesB = std::min(parameters.delaySamplesB, maximumAlignmentSamples);
+    // Only the decision is made here; the history clear it can ask for happens on the audio
+    // thread in process, because this may be called from a worker. Width counts as weight on both
+    // sides: see the note in reset.
+    updateEngagement(firstEngaged, firstNeedsHistoryReset,
+                     std::max(1.0f - parameters.blend, parameters.width));
+    updateEngagement(secondEngaged, secondNeedsHistoryReset,
+                     std::max(parameters.blend, parameters.width));
     lowCut.setCoefficients(dsp::BiquadCoefficients::make(dsp::FilterType::highPass, spec.sampleRate,
         parameters.lowCutHz, 0.707), interpolationSamples);
     highCut.setCoefficients(dsp::BiquadCoefficients::make(dsp::FilterType::lowPass, spec.sampleRate,
         parameters.highCutHz, 0.707), interpolationSamples);
 }
+void CabinetSection::selectImplementation(std::size_t crossfadeSamples)
+{
+    // One decision for the whole section, from the longer of the two responses. Blending sides
+    // with different latencies would comb-filter, so they must share an implementation.
+    const auto wantBuffered = std::max(firstLength, secondLength) > partitionedThresholdTaps;
+    if (wantBuffered == usingBuffered.load(std::memory_order_relaxed)) return;
+
+    if (wantBuffered && ! bufferedPrepared)
+    {
+        // Allocated on whichever thread is loading -- never the audio thread, which only ever
+        // reads the flag published below.
+        firstBuffered.prepare(partitionSamples, maximumIrLength, spec.channels);
+        secondBuffered.prepare(partitionSamples, maximumIrLength, spec.channels);
+        bufferedPrepared = true;
+    }
+
+    // Both sides move together, so both have to be reloaded into the incoming pair.
+    if (wantBuffered)
+    {
+        if (! firstLeft.empty()) { firstBuffered.loadInactiveImpulse(firstLeft, firstRight); firstBuffered.requestSwap(crossfadeSamples); }
+        if (! secondLeft.empty()) { secondBuffered.loadInactiveImpulse(secondLeft, secondRight); secondBuffered.requestSwap(crossfadeSamples); }
+    }
+    else
+    {
+        if (! firstLeft.empty()) { first.loadInactiveImpulse(firstLeft, firstRight); first.requestSwap(crossfadeSamples); }
+        if (! secondLeft.empty()) { second.loadInactiveImpulse(secondLeft, secondRight); second.requestSwap(crossfadeSamples); }
+    }
+    usingBuffered.store(wantBuffered, std::memory_order_release);
+}
+
 bool CabinetSection::loadImpulseA(std::span<const float> left, std::span<const float> right,
                                   CabinetMetadata metadata, std::size_t crossfadeSamples)
 {
-    if (! first.loadInactiveImpulse(left, right)) return false;
+    const auto buffered = usingBuffered.load(std::memory_order_relaxed);
+    if (buffered ? ! firstBuffered.loadInactiveImpulse(left, right)
+                 : ! first.loadInactiveImpulse(left, right)) return false;
     firstMetadata = std::move(metadata); firstLength = std::max(left.size(), right.size());
-    first.requestSwap(crossfadeSamples); return true;
+    firstLeft.assign(left.begin(), left.end());
+    firstRight.assign(right.begin(), right.end());
+    if (buffered) firstBuffered.requestSwap(crossfadeSamples); else first.requestSwap(crossfadeSamples);
+    selectImplementation(crossfadeSamples);
+    return true;
 }
 bool CabinetSection::loadImpulseB(std::span<const float> left, std::span<const float> right,
                                   CabinetMetadata metadata, std::size_t crossfadeSamples)
 {
-    if (! second.loadInactiveImpulse(left, right)) return false;
+    const auto buffered = usingBuffered.load(std::memory_order_relaxed);
+    if (buffered ? ! secondBuffered.loadInactiveImpulse(left, right)
+                 : ! second.loadInactiveImpulse(left, right)) return false;
     secondMetadata = std::move(metadata); secondLength = std::max(left.size(), right.size());
-    second.requestSwap(crossfadeSamples); return true;
+    secondLeft.assign(left.begin(), left.end());
+    secondRight.assign(right.begin(), right.end());
+    if (buffered) secondBuffered.requestSwap(crossfadeSamples); else second.requestSwap(crossfadeSamples);
+    selectImplementation(crossfadeSamples);
+    return true;
+}
+std::size_t CabinetSection::latencySamples() const noexcept
+{
+    if (parameters.bypass) return 0;
+    return usingBuffered.load(std::memory_order_acquire) ? firstBuffered.latencySamples() : 0;
 }
 std::size_t CabinetSection::tailSamples() const noexcept
 {
@@ -740,6 +1037,20 @@ void CabinetSection::process(float* const* channels, std::size_t channelCount, s
     const auto count = std::min(channelCount, spec.channels);
     const auto processSamples = std::min(samples, spec.maximumBlockSize);
     if (parameters.bypass) return;
+    // A side mid-swap, or with one staged, runs whatever the blend says: skipping it would
+    // strand a response the loader has already handed over.
+    const auto pathIsBuffered = usingBuffered.load(std::memory_order_acquire);
+    const auto runFirst = firstEngaged
+        || (pathIsBuffered ? firstBuffered.isCrossfading() || firstBuffered.isSwapPending()
+                           : first.isCrossfading() || first.isSwapPending());
+    const auto runSecond = secondEngaged
+        || (pathIsBuffered ? secondBuffered.isCrossfading() || secondBuffered.isSwapPending()
+                           : second.isCrossfading() || second.isSwapPending());
+    if (runFirst && firstNeedsHistoryReset)
+    { if (pathIsBuffered) firstBuffered.reset(); else first.reset(); firstNeedsHistoryReset = false; }
+    if (runSecond && secondNeedsHistoryReset)
+    { if (pathIsBuffered) secondBuffered.reset(); else second.reset(); secondNeedsHistoryReset = false; }
+
     std::array<float*, dsp::maximumChannels> firstPointers {}, secondPointers {};
     for (std::size_t channel = 0; channel < count; ++channel)
     {
@@ -747,11 +1058,26 @@ void CabinetSection::process(float* const* channels, std::size_t channelCount, s
         firstPointers[channel] = firstBuffer.data() + channel * spec.maximumBlockSize;
         secondPointers[channel] = secondBuffer.data() + channel * spec.maximumBlockSize;
         std::copy_n(channels[channel], processSamples, dry);
-        std::copy_n(channels[channel], processSamples, firstPointers[channel]);
-        std::copy_n(channels[channel], processSamples, secondPointers[channel]);
+        // A skipped side is zeroed rather than left holding the copied input: it is still read
+        // by the blend below, and at the dead zone's edge the residual weight is not exactly
+        // zero, so passing raw dry signal through would leak an unfiltered copy of the input.
+        if (runFirst) std::copy_n(channels[channel], processSamples, firstPointers[channel]);
+        else std::fill_n(firstPointers[channel], processSamples, 0.0f);
+        if (runSecond) std::copy_n(channels[channel], processSamples, secondPointers[channel]);
+        else std::fill_n(secondPointers[channel], processSamples, 0.0f);
     }
-    first.process(firstPointers.data(), count, processSamples);
-    second.process(secondPointers.data(), count, processSamples);
+    // Read once, so a switch published mid-block cannot send one side down each path.
+    const auto buffered = usingBuffered.load(std::memory_order_acquire);
+    if (runFirst)
+    {
+        if (buffered) firstBuffered.process(firstPointers.data(), count, processSamples);
+        else first.process(firstPointers.data(), count, processSamples);
+    }
+    if (runSecond)
+    {
+        if (buffered) secondBuffered.process(secondPointers.data(), count, processSamples);
+        else second.process(secondPointers.data(), count, processSamples);
+    }
     const auto delaySize = maximumAlignmentSamples + 1;
     for (std::size_t sample = 0; sample < processSamples; ++sample)
         for (std::size_t channel = 0; channel < count; ++channel)
@@ -762,13 +1088,25 @@ void CabinetSection::process(float* const* channels, std::size_t channelCount, s
             auto secondSample = channelDelay[readPosition];
             delayPosition[channel] = (delayPosition[channel] + 1) % delaySize;
             if (parameters.phaseInvertB) secondSample = -secondSample;
-            const auto cabinet = firstPointers[channel][sample] * (1.0f - parameters.blend)
-                               + secondSample * parameters.blend;
+            const auto firstSample = firstPointers[channel][sample];
+            const auto summed = firstSample * (1.0f - parameters.blend)
+                              + secondSample * parameters.blend;
+            /* Width sends slot A left and slot B right, interpolating away from the sum.
+
+               Channel 0 takes A and channel 1 takes B; a mono output has one channel and so
+               stays on the sum, which is the only thing it can be. No level compensation:
+               with two similar responses at the default blend of 0.5 the sum is already
+               approximately either one of them, so the crossfade is close to level-matched,
+               and with two deliberately different responses any correction would be guessing
+               at which of them the user considers the reference. */
+            const auto split = count > 1 && channel == 1 ? secondSample : firstSample;
+            const auto cabinet = summed + (split - summed) * parameters.width;
             const auto dry = dryBuffer[channel * spec.maximumBlockSize + sample];
             channels[channel][sample] = cabinet * (1.0f - parameters.bassDiBlend)
                                       + dry * parameters.bassDiBlend;
         }
     lowCut.process(channels, count, processSamples); highCut.process(channels, count, processSamples);
+    measureMonoCompatibility(channels, count, processSamples);
 }
 
 void AmpVoice::prepare(const dsp::ProcessSpec& newSpec)
@@ -896,6 +1234,7 @@ void AmpVoice::process(float* const* channels, std::size_t channelCount, std::si
         processDrivenPath(channels, count, processSamples);
     postLow.process(channels, count, processSamples); postMid.process(channels, count, processSamples);
     postHigh.process(channels, count, processSamples);
+
     for (std::size_t sample = 0; sample < processSamples; ++sample)
     {
         const auto level = outputGain.next();
@@ -920,7 +1259,10 @@ std::size_t AmpVoice::latencySamples() const noexcept
 {
     std::size_t latency {};
     for (std::size_t index = 0; index < parameters.stageCount; ++index) latency += stages[index].latencySamples();
-    return latency;
+    // The cabinet contributes only when a response long enough to want the partitioned path is
+    // loaded. Reported rather than hidden: the host compensates for it, and the plug-in's dry
+    // path is delayed by the same amount, so the bypass crossfade stays aligned.
+    return latency + cabinet.latencySamples();
 }
 
 void TraditionalAmpProcessor::prepare(const dsp::ProcessSpec& newSpec)
@@ -938,6 +1280,20 @@ void TraditionalAmpProcessor::reset() noexcept
 }
 void TraditionalAmpProcessor::setParameters(const AmpParameters& parameters) noexcept
 {
+    // The audio callback calls this once a block with whatever the controls currently read,
+    // which is almost always exactly what they read last block. Reconfiguring regardless is
+    // not free, and the cost is not only the obvious one:
+    //
+    //   - it re-derives around twenty-five sets of biquad coefficients per voice, each costing
+    //     a sin, a cos and a pow, for values that have not moved;
+    //   - and because every setCoefficients call restarts a 64-sample interpolation, it pins
+    //     every filter in the amplifier to its per-sample interpolating path. The settled path,
+    //     which holds state and coefficients in registers, could otherwise never run at all.
+    //
+    // Comparing first costs one struct compare of plain values. The dirty flag covers the
+    // paths that reconfigure a voice without going through here; see its declaration.
+    if (! parametersDirty && ! transitionPending && parameters == requestedParameters) return;
+
     // A change of oversampling factor swaps in a different polyphase filter whose
     // delay lines hold unrelated state, so it has to cross-fade like any other
     // discrete change rather than switching under the signal.
@@ -965,11 +1321,17 @@ void TraditionalAmpProcessor::setParameters(const AmpParameters& parameters) noe
         presets[transitionTarget].parameters = parameters;
         voices[transitionTarget].setParameters(parameters);
         if (crossfader.mode() == transitionTarget && ! crossfader.isCrossfading())
+        {
             transitionPending = false;
+            // Only the target voice has been tracking the controls through the transition, so
+            // the other one is now stale. Force the next call to sync both.
+            parametersDirty = true;
+        }
         return;
     }
     for (auto& voice : voices) voice.setParameters(parameters);
     for (auto& preset : presets) preset.parameters = parameters;
+    parametersDirty = false;
 }
 void TraditionalAmpProcessor::setParametersImmediately(const AmpParameters& parameters) noexcept
 {
@@ -983,6 +1345,7 @@ void TraditionalAmpProcessor::setParametersImmediately(const AmpParameters& para
     crossfader.reset();
     transitionTarget = 0;
     transitionPending = false;
+    parametersDirty = true;
 }
 void TraditionalAmpProcessor::loadPreset(const AmpPreset& preset, std::size_t crossfadeSamples)
 {
@@ -993,6 +1356,7 @@ void TraditionalAmpProcessor::loadPreset(const AmpPreset& preset, std::size_t cr
     requestedParameters = preset.parameters;
     transitionTarget = inactive;
     transitionPending = true;
+    parametersDirty = true;
 }
 void TraditionalAmpProcessor::process(float* const* channels, std::size_t channelCount,
                                       std::size_t samples) noexcept
@@ -1055,3 +1419,5 @@ std::vector<float> renderOffline(TraditionalAmpProcessor& processor, std::span<c
     return result;
 }
 } // namespace nts::amp
+
+

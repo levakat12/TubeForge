@@ -34,8 +34,17 @@ public:
 
         Called on the message thread. Supplied by the owner because parameter objects belong
         to the processor, and reaching back for them is what this separation exists to avoid.
+
+        `isolateChain` asks for the parts of the live rig the offline render never contained --
+        the pedals in front and the time effects behind -- to be taken out of the way, so what
+        is heard is the amplifier that was actually scored rather than that amplifier through
+        whatever else happened to be set up.
+
+        Reporting what is still in the chain afterwards belongs to the owner as well, for the
+        same reason: it means reading the live parameters, which this class deliberately
+        cannot do.
     */
-    using ApplyRig = std::function<void(const nts::amp::AmpParameters&)>;
+    using ApplyRig = std::function<void(const nts::amp::AmpParameters&, bool isolateChain)>;
 
     explicit StudioServices(ApplyRig applyRig);
     ~StudioServices();
@@ -58,10 +67,18 @@ public:
     [[nodiscard]] juce::String reconstructionStatusText() const;
     [[nodiscard]] float reconstructionProgress() const noexcept
     { return reconstructionProgressValue.load(std::memory_order_relaxed); }
+    /** True from the moment the worker starts until it leaves, however it leaves.
+
+        Distinct from `reconstructionProgress`, which cannot answer this: progress is 0 both before
+        a match begins and after one fails, so a caller watching it could not tell idle from
+        running, and anything gated on it would latch on the first failure.
+    */
+    [[nodiscard]] bool songMatchInProgress() const noexcept
+    { return reconstructionRunning.load(std::memory_order_relaxed); }
     [[nodiscard]] std::optional<nts::reconstruction::ReconstructionResult> reconstructionSnapshot() const;
     [[nodiscard]] std::vector<nts::reconstruction::PlayableRegion> reconstructionRegionsSnapshot() const;
     [[nodiscard]] bool requestReconstructionRegion(std::size_t index);
-    [[nodiscard]] bool applyReconstructionCandidate(std::size_t index);
+    [[nodiscard]] bool applyReconstructionCandidate(std::size_t index, bool isolateChain);
     [[nodiscard]] juce::Result exportReconstruction(const juce::File& file) const;
 
     /** The tone of the song a reconstruction was matched against, if there is one.
@@ -104,5 +121,7 @@ private:
     std::size_t activeReconstructionRegion {};
     std::string reconstructionStatus { "Import a song to begin source reconstruction" };
     std::atomic<float> reconstructionProgressValue {};
+    /// Set for the lifetime of a reconstructSongFile call; see songMatchInProgress.
+    std::atomic<bool> reconstructionRunning {};
     std::jthread reconstructionWorker;
 };

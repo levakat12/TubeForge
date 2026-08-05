@@ -15,12 +15,14 @@ class ReconstructionView final : public juce::Component
 {
 public:
     void setResult(std::optional<nts::reconstruction::ReconstructionResult> value,
-                   juce::String status, float progress);
+                   juce::String status, float progress, juce::StringArray chainWarnings);
     void paint(juce::Graphics& graphics) override;
 private:
     std::optional<nts::reconstruction::ReconstructionResult> result;
     juce::String statusText;
     float progressValue {};
+    /// What the live chain still does to the rig that was applied, drawn under the candidates.
+    juce::StringArray warnings;
 };
 
 /// Rebuilding a tone from a song the user owns.
@@ -41,6 +43,9 @@ private:
     juce::TextButton useRegion { "Use this part" };
     juce::TextButton applyCandidate { "Apply" };
     juce::TextButton exportCandidate { "Export profile" };
+    /// On by default: a candidate is chosen by how it sounds on its own, so hearing it
+    /// through a board and a reverb it was never ranked with is the surprising outcome.
+    juce::ToggleButton isolateChain { "Bypass pedals and effects on apply" };
     juce::ComboBox target;
     juce::ComboBox stereoMode;
     juce::ComboBox region;

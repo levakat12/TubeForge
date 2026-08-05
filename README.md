@@ -51,7 +51,9 @@ See [Phase 2 coverage](docs/phase-02-coverage.md), [DSP architecture](docs/phase
 
 ## Phase 3 traditional amplifier
 
-- Tight Modern and Vintage Bloom original topologies with guitar and bass variants.
+- Seven original topologies -- Tight Modern, Vintage Bloom, American Clean, British Crunch,
+  Class-A Chime, Sagging Rectifier and Studio Direct -- each with guitar and bass variants, and
+  each with its own drawn faceplate.
 - Profile-aware DI calibration, automatic trim suggestion, gate, pre-EQ, tightness, and pick emphasis.
 - Two-to-four responsive oversampled preamp stages with bias shift, memory, transient response, and asymmetric saturation.
 - Coupled passive, active, and bass semi-parametric tone stacks.
@@ -184,6 +186,39 @@ See [Phase 9 coverage](docs/phase-09-coverage.md) and [architecture](docs/phase-
 See [Phase 10 coverage](docs/phase-10-coverage.md), [package format](docs/phase-10-package-format.md), and
 [release process](docs/release-process.md).
 
+## Pedalboard
+
+- Four series slots in front of the amplifier and ahead of the noise gate, shared by all three engines,
+  with Boost, Overdrive, Distortion, Fuzz and Compressor voicings built from the Phase 2 primitives.
+- Any slot can instead run a Neural Amp Modeler pedal capture, staged through the same artifact path the
+  amplifier's neural engine uses — manifest schema, SHA-256 over `model.bin`, and exported test vectors all
+  re-run before a model is allowed onto the audio thread — with one background worker per slot.
+- Every slot defaults to None, which is absence rather than a unity-gain effect: a board of four None slots
+  leaves the buffer untouched, so the default rig is amplifier and cabinet exactly as before. Kind changes
+  and bypass both ride the wet/dry blend to silence before switching, so neither steps the signal.
+- Allocation-free and lock-free on the audio thread, saved and restored with the project at schema 4,
+  and covered by `nts_pedal_tests` plus the wrapper suite.
+
+See the [user guide](docs/user-guide.md) and, for pedal captures, the [capture guide](docs/nam-capture-guide.md).
+
+## Neural Amp Modeler capture library
+
+- `.zip` archives, `.nam` files and folders of either are unpacked and converted **inside the plug-in** —
+  no command line and no Python interpreter. Whole archives at a time, because the packs hold up to
+  eighty-nine captures of one box at different settings. Archive entries are read into memory and written
+  only to digest-named directories, so an entry's own path can never place a file outside the library.
+- Captures are classified as amps, full rigs or pedals from `metadata.gear_type`, which orders every
+  picker and warns on a mismatch without ever withholding a capture.
+- Conversion is idempotent and keyed by each capture's SHA-256; the Captures page and the pickers on the
+  Pedals and Neural Capture pages are views of one library.
+- The plug-in's `.nam` reader and NTSM v3 packer duplicate the Python ones because a plug-in cannot depend
+  on an interpreter. `nts_nam_parity` stops that duplicate from drifting by requiring **byte-identical**
+  `model.bin` from both converters: **708 of 708 comparisons** — all 354 corpus captures at both tiers —
+  are byte-identical today. An artifact converted in the plug-in records `"testVectorSource": "runtime"`,
+  because vectors it rendered itself prove determinism rather than parity.
+
+See the [capture guide](docs/nam-capture-guide.md) and [format compatibility](docs/format-compatibility.md).
+
 ## Build on Windows
 
 Requirements:
@@ -225,6 +260,8 @@ The standalone window embeds JUCE's device selector in its **Audio settings** ta
 | `nts_reconstruction` | Stem separation, region confidence, reference normalization, rig search, and safe result export |
 | `nts_assistant` | Live signal summaries, diagnostic rules, musical goals, validated actions, explanations, and local preferences |
 | `nts_ecosystem` | Secure `.ntone` packages, profile library, updates, crash privacy, telemetry policy, and format versions |
+| `nts_nam` | `.nam` reader, NTSM v3 packer, in-process zip import, and the converted-capture library |
+| `nts_pedals` | Four-slot pedalboard: digital drive voicings and per-slot neural capture hosts |
 | `nts_ir` | Background cabinet audio decoding and offline IR preparation |
 | `nts_state` | Project schema, migration, validation, paths, settings |
 | `nts_diagnostics` | Lock-free events, timing, latency, logging, workers |
@@ -237,6 +274,8 @@ The standalone window embeds JUCE's device selector in its **Audio settings** ta
 | `nts_asio_tests` | Optional ASIO backend registration probe when ASIO is enabled |
 | `nts_wrapper_tests` | Processor state and repeated editor lifecycle tests |
 | `nts_ml_runtime_tests` | Packed-model validation and reset behavior |
+| `nts_nam_tests` | Capture parsing, named refusals for unsupported constructs, packed-header layout, and archive import |
+| `nts_pedal_tests` | Pedalboard transparency when absent, bypassed or at zero mix, drive response, and stability at extremes |
 | `nts_circuit_tests` | Circuit components, graph validation/migration/swap, hybrid runtime, telemetry, and real-time allocation tests |
 | `nts_tone_analysis_tests` | Phase 7 analysis, invariance, confidence, serialization, comparison, and search tests |
 | `nts_reconstruction_tests` | Phase 8 separation consistency, cache/cancellation, regions, stereo, reconstruction, and safe-export tests |
@@ -244,6 +283,7 @@ The standalone window embeds JUCE's device selector in its **Audio settings** ta
 | `nts_ecosystem_tests` | Phase 10 package traversal/hash/signature/model/license, browser, update, crash, and telemetry tests |
 | `nts_ml_python_tests` | Dataset, alignment, training, export, evaluation, registry, and determinism suite |
 | `nts_ml_runtime_parity` | Python export versus compiled C++ output tolerance test |
+| `nts_nam_parity` | Plug-in converter versus `nts-nam-import`, required to be byte-identical over the whole corpus |
 | `nts_vst3_host_tests` | Actual VST3 scan, instantiation, processing, and editor tests |
 | `nts_soak_tests` | True wall-clock continuous-processing soak test |
 | `nts_dsp_tests` | Phase 2 response, stability, aliasing, convolution, analysis, regression, and allocation tests |

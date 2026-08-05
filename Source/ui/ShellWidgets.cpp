@@ -45,6 +45,17 @@ juce::Path buildGlyph(Glyph glyph)
                 path.addEllipse(x - 1.0f, 7.8f, 2.0f, 2.0f);
             break;
 
+        case Glyph::pedalboard:
+            // A stomp box seen from above: enclosure, one knob, and the footswitch. The
+            // footswitch is the part that makes it read as a pedal rather than as another
+            // rounded box, so it is drawn largest.
+            path.addRoundedRectangle(5.0f, 2.5f, 14.0f, 19.0f, 2.4f);
+            path.addEllipse(9.4f, 5.4f, 5.2f, 5.2f);
+            path.startNewSubPath(12.0f, 5.4f);
+            path.lineTo(12.0f, 8.0f);
+            path.addEllipse(8.6f, 13.4f, 6.8f, 6.8f);
+            break;
+
         case Glyph::toneShaping:
         {
             constexpr std::array handleY { 9.0f, 14.5f, 7.5f };
@@ -82,6 +93,18 @@ juce::Path buildGlyph(Glyph glyph)
                 path.startNewSubPath(17.5f, offset);
                 path.lineTo(20.5f, offset);
             }
+            break;
+
+        case Glyph::captures:
+            // An archive box: a lid across the top and a handle cut into the front. The chip
+            // glyph next door is the model itself; this is the crate the models arrive in.
+            path.addRoundedRectangle(3.5f, 4.0f, 17.0f, 4.6f, 1.2f);
+            path.startNewSubPath(5.2f, 8.6f);
+            path.lineTo(5.2f, 19.6f);
+            path.lineTo(18.8f, 19.6f);
+            path.lineTo(18.8f, 8.6f);
+            path.startNewSubPath(9.4f, 12.4f);
+            path.lineTo(14.6f, 12.4f);
             break;
 
         case Glyph::toneAssistant:
@@ -250,10 +273,11 @@ void StudioSignalChain::setEngineMode(int mode)
 
 void StudioSignalChain::paint(juce::Graphics& graphics)
 {
-    constexpr std::array stages { "INPUT", "GATE", "PREAMP", "TONE", "POWER", "CABINET", "OUTPUT" };
+    constexpr std::array stages { "INPUT", "PEDALS", "GATE", "PREAMP", "TONE", "POWER",
+                                  "CABINET", "OUTPUT" };
     // The three stages in the middle are the ones the engine mode actually swaps out.
-    constexpr int firstCoreStage = 2;
-    constexpr int lastCoreStage = 4;
+    constexpr int firstCoreStage = 3;
+    constexpr int lastCoreStage = 5;
     constexpr float tracking = 1.4f;
     constexpr float gap = 9.0f;
 

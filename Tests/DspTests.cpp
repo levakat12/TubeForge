@@ -293,6 +293,33 @@ void testNonlinearAndOversampling(TestHarness& tests)
     const auto x1Alias = toneMagnitude(std::span(base).subspan(256), 18000.0);
     const auto x8Alias = toneMagnitude(std::span(highQuality).subspan(256), 18000.0);
     tests.expect(x8Alias < x1Alias, "8x oversampling measurably rejects nonlinear aliasing");
+
+    // Round-trip through the resampler with nothing in between. Everything above checks the
+    // designed coefficients or the gross aliasing behaviour, and neither would notice if the
+    // polyphase up and down paths had drifted out of alignment with each other -- a phase
+    // error, an off-by-one in the tap window, or a sub-filter assigned to the wrong phase all
+    // leave the coefficients correct and the aliasing rejected. Passing a signal well inside
+    // the passband through unchanged and landing it exactly on the reported latency is what
+    // pins those down.
+    for (const auto factor : { nts::dsp::OversamplingFactor::x2, nts::dsp::OversamplingFactor::x4,
+                               nts::dsp::OversamplingFactor::x8 })
+    {
+        constexpr std::size_t length = 2048;
+        auto reference = sine(length, 500.0, 0.5f);
+        auto roundTrip = reference;
+        nts::dsp::Oversampler unity;
+        unity.prepare({ sampleRate, length, 1 }, factor);
+        float* channel[] { roundTrip.data() };
+        unity.process(channel, 1, length, [](float value) noexcept { return value; });
+
+        const auto latency = unity.latencySamples();
+        // Skip the filter's start-up transient before comparing.
+        auto worst = 0.0f;
+        for (std::size_t index = latency + 128; index < length; ++index)
+            worst = std::max(worst, std::abs(roundTrip[index] - reference[index - latency]));
+        tests.expect(worst < 0.02f,
+                     "oversampling round trip reproduces a passband signal at the reported latency");
+    }
 }
 
 void testDynamics(TestHarness& tests)
@@ -356,6 +383,62 @@ void testModeSwitchAndSimd(TestHarness& tests)
     for (std::size_t index = 0; index < scalar.size(); ++index)
         tests.expectNear(simd[index], scalar[index], 1.0e-7, "SIMD gain kernel matches scalar reference");
     tests.expect(nts::dsp::simdAvailable(), "SSE2 SIMD kernel is available on the supported Windows target");
+
+    // Both dispatch paths, driven on whatever machine this is running on. Without forcing, a
+    // developer machine new enough to select AVX2 never executes the SSE2 kernel again -- and the
+    // SSE2 kernel is the one that has to keep working on the hardware this engine exists to
+    // support. So the interesting assertion is not that AVX2 is fast, it is that the two agree.
+    {
+        constexpr std::size_t length = 1000;
+        std::vector<float> left(length), right(length);
+        std::uint32_t seed = 20260803u;
+        const auto next = [&seed]
+        {
+            seed = seed * 1664525u + 1013904223u;
+            return static_cast<float>(static_cast<double>(seed >> 8) / 8388608.0 - 1.0);
+        };
+        for (std::size_t index = 0; index < length; ++index) { left[index] = next(); right[index] = next(); }
+
+        const auto restore = nts::dsp::activeSimdPath();
+        // Every length from zero through the widest unrolled step, so the tails of both kernels
+        // are exercised as well as their main loops. An off-by-one in a tail is exactly the kind
+        // of thing that only shows up on the path the developer's machine does not take.
+        auto worst = 0.0f;
+        auto scalarWorst = 0.0f;
+        for (std::size_t count = 0; count <= 40; ++count)
+        {
+            nts::dsp::setSimdPath(nts::dsp::SimdPath::sse2);
+            const auto sse2 = nts::dsp::dotProductWide(left.data(), right.data(), count);
+            nts::dsp::setSimdPath(nts::dsp::SimdPath::avx2);
+            const auto avx2 = nts::dsp::dotProductWide(left.data(), right.data(), count);
+            const auto reference = nts::dsp::dotProductScalar(left.data(), right.data(), count);
+            worst = std::max(worst, std::abs(sse2 - avx2));
+            scalarWorst = std::max({ scalarWorst, std::abs(sse2 - reference), std::abs(avx2 - reference) });
+        }
+        nts::dsp::setSimdPath(nts::dsp::SimdPath::sse2);
+        const auto longSse2 = nts::dsp::dotProductWide(left.data(), right.data(), length);
+        nts::dsp::setSimdPath(nts::dsp::SimdPath::avx2);
+        const auto longAvx2 = nts::dsp::dotProductWide(left.data(), right.data(), length);
+        worst = std::max(worst, std::abs(longSse2 - longAvx2));
+        nts::dsp::setSimdPath(restore);
+
+        // Not bit-equality: the AVX2 kernel fuses its multiply and add, which keeps more
+        // precision than the SSE2 kernel's separate rounding, and the two reduce their partial
+        // sums in a different order. Agreement to within float epsilon of the magnitude is the
+        // honest requirement.
+        tests.expect(worst < 1.0e-4f, "the SSE2 and AVX2 dot products agree across every length");
+        tests.expect(scalarWorst < 1.0e-4f, "both vector dot products agree with a scalar reference");
+
+        // The forcing hook must refuse a path the machine cannot run, or a test that forces AVX2
+        // on an older CPU would be an illegal instruction rather than a failure.
+        const auto forced = nts::dsp::setSimdPath(nts::dsp::SimdPath::avx2);
+        tests.expect(nts::dsp::avx2Available() ? forced == nts::dsp::SimdPath::avx2
+                                               : forced == nts::dsp::SimdPath::sse2,
+                     "forcing AVX2 is refused on a machine that does not support it");
+        nts::dsp::setSimdPath(nts::dsp::SimdPath::automatic);
+        tests.expect(nts::dsp::activeSimdPath() == nts::dsp::SimdPath::automatic,
+                     "the dispatch returns to automatic selection");
+    }
 }
 
 void testConvolutionAndIr(TestHarness& tests)
@@ -365,6 +448,107 @@ void testConvolutionAndIr(TestHarness& tests)
     std::array<float, 16> left {}; std::array<float, 16> right {}; left[0] = right[0] = 1.0f; float* channels[] { left.data(), right.data() };
     direct.process(channels, 2, left.size());
     for (std::size_t index = 0; index < ir.size(); ++index) tests.expectNear(left[index], ir[index], 1.0e-6, "direct convolution matches reference impulse");
+
+    // An independent reference, because everything else here checks DirectConvolver against
+    // itself or against a single impulse at position zero. Neither would catch a delay-line
+    // wraparound, an off-by-one in the tap window, or a reversed-impulse misalignment -- and
+    // the doubled-buffer layout this class uses is exactly the kind of rewrite that fails that
+    // way. Irregular block sizes are the point: they walk the write position through every
+    // phase of the ring rather than landing on the same offsets each call.
+    {
+        constexpr std::size_t irLength = 100, signalLength = 1000;
+        std::vector<float> randomIr(irLength);
+        std::vector<float> signal(signalLength);
+        std::uint32_t seed = 987654321u;
+        const auto nextRandom = [&seed]
+        {
+            seed = seed * 1664525u + 1013904223u;
+            return static_cast<float>(static_cast<double>(seed >> 8) / 8388608.0 - 1.0);
+        };
+        for (auto& value : randomIr) value = nextRandom();
+        for (auto& value : signal) value = nextRandom();
+
+        // Naive convolution in double, computed straight from the definition.
+        std::vector<float> reference(signalLength);
+        for (std::size_t n = 0; n < signalLength; ++n)
+        {
+            double sum {};
+            for (std::size_t k = 0; k < irLength && k <= n; ++k)
+                sum += static_cast<double>(randomIr[k]) * static_cast<double>(signal[n - k]);
+            reference[n] = static_cast<float>(sum);
+        }
+
+        auto produced = signal;
+        nts::dsp::DirectConvolver irregular;
+        irregular.prepare(irLength, 1);
+        tests.expect(irregular.loadImpulse(randomIr), "direct convolver accepts the random reference IR");
+        constexpr std::array<std::size_t, 8> blockPattern { 7, 13, 1, 64, 200, 3, 128, 33 };
+        std::size_t offset {}, patternIndex {};
+        while (offset < signalLength)
+        {
+            const auto count = std::min(blockPattern[patternIndex++ % blockPattern.size()],
+                                        signalLength - offset);
+            float* block[] { produced.data() + offset };
+            irregular.process(block, 1, count);
+            offset += count;
+        }
+        auto worstError = 0.0f;
+        for (std::size_t index = 0; index < signalLength; ++index)
+            worstError = std::max(worstError, std::abs(produced[index] - reference[index]));
+        tests.expect(worstError < 1.0e-5f,
+                     "direct convolution matches a naive reference across irregular block sizes");
+    }
+
+    // The buffered partitioned path, driven the way a host actually drives one. This is the test
+    // the fixed-block trap made impossible, and it is the entire point of the wrapper: partitioned
+    // convolution is asymptotically cheaper, and it was unreachable because nothing could promise
+    // it a constant block size.
+    {
+        constexpr std::size_t irLength = 300, signalLength = 4096, partition = 128;
+        auto bufferedIr = nts::dsp::StimulusGenerator::transient(irLength, sampleRate);
+        auto signal = nts::dsp::StimulusGenerator::whiteNoise(signalLength, 4242);
+
+        // Reference: the direct convolver, which is invariant to how the input is cut up.
+        auto reference = signal;
+        nts::dsp::DirectConvolver referenceConvolver;
+        referenceConvolver.prepare(bufferedIr.size(), 1);
+        referenceConvolver.loadImpulse(bufferedIr);
+        float* referenceChannel[] { reference.data() };
+        referenceConvolver.process(referenceChannel, 1, reference.size());
+
+        auto buffered = signal;
+        nts::dsp::BufferedCrossfadingConvolver wrapper;
+        wrapper.prepare(partition, bufferedIr.size(), 1);
+        tests.expect(wrapper.loadInactiveImpulse(bufferedIr), "buffered convolver accepts an IR");
+        wrapper.requestSwap(1);
+        tests.expectEqual(wrapper.latencySamples(), partition,
+                          "the buffered convolver reports exactly one partition of latency");
+
+        // Deliberately pathological: none of these is the partition size, several are shorter,
+        // and one is longer, so the wrapper has to cross partition boundaries mid-call.
+        constexpr std::array<std::size_t, 7> pattern { 63, 1, 512, 127, 3, 200, 33 };
+        std::size_t offset {}, patternIndex {};
+        while (offset < signalLength)
+        {
+            const auto count = std::min(pattern[patternIndex++ % pattern.size()], signalLength - offset);
+            float* block[] { buffered.data() + offset };
+            wrapper.process(block, 1, count);
+            offset += count;
+        }
+
+        // Offset by the reported latency, and skipping the leading partition of priming silence.
+        auto worst = 0.0f;
+        for (std::size_t index = partition + 64; index < signalLength; ++index)
+            worst = std::max(worst, std::abs(buffered[index] - reference[index - partition]));
+        tests.expect(worst < 2.0e-4f,
+                     "buffered partitioned convolution matches direct convolution at its "
+                     "reported latency across irregular block sizes");
+
+        auto leadingSilence = true;
+        for (std::size_t index = 0; index < partition; ++index)
+            leadingSilence = leadingSilence && std::abs(buffered[index]) < 1.0e-6f;
+        tests.expect(leadingSilence, "the buffered convolver's latency is silence, not stale data");
+    }
 
     auto longIr = nts::dsp::StimulusGenerator::transient(300, sampleRate);
     auto input = nts::dsp::StimulusGenerator::whiteNoise(1024, 1234); auto expected = input; auto actual = input;
@@ -568,6 +752,25 @@ void testPitchDetection(TestHarness& tests)
     tests.expect(sharpNote.midiNote == 69, "a sharp A4 still reads as A4");
     tests.expectNear(sharpNote.cents, 15.0, 1.5, "cent offset reports how far sharp the note is");
 
+    {
+        // An adjustable concert A is the whole point of the reference control on the tuner page:
+        // 440 Hz has to read as in tune at A=440 and audibly sharp against a lower reference, and
+        // the note name must not move when only the reference does.
+        const auto at440 = nts::dsp::nearestNote(440.0f, 440.0f);
+        const auto at432 = nts::dsp::nearestNote(440.0f, 432.0f);
+        tests.expect(at440.midiNote == 69 && at432.midiNote == 69,
+                     "changing the reference renames nothing: 440 Hz is A4 either way");
+        tests.expectNear(at440.cents, 0.0, 0.01, "440 Hz is in tune at A=440");
+        // 1200 * log2(440/432) is 31.8 cents.
+        tests.expectNear(at432.cents, 31.8, 0.3, "440 Hz reads sharp against a 432 Hz reference");
+        // And the reference scales the whole grid, not just the octave it names: the low E of a
+        // guitar has to move by the same ratio, or every string but the A would be tuned wrongly.
+        const auto lowE432 = nts::dsp::nearestNote(82.41f * 432.0f / 440.0f, 432.0f);
+        tests.expect(lowE432.midiNote == 40, "a reference-scaled low E is still E2");
+        tests.expectNear(lowE432.cents, 0.0, 1.0,
+                         "the reference scales every note, not only the A it is named for");
+    }
+
     // Silence and noise must not produce a confident reading, or the display will chatter.
     std::vector<float> silence(frameSamples, 0.0f);
     tests.expect(! detector.analyse(silence).voiced, "silence produces no pitch reading");
@@ -695,6 +898,60 @@ void testTimeBasedEffects(TestHarness& tests)
     auto untouched = true;
     for (const auto value : flat) untouched = untouched && std::abs(value - 0.3f) < 1.0e-7f;
     tests.expect(untouched, "a reverb at zero mix leaves the signal completely alone");
+
+    // Bringing a send back up after it has been parked. Skipping the wet path while it is
+    // inaudible is worth the whole cost of the effect, but it leaves the delay lines holding
+    // whatever was in them, and a send that replays seconds of stale audio on re-engagement is
+    // worse than one that costs CPU. Both effects clear on the way back in; these assert it.
+    for (auto* effect : { &silent })
+    {
+        // Drive it hard while parked at zero mix, so anything retained would be loud.
+        reverbParameters.mix = 0.0f;
+        effect->setParameters(reverbParameters);
+        std::vector<float> loudLeft(frame, 0.0f), loudRight(frame, 0.0f);
+        float* loudChannels[] { loudLeft.data(), loudRight.data() };
+        for (std::size_t index = 0; index < frame; ++index)
+            loudLeft[index] = loudRight[index] = 0.9f * std::sin(0.07f * static_cast<float>(index));
+        effect->process(loudChannels, 2, frame);
+
+        // Now bring it up with silence going in. A cleared reverb produces nothing.
+        reverbParameters.mix = 1.0f;
+        effect->setParameters(reverbParameters);
+        std::vector<float> quietLeft(frame, 0.0f), quietRight(frame, 0.0f);
+        float* quietChannels[] { quietLeft.data(), quietRight.data() };
+        effect->process(quietChannels, 2, frame);
+        auto loudest = 0.0f;
+        for (const auto value : quietLeft) loudest = std::max(loudest, std::abs(value));
+        tests.expect(loudest < 1.0e-6f,
+                     "a reverb brought back up does not replay what it held while parked");
+    }
+
+    nts::dsp::Delay parked;
+    parked.prepare(fxSpec);
+    delayParameters.timeMs = 100.0f; delayParameters.feedback = 0.4f;
+    delayParameters.mix = 0.0f; delayParameters.dampingHz = 20000.0f;
+    parked.setParameters(delayParameters);
+    parked.reset();
+    std::vector<float> parkLeft(frame, 0.0f), parkRight(frame, 0.0f);
+    float* parkChannels[] { parkLeft.data(), parkRight.data() };
+    for (std::size_t index = 0; index < frame; ++index)
+        parkLeft[index] = parkRight[index] = 0.9f * std::sin(0.05f * static_cast<float>(index));
+    parked.process(parkChannels, 2, frame);
+    auto dryUntouched = true;
+    for (std::size_t index = 0; index < frame; ++index)
+        dryUntouched = dryUntouched
+            && std::abs(parkLeft[index] - 0.9f * std::sin(0.05f * static_cast<float>(index))) < 1.0e-6f;
+    tests.expect(dryUntouched, "a delay at zero mix leaves the signal completely alone");
+
+    delayParameters.mix = 1.0f;
+    parked.setParameters(delayParameters);
+    std::vector<float> silentLeft(frame, 0.0f), silentRight(frame, 0.0f);
+    float* silentChannels[] { silentLeft.data(), silentRight.data() };
+    parked.process(silentChannels, 2, frame);
+    auto loudestRepeat = 0.0f;
+    for (const auto value : silentLeft) loudestRepeat = std::max(loudestRepeat, std::abs(value));
+    tests.expect(loudestRepeat < 1.0e-6f,
+                 "a delay brought back up does not replay what it held while parked");
 
     // A long decay must still settle rather than sustaining forever.
     tests.expect(reverb.tailSamples() > 0 && delay.tailSamples() > 0,

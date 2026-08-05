@@ -34,11 +34,11 @@ public:
     void paint(juce::Graphics& graphics) override;
     void resized() override;
 
-    static constexpr int moduleCount = 10;
+    static constexpr int moduleCount = 12;
     /// Modules from this index on are engineering surfaces, hidden until PRO is switched on.
-    static constexpr int firstProModule = 7;
+    static constexpr int firstProModule = 9;
     /// The page the header's preset controls talk to.
-    static constexpr int libraryModule = 6;
+    static constexpr int libraryModule = 8;
 
 private:
     void timerCallback() override;
@@ -48,6 +48,14 @@ private:
     void layOutRail();
     void setActiveModule(int index);
     void applyProModeVisibility();
+    /** Greys the controls the performance tier has taken over.
+
+        A capped control that still looks live is worse than one that is visibly unavailable: the
+        user turns it, nothing happens, and there is nothing on screen saying why. This does not
+        change any value -- the tier caps what the engine derives, never what is stored -- so
+        raising the tier brings the control back exactly where it was left.
+    */
+    void applyPerformanceTierVisibility();
     void chooseProjectToSave();
     void chooseProjectToOpen();
 
@@ -72,6 +80,8 @@ private:
 
     juce::Label engineCaption;
     juce::ComboBox engineModeSelector;
+    juce::Label performanceCaption;
+    juce::ComboBox performanceSelector;
     juce::ToggleButton bypass { "BYPASS" };
     juce::ToggleButton proMode { "PRO" };
 
@@ -112,6 +122,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> outputAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> engineModeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> performanceAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TubeForgeAudioProcessorEditor)
 };

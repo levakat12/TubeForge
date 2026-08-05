@@ -3,6 +3,82 @@
 
 #include "PluginProcessorInternal.h"
 
+namespace
+{
+/** The outcome of reading an exported model artifact directory and staging what is in it.
+
+    `cancelled` is not a failure: the worker was asked to stop, usually because a newer load
+    replaced it, and it must leave the status line alone rather than overwriting the newer
+    load's own message with a stale one.
+*/
+struct ArtifactStageResult
+{
+    bool ok {};
+    bool cancelled {};
+    std::string message;
+};
+
+/** Validates an artifact directory and stages its model into `target`.
+
+    Shared by the amplifier's neural engine and by every pedal slot, so a capture loaded as a
+    pedal gets exactly the guarantees one loaded as an amplifier does: manifest schema, a
+    SHA-256 over model.bin that has to match the manifest, and the exported test vectors run
+    through the model before it is allowed anywhere near the audio thread.
+
+    Runs on a worker: it reads files and runs inference.
+*/
+ArtifactStageResult stageArtifactDirectory(const juce::File& artifactDirectory,
+                                           nts::ml::NeuralAmpProcessor& target,
+                                           const std::stop_token& stopToken)
+{
+    const auto fail = [](std::string message) { return ArtifactStageResult { false, false, std::move(message) }; };
+    const auto modelFile = artifactDirectory.getChildFile("model.bin");
+    const auto inputFile = artifactDirectory.getChildFile("test-vectors").getChildFile("input.f32");
+    const auto outputFile = artifactDirectory.getChildFile("test-vectors").getChildFile("output.f32");
+    const auto metadataFile = artifactDirectory.getChildFile("test-vectors").getChildFile("metadata.json");
+    const auto normalizationFile = artifactDirectory.getChildFile("normalization.json");
+    const auto manifestFile = artifactDirectory.getChildFile("manifest.json");
+    if (! modelFile.existsAsFile() || ! inputFile.existsAsFile() || ! outputFile.existsAsFile()
+        || ! metadataFile.existsAsFile() || ! normalizationFile.existsAsFile() || ! manifestFile.existsAsFile())
+        return fail("Model artifact is incomplete");
+    juce::var manifest;
+    if (juce::JSON::parse(manifestFile.loadFileAsString(), manifest).failed() || ! manifest.isObject())
+        return fail("Model manifest is invalid");
+    // 3 is the WaveNet format that `nts-nam-import` produces from a Neural Amp Modeler capture.
+    const auto formatVersion = static_cast<int>(manifest.getProperty("modelFormatVersion", 0));
+    if (formatVersion < 1 || formatVersion > 3)
+        return fail("Model manifest schema is unsupported");
+    juce::MemoryBlock modelBlock, inputBlock, outputBlock;
+    if (! modelFile.loadFileAsData(modelBlock) || ! inputFile.loadFileAsData(inputBlock)
+        || ! outputFile.loadFileAsData(outputBlock) || inputBlock.getSize() == 0
+        || inputBlock.getSize() != outputBlock.getSize() || inputBlock.getSize() % sizeof(float) != 0)
+        return fail("Model or test-vector data is invalid");
+    const auto expectedHash = manifest.getProperty("sha256", "").toString();
+    const auto actualHash = juce::SHA256(modelBlock.getData(), modelBlock.getSize()).toHexString();
+    if (expectedHash.isEmpty() || ! actualHash.equalsIgnoreCase(expectedHash))
+        return fail("model.bin SHA-256 does not match the manifest");
+    const auto sampleCount = inputBlock.getSize() / sizeof(float);
+    std::vector<float> testInput(sampleCount), expectedOutput(sampleCount);
+    std::memcpy(testInput.data(), inputBlock.getData(), inputBlock.getSize());
+    std::memcpy(expectedOutput.data(), outputBlock.getData(), outputBlock.getSize());
+    juce::var metadata, normalization;
+    if (juce::JSON::parse(metadataFile.loadFileAsString(), metadata).failed()
+        || juce::JSON::parse(normalizationFile.loadFileAsString(), normalization).failed())
+        return fail("Model validation metadata is invalid");
+    const auto maximumError = static_cast<float>(static_cast<double>(
+        metadata.getProperty("maximumAbsoluteErrorTolerance", 1.0e-5)));
+    const auto expectedRms = static_cast<float>(static_cast<double>(
+        normalization.getProperty("inputRmsDb", -21.0)));
+    if (stopToken.stop_requested()) return { false, true, {} };
+    std::string error;
+    const auto bytes = std::span(reinterpret_cast<const std::byte*>(modelBlock.getData()),
+                                 modelBlock.getSize());
+    if (! target.stageModel(bytes, testInput, expectedOutput, maximumError, expectedRms, error))
+        return fail(std::move(error));
+    return { true, false, "Ready: " + artifactDirectory.getFileName().toStdString() };
+}
+} // namespace
+
 void TubeForgeAudioProcessor::requestCabinetIrLoad(int slot, const juce::File& irFile)
 {
     if (slot < 0 || slot > 1) return;
@@ -60,6 +136,30 @@ void TubeForgeAudioProcessor::applyCabinetIr(int slot)
         if (prepared.channels.empty()) return;
         left = prepared.channels.front();
         right = prepared.channels.size() > 1 ? prepared.channels[1] : std::vector<float> {};
+    }
+
+    // The performance tier's largest single lever. Direct convolution is O(taps) per sample, so
+    // a 4096-tap response costs sixteen times a 256-tap one, and a guitar cabinet's response
+    // past the first few milliseconds is mostly room rather than speaker. Applied here, on the
+    // message thread, so the audio path only ever sees an already-short response.
+    //
+    // Faded rather than cut: a hard truncation is a step in the impulse, and a step in an
+    // impulse is broadband splatter at the top of the spectrum.
+    if (const auto taps = tierLimits().maximumImpulseTaps; taps > 0)
+    {
+        const auto shorten = [taps](std::vector<float>& response)
+        {
+            if (response.size() <= taps) return;
+            response.resize(taps);
+            const auto fade = std::min<std::size_t>(32, taps);
+            for (std::size_t index = 0; index < fade; ++index)
+            {
+                const auto gain = static_cast<float>(fade - index) / static_cast<float>(fade);
+                response[taps - fade + index] *= gain;
+            }
+        };
+        shorten(left);
+        shorten(right);
     }
 
     nts::amp::CabinetMetadata metadata;
@@ -142,64 +242,130 @@ void TubeForgeAudioProcessor::requestNeuralModelLoad(const juce::File& artifactD
 void TubeForgeAudioProcessor::loadNeuralArtifact(std::stop_token stopToken,
                                                  juce::File artifactDirectory)
 {
-    const auto fail = [this](std::string message)
-    {
-        {
-            const std::scoped_lock lock(neuralStatusMutex);
-            neuralStatusDetail = std::move(message);
-        }
-        neuralLoadStatus.store(nts::diagnostics::AssetLoadStatus::failed, std::memory_order_relaxed);
-        diagnostics.setModelLoadStatus(nts::diagnostics::AssetLoadStatus::failed);
-    };
-    const auto modelFile = artifactDirectory.getChildFile("model.bin");
-    const auto inputFile = artifactDirectory.getChildFile("test-vectors").getChildFile("input.f32");
-    const auto outputFile = artifactDirectory.getChildFile("test-vectors").getChildFile("output.f32");
-    const auto metadataFile = artifactDirectory.getChildFile("test-vectors").getChildFile("metadata.json");
-    const auto normalizationFile = artifactDirectory.getChildFile("normalization.json");
-    const auto manifestFile = artifactDirectory.getChildFile("manifest.json");
-    if (! modelFile.existsAsFile() || ! inputFile.existsAsFile() || ! outputFile.existsAsFile()
-        || ! metadataFile.existsAsFile() || ! normalizationFile.existsAsFile() || ! manifestFile.existsAsFile())
-    { fail("Model artifact is incomplete"); return; }
-    juce::var manifest;
-    if (juce::JSON::parse(manifestFile.loadFileAsString(), manifest).failed() || ! manifest.isObject())
-    { fail("Model manifest is invalid"); return; }
-    // 3 is the WaveNet format that `nts-nam-import` produces from a Neural Amp Modeler capture.
-    const auto formatVersion = static_cast<int>(manifest.getProperty("modelFormatVersion", 0));
-    if (formatVersion < 1 || formatVersion > 3)
-    { fail("Model manifest schema is unsupported"); return; }
-    juce::MemoryBlock modelBlock, inputBlock, outputBlock;
-    if (! modelFile.loadFileAsData(modelBlock) || ! inputFile.loadFileAsData(inputBlock)
-        || ! outputFile.loadFileAsData(outputBlock) || inputBlock.getSize() == 0
-        || inputBlock.getSize() != outputBlock.getSize() || inputBlock.getSize() % sizeof(float) != 0)
-    { fail("Model or test-vector data is invalid"); return; }
-    const auto expectedHash = manifest.getProperty("sha256", "").toString();
-    const auto actualHash = juce::SHA256(modelBlock.getData(), modelBlock.getSize()).toHexString();
-    if (expectedHash.isEmpty() || ! actualHash.equalsIgnoreCase(expectedHash))
-    { fail("model.bin SHA-256 does not match the manifest"); return; }
-    const auto sampleCount = inputBlock.getSize() / sizeof(float);
-    std::vector<float> testInput(sampleCount), expectedOutput(sampleCount);
-    std::memcpy(testInput.data(), inputBlock.getData(), inputBlock.getSize());
-    std::memcpy(expectedOutput.data(), outputBlock.getData(), outputBlock.getSize());
-    juce::var metadata, normalization;
-    if (juce::JSON::parse(metadataFile.loadFileAsString(), metadata).failed()
-        || juce::JSON::parse(normalizationFile.loadFileAsString(), normalization).failed())
-    { fail("Model validation metadata is invalid"); return; }
-    const auto maximumError = static_cast<float>(static_cast<double>(
-        metadata.getProperty("maximumAbsoluteErrorTolerance", 1.0e-5)));
-    const auto expectedRms = static_cast<float>(static_cast<double>(
-        normalization.getProperty("inputRmsDb", -21.0)));
-    if (stopToken.stop_requested()) return;
-    std::string error;
-    const auto bytes = std::span(reinterpret_cast<const std::byte*>(modelBlock.getData()),
-                                 modelBlock.getSize());
-    if (! neuralAmp.stageModel(bytes, testInput, expectedOutput, maximumError, expectedRms, error))
-    { fail(error); return; }
+    const auto staged = stageArtifactDirectory(artifactDirectory, neuralAmp, stopToken);
+    if (staged.cancelled) return;
     {
         const std::scoped_lock lock(neuralStatusMutex);
-        neuralStatusDetail = "Ready: " + artifactDirectory.getFileName().toStdString();
+        neuralStatusDetail = staged.message;
     }
-    neuralLoadStatus.store(nts::diagnostics::AssetLoadStatus::ready, std::memory_order_relaxed);
-    diagnostics.setModelLoadStatus(nts::diagnostics::AssetLoadStatus::ready);
+    const auto status = staged.ok ? nts::diagnostics::AssetLoadStatus::ready
+                                  : nts::diagnostics::AssetLoadStatus::failed;
+    neuralLoadStatus.store(status, std::memory_order_relaxed);
+    diagnostics.setModelLoadStatus(status);
+}
+
+void TubeForgeAudioProcessor::requestPedalModelLoad(int slot, const juce::File& artifactDirectory)
+{
+    if (slot < 0 || slot >= static_cast<int>(nts::pedals::slotCount)) return;
+    const auto index = static_cast<std::size_t>(slot);
+    {
+        const std::scoped_lock lock(pedalModelMutex);
+        pedalModelSlots[index].status = "Loading " + artifactDirectory.getFileName().toStdString();
+    }
+    // Move-assigning a running jthread stops and joins it first, so a second load into the
+    // same slot replaces the first rather than racing it. Slots do not share a worker, so
+    // loading into one never cancels another.
+    pedalLoaders[index] = std::jthread(
+        [this, index, artifactDirectory](std::stop_token stopToken)
+        {
+            const auto staged = stageArtifactDirectory(
+                artifactDirectory, pedalBoard.slot(index).model(), stopToken);
+            if (staged.cancelled) return;
+            const std::scoped_lock lock(pedalModelMutex);
+            // The path is kept only on success, so a project saved after a failed load does
+            // not point at something that will fail again on the next open.
+            if (staged.ok) pedalModelSlots[index].file = artifactDirectory;
+            pedalModelSlots[index].status = staged.message;
+        });
+}
+
+juce::String TubeForgeAudioProcessor::pedalModelStatusText(int slot) const
+{
+    if (slot < 0 || slot >= static_cast<int>(nts::pedals::slotCount)) return {};
+    const std::scoped_lock lock(pedalModelMutex);
+    return juce::String::fromUTF8(pedalModelSlots[static_cast<std::size_t>(slot)].status.c_str());
+}
+
+juce::File TubeForgeAudioProcessor::pedalModelFile(int slot) const
+{
+    if (slot < 0 || slot >= static_cast<int>(nts::pedals::slotCount)) return {};
+    const std::scoped_lock lock(pedalModelMutex);
+    return pedalModelSlots[static_cast<std::size_t>(slot)].file;
+}
+
+void TubeForgeAudioProcessor::requestCaptureImport(const juce::File& source, nts::nam::Tier tier)
+{
+    if (source == juce::File {}) return;
+    importRunning.store(true, std::memory_order_relaxed);
+    importProgress.store(0.0f, std::memory_order_relaxed);
+    {
+        const std::scoped_lock lock(importStatusMutex);
+        importStatus = "Reading " + source.getFileName().toStdString();
+    }
+    // Move-assignment stops and joins any import already running, so starting a second one
+    // replaces the first rather than letting two workers write the same artifact directories.
+    captureImporter = std::jthread(
+        [this, source, tier](std::stop_token stopToken)
+        {
+            // The worker gets its own view of the same directory rather than sharing the
+            // library the editor is reading. Both only ever read the filesystem concurrently;
+            // the shared library's in-memory list is rebuilt on the message thread below, so it
+            // is never mutated out from under a page that is drawing it.
+            nts::nam::CaptureLibrary worker(captureLibraryPath());
+            const auto report = worker.import(
+                source, tier, stopToken,
+                [this](int done, int total, const juce::String& label)
+                {
+                    importProgress.store(total > 0 ? static_cast<float>(done) / static_cast<float>(total)
+                                                   : 1.0f,
+                                         std::memory_order_relaxed);
+                    {
+                        const std::scoped_lock lock(importStatusMutex);
+                        importStatus = "Converting " + std::to_string(done + 1) + " of "
+                                     + std::to_string(total)
+                                     + (label.isEmpty() ? std::string {} : ": " + label.toStdString());
+                    }
+                    // Rescan periodically rather than only at the end, so an archive of hundreds
+                    // fills the list as it goes instead of appearing all at once after a minute
+                    // of apparently nothing happening. A partly written artifact cannot be seen:
+                    // its sidecar is the last file written, and the library ignores a directory
+                    // without one.
+                    if (done > 0 && done % 16 == 0)
+                    {
+                        pendingCaptureRefresh.store(true, std::memory_order_release);
+                        triggerAsyncUpdate();
+                    }
+                });
+
+            std::string summary;
+            if (report.cancelled > 0)
+                summary = "Cancelled with " + std::to_string(report.cancelled) + " left to convert; ";
+            summary += std::to_string(report.converted) + " converted";
+            if (report.reused > 0) summary += ", " + std::to_string(report.reused) + " already imported";
+            if (report.failed > 0) summary += ", " + std::to_string(report.failed) + " refused";
+            // The first refusal, verbatim. A count alone tells the user something went wrong
+            // without telling them the one thing that would let them do anything about it.
+            if (! report.messages.empty()) summary += " -- " + report.messages.front();
+            {
+                const std::scoped_lock lock(importStatusMutex);
+                importStatus = std::move(summary);
+            }
+            importProgress.store(1.0f, std::memory_order_relaxed);
+            importRunning.store(false, std::memory_order_relaxed);
+            pendingCaptureRefresh.store(true, std::memory_order_release);
+            triggerAsyncUpdate();
+        });
+}
+
+void TubeForgeAudioProcessor::cancelCaptureImport()
+{
+    if (captureImporter.joinable()) captureImporter.request_stop();
+}
+
+juce::String TubeForgeAudioProcessor::captureImportStatusText() const
+{
+    const std::scoped_lock lock(importStatusMutex);
+    return juce::String::fromUTF8(importStatus.c_str());
 }
 
 void TubeForgeAudioProcessor::loadPackagedNeuralModel(std::stop_token stopToken,
@@ -234,7 +400,19 @@ void TubeForgeAudioProcessor::loadPackagedNeuralModel(std::stop_token stopToken,
     if (stopToken.stop_requested()) return;
     std::string error;
     const auto bytes = std::span(reinterpret_cast<const std::byte*>(modelBlock.getData()), modelBlock.getSize());
-    if (! neuralAmp.stageModel(bytes, testInput, expectedOutput, tolerance, -21.0f, error))
+    // The capture's own declared calibration, where it ships one. This used to pass a flat -21 dB
+    // regardless, so a capture made at any other level was told the wrong thing about its input and
+    // the compensation built on top of that reading was off by the difference. `stageArtifactDirectory`
+    // already reads the same field; this path was the inconsistent one. The fallback stays -21 because
+    // that is the runtime default the older packages were exported against.
+    auto expectedRms = -21.0f;
+    juce::var normalization;
+    const auto normalizationFile = packageDirectory.getChildFile("normalization.json");
+    if (normalizationFile.existsAsFile()
+        && ! juce::JSON::parse(normalizationFile.loadFileAsString(), normalization).failed())
+        expectedRms = static_cast<float>(static_cast<double>(
+            normalization.getProperty("inputRmsDb", -21.0)));
+    if (! neuralAmp.stageModel(bytes, testInput, expectedOutput, tolerance, expectedRms, error))
     { fail(error); return; }
     { const std::scoped_lock lock(neuralStatusMutex); neuralStatusDetail = "Ready: " + packageDirectory.getFileName().toStdString(); }
     neuralLoadStatus.store(nts::diagnostics::AssetLoadStatus::ready, std::memory_order_relaxed);
@@ -352,7 +530,7 @@ juce::Result TubeForgeAudioProcessor::applyTonePackage(const juce::String& packa
     if (! preset) return juce::Result::fail("Profile rig failed schema validation");
     const auto& p = preset->parameters;
     setParameterValue(parameterState, ParameterIds::instrument, p.instrument == nts::amp::Instrument::bass ? 1.0f : 0.0f);
-    setParameterValue(parameterState, ParameterIds::topology, p.topology == nts::amp::Topology::vintageBloom ? 1.0f : 0.0f);
+    setParameterValue(parameterState, ParameterIds::topology, static_cast<float>(static_cast<int>(p.topology)));
     setParameterValue(parameterState, ParameterIds::gain, 5.0f);
     setParameterValue(parameterState, ParameterIds::bass, p.toneStack.bass * 10.0f);
     setParameterValue(parameterState, ParameterIds::mid, p.toneStack.mid * 10.0f);
@@ -383,6 +561,7 @@ juce::Result TubeForgeAudioProcessor::applyTonePackage(const juce::String& packa
     setParameterValue(parameterState, ParameterIds::gateAttack, p.gateAttackMs);
     setParameterValue(parameterState, ParameterIds::gateHold, p.gateHoldMs);
     setParameterValue(parameterState, ParameterIds::gateRelease, p.gateReleaseMs);
+    setParameterValue(parameterState, ParameterIds::loudnessMatch, p.loudnessMatch ? 1.0f : 0.0f);
     setParameterValue(parameterState, ParameterIds::sag, p.powerAmp.sag * 100.0f);
     setParameterValue(parameterState, ParameterIds::feedback, p.powerAmp.feedback * 100.0f);
     setParameterValue(parameterState, ParameterIds::crossover, p.bass.crossoverHz);

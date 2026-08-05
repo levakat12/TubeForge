@@ -38,8 +38,23 @@ struct PortSchema
 
 struct TubeDefinition
 {
-    std::string id;
-    std::string family;
+    /** Views, not strings, so `TubeLibrary`'s table can be what it says it is.
+
+        The table in Components.cpp is declared `constexpr`, which is ill-formed for a type holding
+        `std::string`: constant evaluation may allocate transiently but the result cannot persist in
+        a constexpr object, and MSVC rejects it outright with C2131. The whole `nts_circuit` library
+        failed to compile as a result, and with it every target that links it -- including the
+        plug-in.
+
+        Views are the right fix rather than the smallest one. Every entry is a string literal with
+        static storage duration, so the views outlive any use of them; the fields are only ever
+        compared against a `std::string_view` or read; and nothing outside this library constructs a
+        `TubeDefinition`. Making the table `const` instead would have compiled equally well while
+        introducing dynamic initialisation at static-init time for a lookup table inside an audio
+        plug-in, which is a worse trade for one saved word.
+    */
+    std::string_view id;
+    std::string_view family;
     float amplificationFactor {};
     float plateResistanceOhms {};
     float transconductanceSiemens {};

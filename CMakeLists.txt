@@ -1,10 +1,44 @@
 cmake_minimum_required(VERSION 3.22)
 
+# Refuse to reconfigure an existing build tree with a different CMake than built it.
+#
+# Two CMake installations are common on a Windows dev box -- one per Visual Studio -- and whichever
+# is first on PATH wins. Building with the wrong one is harmless until something forces a
+# reconfigure, at which point compiler re-detection fails against the cached toolchain, the
+# generator cannot regenerate its project files, and `cmake --build` goes on reporting success while
+# silently building nothing new. That failure mode cost real debugging time: source files newer than
+# their own object files, a plug-in binary missing changes that had definitely been compiled, and a
+# UI bug that looked unfixed because the fix was never in the binary.
+#
+# Checked before `project()` on purpose: that is where the re-detection blows up, so a guard after it
+# never runs. Cache variables are loaded before this file is processed, so the comparison is
+# available this early.
+if(DEFINED CMAKE_CACHE_MAJOR_VERSION)
+    set(TUBEFORGE_CACHED_CMAKE
+        "${CMAKE_CACHE_MAJOR_VERSION}.${CMAKE_CACHE_MINOR_VERSION}.${CMAKE_CACHE_PATCH_VERSION}")
+    if(NOT TUBEFORGE_CACHED_CMAKE VERSION_EQUAL CMAKE_VERSION)
+        message(FATAL_ERROR
+            "This build tree was configured by CMake ${TUBEFORGE_CACHED_CMAKE}, but CMake "
+            "${CMAKE_VERSION} is running (${CMAKE_COMMAND}).\n"
+            "Reconfiguring across versions fails on compiler re-detection and leaves the tree "
+            "building stale objects while still reporting success.\n"
+            "Either build with the CMake that configured this tree, or delete "
+            "${CMAKE_BINARY_DIR}/CMakeCache.txt and configure again from scratch with the one you "
+            "want.")
+    endif()
+endif()
+
 project(TubeForge VERSION 0.10.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# The project version, reachable from code. `JucePlugin_VersionString` exists only on targets
+# juce_add_plugin created, so the shell sources -- which are also compiled into the wrapper tests
+# and the standalone app -- cannot use it. Defined globally because a version string costs nothing
+# and a per-target definition is the kind of thing that gets missed when a target is added.
+add_compile_definitions(TUBEFORGE_VERSION_STRING="${PROJECT_VERSION}")
 
 if(MSVC)
     # Keep optimized Release binaries while emitting separate PDBs for crash-symbol processing.
@@ -99,8 +133,28 @@ add_library(nts_dsp STATIC
     engine/dsp/src/PitchDetector.cpp
     engine/dsp/src/Regression.cpp
     engine/dsp/src/Simd.cpp
+    engine/dsp/src/SimdAvx2.cpp
 )
 target_include_directories(nts_dsp PUBLIC engine/dsp/include)
+
+# The AVX2 kernel, and only it, is compiled at a wider instruction set. The rest of the engine
+# stays at the SSE2 baseline, which is the floor this plug-in has to keep running on -- raising it
+# globally would trade a crash on older hardware for a speedup nobody asked for.
+#
+# The guard is at run time, not build time: Simd.cpp checks CPUID and the OS's YMM state before it
+# will dispatch here. That is why this file must hold exactly one function and no static state --
+# anything with an initialiser in this translation unit would execute before that check.
+if(MSVC)
+    set_source_files_properties(engine/dsp/src/SimdAvx2.cpp PROPERTIES
+        COMPILE_OPTIONS "/arch:AVX2;/DNTS_BUILD_AVX2")
+else()
+    set_source_files_properties(engine/dsp/src/SimdAvx2.cpp PROPERTIES
+        COMPILE_OPTIONS "-mavx2;-mfma;-DNTS_BUILD_AVX2")
+endif()
+# Simd.cpp needs to know a real AVX2 kernel exists before it will dispatch to one, but must not
+# itself be compiled wide.
+set_source_files_properties(engine/dsp/src/Simd.cpp PROPERTIES
+    COMPILE_DEFINITIONS "NTS_BUILD_AVX2")
 
 add_library(nts_amp STATIC
     engine/amp/src/TraditionalAmp.cpp
@@ -141,6 +195,24 @@ add_library(nts_ml_runtime STATIC
     engine/ml-runtime/src/NeuralAmpProcessor.cpp
 )
 target_include_directories(nts_ml_runtime PUBLIC engine/ml-runtime/include)
+# For the shared SIMD kernels. Deliberately a link rather than an inline header: the runtime
+# instruction-set dispatch this is heading for needs these kernels in translation units of their
+# own so a second copy can be compiled at a wider instruction set. Every consumer of
+# nts_ml_runtime already has nts_dsp in its dependency graph.
+target_link_libraries(nts_ml_runtime PUBLIC nts_dsp)
+
+add_library(nts_nam STATIC
+    engine/nam/src/Capture.cpp
+    engine/nam/src/CaptureLibrary.cpp
+)
+target_include_directories(nts_nam PUBLIC engine/nam/include)
+target_link_libraries(nts_nam PUBLIC nts_ml_runtime juce::juce_core juce::juce_cryptography)
+
+add_library(nts_pedals STATIC
+    engine/pedals/src/PedalBoard.cpp
+)
+target_include_directories(nts_pedals PUBLIC engine/pedals/include)
+target_link_libraries(nts_pedals PUBLIC nts_dsp nts_ml_runtime)
 
 add_library(nts_circuit STATIC
     engine/circuit/src/CircuitTypes.cpp
@@ -179,11 +251,24 @@ add_library(nts_ecosystem STATIC
 target_include_directories(nts_ecosystem PUBLIC engine/ecosystem/include)
 target_link_libraries(nts_ecosystem PUBLIC nts_amp nts_ml_runtime juce::juce_cryptography)
 
-foreach(target nts_audio_core nts_dsp nts_amp nts_diagnostics nts_state nts_ir nts_ml_runtime nts_circuit nts_tone_analysis nts_reconstruction nts_assistant nts_ecosystem)
+foreach(target nts_audio_core nts_dsp nts_amp nts_diagnostics nts_state nts_ir nts_ml_runtime nts_nam nts_pedals nts_circuit nts_tone_analysis nts_reconstruction nts_assistant nts_ecosystem)
     target_link_libraries(${target} PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags
     )
+    # Whole-program optimisation is deliberately NOT applied here, having been tried and measured.
+    #
+    # The hypothesis was that /GL would let dsp::dotProduct inline into its callers and remove the
+    # cross-translation-unit call that forces that kernel to carry a length threshold. Measured on
+    # the DSP, amplifier and ML benchmarks, the result was inside run-to-run noise: one amplifier
+    # configuration appeared 9% faster and another 7% slower across rebuilds. It is not a win this
+    # harness can resolve, and it costs build time on every target, because these libraries are
+    # linked PUBLIC and the flag would propagate to all twenty-three test executables.
+    #
+    # It also cannot simply be switched on: MSVC's Address Sanitizer cannot be combined with /GL,
+    # and the ASan configuration works by building the test targets against these libraries
+    # precisely because they do not carry the plug-in's whole-program flags. Any future attempt
+    # needs the `if(NOT TUBEFORGE_ENABLE_SANITIZERS)` guard and a quieter machine to measure on.
     tubeforge_set_warning_policy(${target})
 endforeach()
 
@@ -227,10 +312,22 @@ target_sources(TubeForge PRIVATE
     Source/ui/ShellWidgets.h
     Source/ui/AmplifierPage.cpp
     Source/ui/AmplifierPage.h
+    Source/ui/FaceplateArt.cpp
+    Source/ui/FaceplateArt.h
+    Source/ui/GearPicker.cpp
+    Source/ui/GearPicker.h
     Source/ui/ToneShapingPage.cpp
     Source/ui/ToneShapingPage.h
     Source/ui/NeuralCapturePage.cpp
     Source/ui/NeuralCapturePage.h
+    Source/ui/PedalArt.cpp
+    Source/ui/PedalArt.h
+    Source/ui/PedalboardPage.cpp
+    Source/ui/PedalboardPage.h
+    Source/ui/CapturePicker.cpp
+    Source/ui/CapturePicker.h
+    Source/ui/CapturesPage.cpp
+    Source/ui/CapturesPage.h
     Source/ui/ToneAssistantPage.cpp
     Source/ui/ToneAssistantPage.h
     Source/ui/ProfileLibraryPage.cpp
@@ -301,6 +398,8 @@ target_link_libraries(TubeForge PRIVATE
     nts_assistant
     nts_ecosystem
     nts_ml_runtime
+    nts_nam
+    nts_pedals
     nts_diagnostics
     nts_state
     juce::juce_audio_utils
@@ -331,10 +430,22 @@ target_sources(nts_standalone_app PRIVATE
     Source/ui/ShellWidgets.h
     Source/ui/AmplifierPage.cpp
     Source/ui/AmplifierPage.h
+    Source/ui/FaceplateArt.cpp
+    Source/ui/FaceplateArt.h
+    Source/ui/GearPicker.cpp
+    Source/ui/GearPicker.h
     Source/ui/ToneShapingPage.cpp
     Source/ui/ToneShapingPage.h
     Source/ui/NeuralCapturePage.cpp
     Source/ui/NeuralCapturePage.h
+    Source/ui/PedalArt.cpp
+    Source/ui/PedalArt.h
+    Source/ui/PedalboardPage.cpp
+    Source/ui/PedalboardPage.h
+    Source/ui/CapturePicker.cpp
+    Source/ui/CapturePicker.h
+    Source/ui/CapturesPage.cpp
+    Source/ui/CapturesPage.h
     Source/ui/ToneAssistantPage.cpp
     Source/ui/ToneAssistantPage.h
     Source/ui/ProfileLibraryPage.cpp
@@ -376,6 +487,8 @@ target_link_libraries(nts_standalone_app PRIVATE
     nts_assistant
     nts_ecosystem
     nts_ml_runtime
+    nts_nam
+    nts_pedals
     nts_diagnostics
     nts_state
     juce::juce_audio_utils
@@ -436,6 +549,21 @@ if(TUBEFORGE_BUILD_TESTS)
     target_link_libraries(nts_ml_runtime_benchmarks PRIVATE nts_ml_runtime)
     add_test(NAME nts_ml_runtime_performance COMMAND nts_ml_runtime_benchmarks)
 
+    add_executable(nts_pedal_tests Tests/PedalTests.cpp)
+    target_include_directories(nts_pedal_tests PRIVATE Tests)
+    target_link_libraries(nts_pedal_tests PRIVATE nts_pedals)
+    add_test(NAME nts_pedal_tests COMMAND nts_pedal_tests)
+
+    add_executable(nts_nam_tests Tests/NamTests.cpp)
+    target_include_directories(nts_nam_tests PRIVATE Tests)
+    target_link_libraries(nts_nam_tests PRIVATE nts_nam)
+    add_test(NAME nts_nam_tests COMMAND nts_nam_tests)
+
+    # Emits the converter's model.bin for one capture so the parity driver can compare it, byte
+    # for byte, with what nts-nam-import writes for the same file.
+    add_executable(nts_nam_cli Tests/NamCli.cpp)
+    target_link_libraries(nts_nam_cli PRIVATE nts_nam)
+
     add_executable(nts_circuit_tests Tests/CircuitTests.cpp)
     target_include_directories(nts_circuit_tests PRIVATE Tests)
     target_link_libraries(nts_circuit_tests PRIVATE nts_circuit)
@@ -466,15 +594,17 @@ if(TUBEFORGE_BUILD_TESTS)
     # compile JUCE's vendored codec C (libvorbis and friends), which does not build
     # warning-clean and is not ours to fix.
     foreach(target nts_ml_runtime_tests nts_ml_runtime_cli nts_ml_runtime_benchmarks
-                   nts_circuit_tests nts_tone_analysis_tests nts_reconstruction_tests
-                   nts_assistant_tests nts_ecosystem_tests)
+                   nts_pedal_tests nts_nam_tests nts_nam_cli nts_circuit_tests
+                   nts_tone_analysis_tests nts_reconstruction_tests nts_assistant_tests
+                   nts_ecosystem_tests)
         tubeforge_set_warning_policy(${target})
     endforeach()
 
     # The suites the sanitizer leg runs. Excludes the soak and VST3 host tests, whose runtimes
     # are impractical under ASan's slowdown.
-    foreach(target nts_ml_runtime_tests nts_circuit_tests nts_tone_analysis_tests
-                   nts_reconstruction_tests nts_assistant_tests nts_ecosystem_tests)
+    foreach(target nts_ml_runtime_tests nts_pedal_tests nts_nam_tests nts_circuit_tests
+                   nts_tone_analysis_tests nts_reconstruction_tests nts_assistant_tests
+                   nts_ecosystem_tests)
         tubeforge_stage_sanitizer_runtime(${target})
     endforeach()
 
@@ -490,7 +620,16 @@ if(TUBEFORGE_BUILD_TESTS)
         add_test(NAME nts_ml_torch_parity
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/ml/tests/torch_parity_driver.py
                     $<TARGET_FILE:nts_ml_runtime_cli>)
-        set_tests_properties(nts_ml_python_tests nts_ml_runtime_parity nts_ml_torch_parity PROPERTIES
+        # The plug-in carries its own .nam reader and packer so it can open a capture without an
+        # interpreter present. This is what stops that duplicate from drifting: the two converters
+        # must write byte-identical models for every capture, synthetic and real.
+        add_test(NAME nts_nam_parity
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/ml/tests/nam_parity_driver.py
+                    $<TARGET_FILE:nts_nam_cli>)
+        # ml/tests does not need to be on the path: Python puts a script's own directory on
+        # sys.path, which is how the existing drivers reach their fixture builders.
+        set_tests_properties(nts_ml_python_tests nts_ml_runtime_parity nts_ml_torch_parity
+                             nts_nam_parity PROPERTIES
             ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/ml")
     endif()
 
@@ -534,59 +673,61 @@ if(TUBEFORGE_BUILD_TESTS)
         add_test(NAME nts_asio_tests COMMAND nts_asio_tests)
     endif()
 
-    juce_add_console_app(nts_wrapper_tests PRODUCT_NAME "TubeForge Wrapper Tests")
-    target_sources(nts_wrapper_tests PRIVATE
-        Tests/WrapperTests.cpp
-        Source/PluginEditor.cpp
-        Source/PluginEditor.h
-        Source/TubeForgeTheme.h
-        Source/TubeForgeLookAndFeel.cpp
-        Source/TubeForgeLookAndFeel.h
-        Source/ui/ModulePage.h
-        Source/ui/UiSupport.cpp
-        Source/ui/UiSupport.h
-        Source/ui/ShellWidgets.cpp
-        Source/ui/ShellWidgets.h
-        Source/ui/AmplifierPage.cpp
-        Source/ui/AmplifierPage.h
-        Source/ui/ToneShapingPage.cpp
-        Source/ui/ToneShapingPage.h
-        Source/ui/NeuralCapturePage.cpp
-        Source/ui/NeuralCapturePage.h
-        Source/ui/ToneAssistantPage.cpp
-        Source/ui/ToneAssistantPage.h
-        Source/ui/ProfileLibraryPage.cpp
-        Source/ui/ProfileLibraryPage.h
-        Source/ui/CabinetPage.cpp
-        Source/ui/CabinetPage.h
-        Source/ui/TunerPage.cpp
-        Source/ui/TunerPage.h
-        Source/ui/CircuitPage.cpp
-        Source/ui/CircuitPage.h
-        Source/ui/ToneAnalyzerPage.cpp
-        Source/ui/ToneAnalyzerPage.h
-        Source/ui/SongMatchPage.cpp
-        Source/ui/SongMatchPage.h
-        Source/PluginProcessorAudio.cpp
-        Source/PluginProcessorHost.cpp
-        Source/PluginProcessorAssets.cpp
-        Source/PluginProcessorSupport.cpp
-        Source/PluginProcessorInternal.h
-        Source/PluginProcessor.h
-        Source/StudioServices.cpp
-        Source/StudioServices.h
+    # The plug-in shell -- editor, pages, and the four processor units -- as one list, so a
+    # target that needs to instantiate TubeForgeAudioProcessor does not have to repeat it.
+    set(TUBEFORGE_SHELL_SOURCES
+    Source/PluginEditor.cpp
+    Source/PluginEditor.h
+    Source/TubeForgeTheme.h
+    Source/TubeForgeLookAndFeel.cpp
+    Source/TubeForgeLookAndFeel.h
+    Source/ui/ModulePage.h
+    Source/ui/UiSupport.cpp
+    Source/ui/UiSupport.h
+    Source/ui/ShellWidgets.cpp
+    Source/ui/ShellWidgets.h
+    Source/ui/AmplifierPage.cpp
+    Source/ui/AmplifierPage.h
+    Source/ui/FaceplateArt.cpp
+    Source/ui/FaceplateArt.h
+    Source/ui/GearPicker.cpp
+    Source/ui/GearPicker.h
+    Source/ui/ToneShapingPage.cpp
+    Source/ui/ToneShapingPage.h
+    Source/ui/NeuralCapturePage.cpp
+    Source/ui/NeuralCapturePage.h
+    Source/ui/PedalArt.cpp
+    Source/ui/PedalArt.h
+    Source/ui/PedalboardPage.cpp
+    Source/ui/PedalboardPage.h
+    Source/ui/CapturePicker.cpp
+    Source/ui/CapturePicker.h
+    Source/ui/CapturesPage.cpp
+    Source/ui/CapturesPage.h
+    Source/ui/ToneAssistantPage.cpp
+    Source/ui/ToneAssistantPage.h
+    Source/ui/ProfileLibraryPage.cpp
+    Source/ui/ProfileLibraryPage.h
+    Source/ui/CabinetPage.cpp
+    Source/ui/CabinetPage.h
+    Source/ui/TunerPage.cpp
+    Source/ui/TunerPage.h
+    Source/ui/CircuitPage.cpp
+    Source/ui/CircuitPage.h
+    Source/ui/ToneAnalyzerPage.cpp
+    Source/ui/ToneAnalyzerPage.h
+    Source/ui/SongMatchPage.cpp
+    Source/ui/SongMatchPage.h
+    Source/PluginProcessorAudio.cpp
+    Source/PluginProcessorHost.cpp
+    Source/PluginProcessorAssets.cpp
+    Source/PluginProcessorSupport.cpp
+    Source/PluginProcessorInternal.h
+    Source/PluginProcessor.h
+    Source/StudioServices.cpp
+    Source/StudioServices.h
     )
-    target_include_directories(nts_wrapper_tests PRIVATE Tests Source)
-    target_compile_definitions(nts_wrapper_tests PRIVATE
-        JucePlugin_Name="TubeForge"
-        JUCE_REPORT_APP_USAGE=0
-        JUCE_USE_CURL=0
-        JUCE_WEB_BROWSER=0
-        # Test-only: lets the suite pump the message queue so asynchronous work -- a MIDI
-        # program change latched on the audio thread, for instance -- can be observed landing.
-        JUCE_MODAL_LOOPS_PERMITTED=1
-    )
-    target_link_libraries(nts_wrapper_tests PRIVATE
+    set(TUBEFORGE_SHELL_LIBRARIES
         TubeForgeAssets
         nts_audio_core
         nts_amp
@@ -597,12 +738,47 @@ if(TUBEFORGE_BUILD_TESTS)
         nts_assistant
         nts_ecosystem
         nts_ml_runtime
+        nts_nam
+        nts_pedals
         nts_diagnostics
         nts_state
         juce::juce_audio_utils
         juce::juce_cryptography
         juce::juce_dsp
     )
+
+    juce_add_console_app(nts_wrapper_tests PRODUCT_NAME "TubeForge Wrapper Tests")
+    target_sources(nts_wrapper_tests PRIVATE Tests/WrapperTests.cpp ${TUBEFORGE_SHELL_SOURCES})
+    target_include_directories(nts_wrapper_tests PRIVATE Tests Source)
+    target_compile_definitions(nts_wrapper_tests PRIVATE
+        JucePlugin_Name="TubeForge"
+        JUCE_REPORT_APP_USAGE=0
+        JUCE_USE_CURL=0
+        JUCE_WEB_BROWSER=0
+        # Test-only: lets the suite pump the message queue so asynchronous work -- a MIDI
+        # program change latched on the audio thread, for instance -- can be observed landing.
+        JUCE_MODAL_LOOPS_PERMITTED=1
+    )
+    target_link_libraries(nts_wrapper_tests PRIVATE ${TUBEFORGE_SHELL_LIBRARIES})
+
+    # Renders the drawn amplifier and pedal faces to PNGs. Not a test -- it asserts nothing and
+    # is deliberately left out of the `check` target -- but the only way to review procedural
+    # artwork is to look at it, and it links the two art files alone rather than the whole shell.
+    juce_add_console_app(nts_art_renderer PRODUCT_NAME "TubeForge Art Renderer")
+    target_sources(nts_art_renderer PRIVATE
+        Tests/ArtRenderer.cpp
+        Source/ui/FaceplateArt.cpp
+        Source/ui/FaceplateArt.h
+        Source/ui/PedalArt.cpp
+        Source/ui/PedalArt.h
+        Source/TubeForgeTheme.h)
+    target_include_directories(nts_art_renderer PRIVATE Source)
+    target_compile_definitions(nts_art_renderer PRIVATE
+        JUCE_REPORT_APP_USAGE=0
+        JUCE_USE_CURL=0
+        JUCE_WEB_BROWSER=0
+    )
+    target_link_libraries(nts_art_renderer PRIVATE nts_amp nts_pedals juce::juce_gui_basics)
 
     juce_add_console_app(nts_vst3_host_tests PRODUCT_NAME "TubeForge VST3 Host Tests")
     target_sources(nts_vst3_host_tests PRIVATE Tests/VST3HostTests.cpp)
@@ -643,6 +819,28 @@ if(TUBEFORGE_BUILD_TESTS)
     target_sources(nts_dsp_benchmarks PRIVATE Tests/DspBenchmarks.cpp)
     target_include_directories(nts_dsp_benchmarks PRIVATE Tests)
     target_link_libraries(nts_dsp_benchmarks PRIVATE nts_dsp)
+
+    # End-to-end amplifier cost across oversampling factor, cabinet length and whether the
+    # controls are moving. Not a CTest gate: it is a measurement tool, and the acceptance
+    # thresholds live on the per-component benchmarks.
+    juce_add_console_app(nts_amp_benchmarks PRODUCT_NAME "TubeForge Amp Benchmarks")
+    target_sources(nts_amp_benchmarks PRIVATE Tests/AmpBenchmarks.cpp)
+    target_include_directories(nts_amp_benchmarks PRIVATE Tests)
+    target_link_libraries(nts_amp_benchmarks PRIVATE nts_amp)
+
+    # Whole-plug-in cost through the real processBlock, per engine mode and block size. This is
+    # the only figure that includes the shared front end, pedals, gate, effects, metering and
+    # display feeds together, so it is the one that answers "will this run on that machine".
+    juce_add_console_app(nts_plugin_benchmarks PRODUCT_NAME "TubeForge Plugin Benchmarks")
+    target_sources(nts_plugin_benchmarks PRIVATE Tests/PluginBenchmarks.cpp ${TUBEFORGE_SHELL_SOURCES})
+    target_include_directories(nts_plugin_benchmarks PRIVATE Tests Source)
+    target_compile_definitions(nts_plugin_benchmarks PRIVATE
+        JucePlugin_Name="TubeForge"
+        JUCE_REPORT_APP_USAGE=0
+        JUCE_USE_CURL=0
+        JUCE_WEB_BROWSER=0
+    )
+    target_link_libraries(nts_plugin_benchmarks PRIVATE ${TUBEFORGE_SHELL_LIBRARIES})
 
     add_test(NAME nts_unit_tests COMMAND nts_unit_tests)
     tubeforge_stage_sanitizer_runtime(nts_unit_tests)

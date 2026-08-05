@@ -117,6 +117,17 @@ juce::var migrateV2ToV3(const juce::var& source)
     return migrated;
 }
 
+juce::var migrateV3ToV4(const juce::var& source)
+{
+    // A version 3 project predates the pedalboard, so it has none. An absent block reads back
+    // as an empty slot list, which is exactly the rig it described: amplifier and cabinet.
+    auto migrated = source.clone();
+    auto* root = migrated.getDynamicObject();
+    root->setProperty("schemaVersion", 4);
+    root->setProperty("pedalboard", juce::var(new juce::DynamicObject()));
+    return migrated;
+}
+
 juce::var toVar(const ProjectState& state)
 {
     auto* root = new juce::DynamicObject();
@@ -157,6 +168,23 @@ juce::var toVar(const ProjectState& state)
     assets->setProperty("cabinetIrPathA", juce::String::fromUTF8(state.assets.cabinetIrPathA.c_str()));
     assets->setProperty("cabinetIrPathB", juce::String::fromUTF8(state.assets.cabinetIrPathB.c_str()));
     root->setProperty("assets", juce::var(assets));
+
+    auto* pedalboard = new juce::DynamicObject();
+    juce::Array<juce::var> pedalSlots;
+    for (const auto& slot : state.pedalboard.slots)
+    {
+        auto* entry = new juce::DynamicObject();
+        entry->setProperty("kind", slot.kind);
+        entry->setProperty("bypassed", slot.bypassed);
+        entry->setProperty("drive", slot.drive);
+        entry->setProperty("tone", slot.tone);
+        entry->setProperty("levelDb", slot.levelDb);
+        entry->setProperty("mix", slot.mix);
+        entry->setProperty("modelPath", juce::String::fromUTF8(slot.modelPath.c_str()));
+        pedalSlots.add(juce::var(entry));
+    }
+    pedalboard->setProperty("slots", pedalSlots);
+    root->setProperty("pedalboard", juce::var(pedalboard));
     return juce::var(root);
 }
 
@@ -195,6 +223,24 @@ ProjectState fromVar(const juce::var& root)
     state.assets.relativePaths = readStringArray(assets.getProperty("relativePaths", {}));
     state.assets.cabinetIrPathA = assets.getProperty("cabinetIrPathA", "").toString().toStdString();
     state.assets.cabinetIrPathB = assets.getProperty("cabinetIrPathB", "").toString().toStdString();
+
+    const auto pedalboard = root.getProperty("pedalboard", {});
+    if (const auto* pedalSlots = pedalboard.getProperty("slots", {}).getArray())
+    {
+        state.pedalboard.slots.reserve(static_cast<std::size_t>(pedalSlots->size()));
+        for (const auto& entry : *pedalSlots)
+        {
+            PedalSlotState slot;
+            slot.kind = static_cast<int>(entry.getProperty("kind", 0));
+            slot.bypassed = static_cast<bool>(entry.getProperty("bypassed", false));
+            slot.drive = static_cast<float>(static_cast<double>(entry.getProperty("drive", 5.0)));
+            slot.tone = static_cast<float>(static_cast<double>(entry.getProperty("tone", 5.0)));
+            slot.levelDb = static_cast<float>(static_cast<double>(entry.getProperty("levelDb", 0.0)));
+            slot.mix = static_cast<float>(static_cast<double>(entry.getProperty("mix", 100.0)));
+            slot.modelPath = entry.getProperty("modelPath", "").toString().toStdString();
+            state.pedalboard.slots.push_back(std::move(slot));
+        }
+    }
     return state;
 }
 } // namespace
@@ -218,6 +264,7 @@ StateResult deserialize(std::string_view json)
     if (sourceVersion == 0) parsed = migrateV0ToV1(parsed);
     if (sourceVersion <= 1) parsed = migrateV1ToV2(parsed);
     if (sourceVersion <= 2) parsed = migrateV2ToV3(parsed);
+    if (sourceVersion <= 3) parsed = migrateV3ToV4(parsed);
 
     auto state = fromVar(parsed);
     std::string error;
@@ -276,6 +323,31 @@ bool validate(const ProjectState& state, std::string& error) noexcept
         if (path.empty() || std::filesystem::path(path).is_absolute())
         {
             error = "Asset paths must be non-empty and project-relative";
+            return false;
+        }
+    }
+    // The bound is the board's own size, not an arbitrary safety limit: a file describing more
+    // slots than exist is describing a different product, and applying the ones that do fit
+    // would silently discard the rest.
+    if (state.pedalboard.slots.size() > maximumPedalSlots)
+    {
+        error = "Pedalboard state describes more slots than exist";
+        return false;
+    }
+    for (const auto& slot : state.pedalboard.slots)
+    {
+        // Deliberately looser than the current kind count. This layer's job is to reject
+        // corruption, not to know the engine's enumeration -- a project from a later build
+        // that added a kind should still open, with the processor clamping what it applies.
+        if (slot.kind < 0 || slot.kind > 64)
+        {
+            error = "Pedal kind is outside the supported range";
+            return false;
+        }
+        if (! std::isfinite(slot.drive) || ! std::isfinite(slot.tone)
+            || ! std::isfinite(slot.levelDb) || ! std::isfinite(slot.mix))
+        {
+            error = "Pedal control state is invalid";
             return false;
         }
     }

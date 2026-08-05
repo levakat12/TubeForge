@@ -4,9 +4,11 @@
 
 #include "ui/AmplifierPage.h"
 #include "ui/CabinetPage.h"
+#include "ui/CapturesPage.h"
 #include "ui/TunerPage.h"
 #include "ui/CircuitPage.h"
 #include "ui/NeuralCapturePage.h"
+#include "ui/PedalboardPage.h"
 #include "ui/ProfileLibraryPage.h"
 #include "ui/SongMatchPage.h"
 #include "ui/ToneAnalyzerPage.h"
@@ -36,6 +38,10 @@ constexpr std::array<ModuleDescriptor, TubeForgeAudioProcessorEditor::moduleCoun
     { "Amplifier", "Core tone",
       "Set the sound here: drive, EQ and level. Everything else in TubeForge refines what you dial in on this page.",
       0, tf::ui::Glyph::amplifier },
+    { "Pedals", "In front of the amp",
+      "Up to four pedals ahead of the amplifier: built-in drives and a compressor, or a Neural "
+      "Amp Modeler pedal capture. Leave every slot on None for amp and cabinet alone.",
+      0, tf::ui::Glyph::pedalboard },
     { "Tone Shaping", "Fine control",
       "Per-stage gain, filtering, feel, power-section behaviour and the noise gate. Reach for these once the amp is close.",
       0, tf::ui::Glyph::toneShaping },
@@ -47,6 +53,10 @@ constexpr std::array<ModuleDescriptor, TubeForgeAudioProcessorEditor::moduleCoun
     { "Neural Capture", "Amp models",
       "Play through a captured amp. Load a model folder exported by the capture wizard, then choose what you monitor.",
       1, tf::ui::Glyph::neuralCapture },
+    { "Captures", "NAM library",
+      "Import Neural Amp Modeler .zip archives and .nam files. Everything inside is converted "
+      "here, in the plug-in, and sorted into amps and pedals by what the capture says it is.",
+      1, tf::ui::Glyph::captures },
     { "Tone Assistant", "Suggestions",
       "Suggests bounded changes based on what it hears. Every suggestion is previewed first; nothing is applied without you.",
       1, tf::ui::Glyph::toneAssistant },
@@ -68,8 +78,23 @@ constexpr int navBarHeight = 54;
 constexpr int railHeight = 116;
 constexpr int footerHeight = 28;
 constexpr int diagnosticsHeight = 20;
-/// Both rail clusters are this wide so the preset block between them is centred in the window.
-constexpr int railClusterWidth = 372;
+/** Rail cluster widths, each sized for what it actually holds rather than for symmetry.
+
+    They were both 372, which was wrong in both directions. The left cluster carries the input trim,
+    two selectors and the switch column -- 526 px of cells -- so `removeFromLeft` ran the rectangle
+    dry partway through: the Performance selector was clamped to 98 px instead of 140, and the switch
+    cell was then built by `withSizeKeepingCentre` from an *empty* rectangle, which re-expanded it
+    around the cluster's right edge and dropped Bypass and Pro on top of that selector. The right
+    cluster reserved the same 372 and used 88 of it, so the space the left one needed was sitting
+    unused next to it.
+
+    The preset block between them is still centred, because it centres itself inside whatever is
+    left (`withSizeKeepingCentre` on the remaining rail) rather than relying on the two clusters
+    being equal. At the 1040 px minimum window width this leaves it 366 px, against the 380 it asks
+    for at its widest -- so it clamps gracefully rather than colliding.
+*/
+constexpr int railLeftClusterWidth = 526;
+constexpr int railRightClusterWidth = 108;
 
 juce::String statusName(nts::diagnostics::AssetLoadStatus status)
 {
@@ -91,7 +116,22 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     setLookAndFeel(&lookAndFeel);
 
     tf::ui::configureLabel(title, "TUBEFORGE", 16.0f, true, theme::textPrimary);
-    tf::ui::configureLabel(productTagline, "NEURAL AMPLIFIER STUDIO", 8.0f, true, theme::textTertiary);
+    /* The version and the build date, visible rather than buried.
+
+       Six build trees exist in this repository and the plug-in is not copied to a system VST3
+       folder, so "am I running the binary that has my change in it" is a question that comes up
+       constantly and had no answer inside the running application. Compiled-in timestamps are
+       normally worth avoiding -- they defeat reproducible builds -- but this is a label in an
+       editor, not an artefact anyone ships hashes of, and the alternative is diagnosing stale
+       binaries from screenshots. */
+    tf::ui::configureLabel(productTagline,
+                           juce::String("NEURAL AMPLIFIER STUDIO   v") + TUBEFORGE_VERSION_STRING,
+                           8.0f, true, theme::textTertiary);
+    productTagline.setTooltip(juce::String("TubeForge ") + TUBEFORGE_VERSION_STRING + "\nBuilt "
+                              + __DATE__ + " " + __TIME__
+                              + "\nIf this date is older than a change you expect to see, the host is "
+                                "loading a different build than the one you think it is.");
+    title.setTooltip(productTagline.getTooltip());
 
     tf::ui::configureFieldCaption(presetCaption, "Preset");
     presetCaption.setJustificationType(juce::Justification::centred);
@@ -113,8 +153,22 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     tf::ui::configureKnob(outputGain, false);
     inputGain.setTextValueSuffix(" dB");
     outputGain.setTextValueSuffix(" dB");
+    inputGain.setTooltip("Trim into the whole chain, ahead of the pedals and every engine. Use it to "
+                         "get a guitar to the level the amp expects -- a hotter signal drives the "
+                         "front end harder, exactly as a louder pickup would.");
+    outputGain.setTooltip("Level after everything, including the effects. Purely a volume control: "
+                          "it changes nothing about the tone, so use it to match levels rather than "
+                          "to find one.");
+    inputLabel.setTooltip(inputGain.getTooltip());
+    outputLabel.setTooltip(outputGain.getTooltip());
 
     tf::ui::populateFromParameter(engineModeSelector, processor.getParameters(), "engineMode");
+    tf::ui::configureFieldCaption(performanceCaption, "Performance");
+    tf::ui::populateFromParameter(performanceSelector, processor.getParameters(), "performanceTier");
+    performanceSelector.setTooltip(
+        "How much work the engine is allowed to do. Eco caps oversampling at 1x, runs a single "
+        "cabinet, shortens impulse responses and approximates the saturation curves -- roughly a "
+        "third of Studio's CPU. Studio lifts every limit.");
     bypass.setColour(juce::ToggleButton::tickColourId, theme::bad);
     bypass.setTooltip("Pass the dry signal straight through, bypassing the whole chain.");
     proMode.setTooltip("Show the engineering modules and the live diagnostics readout.");
@@ -135,7 +189,7 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
              &presetBrowse, &engineCaption, &inputLabel, &outputLabel, &inputMeter, &outputMeter,
              &pageHost, &mode, &deviceStatus, &signalChain, &diagnosticsText, &inputGain,
              &outputGain, &bypass, &proMode, &engineModeSelector, &audioSettings, &openProject,
-             &saveProject })
+             &saveProject, &performanceCaption, &performanceSelector })
         addAndMakeVisible(*component);
 
     inputAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
@@ -146,6 +200,11 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
         processor.getParameters(), "bypass", bypass);
     engineModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor.getParameters(), "engineMode", engineModeSelector);
+    performanceAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.getParameters(), "performanceTier", performanceSelector);
+    // Controls the tier overrides read as unavailable rather than merely ignored, so the reason a
+    // knob has stopped doing anything is visible instead of being a mystery.
+    performanceSelector.onChange = [this] { applyPerformanceTierVisibility(); };
 
     audioSettings.onClick = [this]
     {
@@ -163,15 +222,19 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
 
     setActiveModule(0);
     applyProModeVisibility();
+    applyPerformanceTierVisibility();
 
     setResizable(true, true);
     setResizeLimits(1040, 700, 1800, 1200);
     setSize(1240, 820);
+    // Lets the audio thread stop filling the display-only queues when nothing is draining them.
+    owner.setEditorActive(true);
     startTimerHz(20);
 }
 
 TubeForgeAudioProcessorEditor::~TubeForgeAudioProcessorEditor()
 {
+    processor.setEditorActive(false);
     setLookAndFeel(nullptr);
 }
 
@@ -179,17 +242,19 @@ void TubeForgeAudioProcessorEditor::buildPages()
 {
     // Order must match moduleTable.
     pages[0] = std::make_unique<AmplifierPage>(processor);
-    pages[1] = std::make_unique<ToneShapingPage>(processor);
-    pages[2] = std::make_unique<TunerPage>(processor);
-    pages[3] = std::make_unique<CabinetPage>(processor);
-    pages[4] = std::make_unique<NeuralCapturePage>(processor);
-    pages[5] = std::make_unique<ToneAssistantPage>(processor);
+    pages[1] = std::make_unique<PedalboardPage>(processor);
+    pages[2] = std::make_unique<ToneShapingPage>(processor);
+    pages[3] = std::make_unique<TunerPage>(processor);
+    pages[4] = std::make_unique<CabinetPage>(processor);
+    pages[5] = std::make_unique<NeuralCapturePage>(processor);
+    pages[6] = std::make_unique<CapturesPage>(processor);
+    pages[7] = std::make_unique<ToneAssistantPage>(processor);
     auto profileLibrary = std::make_unique<ProfileLibraryPage>(processor);
     library = profileLibrary.get();
     pages[libraryModule] = std::move(profileLibrary);
-    pages[7] = std::make_unique<CircuitPage>(processor);
-    pages[8] = std::make_unique<ToneAnalyzerPage>(processor);
-    pages[9] = std::make_unique<SongMatchPage>(processor);
+    pages[9] = std::make_unique<CircuitPage>(processor);
+    pages[10] = std::make_unique<ToneAnalyzerPage>(processor);
+    pages[11] = std::make_unique<SongMatchPage>(processor);
 
     // The library is the only page with anything to say to the shell.
     library->onRigLoaded = [this](juce::String name)
@@ -243,6 +308,16 @@ void TubeForgeAudioProcessorEditor::applyProModeVisibility()
     if (! pro && activeModule >= firstProModule)
         setActiveModule(0);
     resized();
+    repaint();
+}
+
+void TubeForgeAudioProcessorEditor::applyPerformanceTierVisibility()
+{
+    const auto limits = processor.tierLimits();
+    // The pages own their own controls, so the shell tells them what the tier has taken rather
+    // than reaching into them. Anything a page does not care about is ignored.
+    for (auto& page : pages)
+        page->setPerformanceLimits(limits.maximumOversamplingFactor, limits.singleCabinet);
     repaint();
 }
 
@@ -358,8 +433,8 @@ void TubeForgeAudioProcessorEditor::layOutNavigation()
 void TubeForgeAudioProcessorEditor::layOutRail()
 {
     auto rail = railBounds.reduced(20, 10);
-    auto leftCluster = rail.removeFromLeft(railClusterWidth);
-    auto rightCluster = rail.removeFromRight(railClusterWidth);
+    auto leftCluster = rail.removeFromLeft(railLeftClusterWidth);
+    auto rightCluster = rail.removeFromRight(railRightClusterWidth);
     railDividerX = { leftCluster.getRight() + 10, rightCluster.getX() - 10 };
 
     // Input trim: caption, knob with its value underneath, peak bar. The output cluster on the
@@ -372,16 +447,33 @@ void TubeForgeAudioProcessorEditor::layOutRail()
     inputGain.setBounds(inputCell);
 
     leftCluster.removeFromLeft(20);
-    auto engineCell = leftCluster.removeFromLeft(152).withSizeKeepingCentre(152, 44);
+
+    /* The switch column is reserved from the *right* of the cluster before the selectors take
+       their share, so it cannot be pushed past the edge and cannot be rebuilt from an empty
+       rectangle. Taken from the left like everything else, an exhausted cluster left it zero-width
+       and `withSizeKeepingCentre` then grew it back around the boundary, straddling the selector
+       beside it -- the switches were drawn on top of the Performance combo. Reserving it first
+       makes that arithmetically impossible rather than merely unlikely. */
+    auto switchCell = leftCluster.removeFromRight(94).withSizeKeepingCentre(94, 64);
+    leftCluster.removeFromRight(18);
+    bypass.setBounds(switchCell.removeFromTop(28));
+    switchCell.removeFromTop(8);
+    proMode.setBounds(switchCell.removeFromTop(28));
+
+    // Whatever remains is shared between the two selectors, so a cluster narrower than its content
+    // shrinks them evenly instead of starving whichever one is laid out last.
+    constexpr int selectorGap = 14;
+    const auto selectorWidth = std::max(0, (leftCluster.getWidth() - selectorGap) / 2);
+    auto engineCell = leftCluster.removeFromLeft(selectorWidth).withSizeKeepingCentre(selectorWidth, 44);
     engineCaption.setBounds(engineCell.removeFromTop(12));
     engineCell.removeFromTop(4);
     engineModeSelector.setBounds(engineCell.removeFromTop(28));
 
-    leftCluster.removeFromLeft(18);
-    auto switchCell = leftCluster.removeFromLeft(94).withSizeKeepingCentre(94, 64);
-    bypass.setBounds(switchCell.removeFromTop(28));
-    switchCell.removeFromTop(8);
-    proMode.setBounds(switchCell.removeFromTop(28));
+    leftCluster.removeFromLeft(selectorGap);
+    auto performanceCell = leftCluster.removeFromLeft(selectorWidth).withSizeKeepingCentre(selectorWidth, 44);
+    performanceCaption.setBounds(performanceCell.removeFromTop(12));
+    performanceCell.removeFromTop(4);
+    performanceSelector.setBounds(performanceCell.removeFromTop(28));
 
     auto outputCell = rightCluster.removeFromRight(88);
     outputLabel.setBounds(outputCell.removeFromTop(12));
@@ -431,6 +523,23 @@ void TubeForgeAudioProcessorEditor::timerCallback()
     outputMeter.setLevel(std::max(meters.outputPeak(0), meters.outputPeak(1)));
     signalChain.setEngineMode(static_cast<int>(std::lround(
         processor.getParameters().getRawParameterValue("engineMode")->load(std::memory_order_relaxed))));
+
+    /* Veil the tone-editing pages while a song match runs.
+
+       Pushed to all three every tick rather than only to the visible one: the veil has to be
+       correct the instant a page is opened, and a page that was hidden when the match started
+       would otherwise appear un-veiled until the following tick. Setting it is a no-op when
+       nothing has changed, so this costs a comparison.
+
+       Amplifier, Pedals and Tone Shaping specifically -- these are the pages whose settings
+       applying a candidate overwrites. The cabinet and the tuner are left alone: a match does not
+       touch the loaded impulse responses, and tuning up while one renders is entirely reasonable. */
+    const auto matching = processor.songMatchInProgress();
+    for (const auto index : { std::size_t { 0 }, std::size_t { 1 }, std::size_t { 2 } })
+        pages[index]->setSongMatchVeil(matching,
+            "Applying one of the matched rigs will replace the drive, EQ and pedal settings on "
+            "these pages. You can still change them -- nothing here affects the match itself -- "
+            "but anything you dial in now is likely to be overwritten.");
 
     // Only the page the user is actually looking at pulls state into its views.
     pages[static_cast<std::size_t>(activeModule)]->refresh();

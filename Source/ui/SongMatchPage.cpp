@@ -8,10 +8,12 @@
 namespace theme = tf::theme;
 
 void ReconstructionView::setResult(std::optional<nts::reconstruction::ReconstructionResult> value,
-                                   juce::String status, float progress)
+                                   juce::String status, float progress,
+                                   juce::StringArray chainWarnings)
 {
     result = std::move(value); statusText = std::move(status);
-    progressValue = std::clamp(progress, 0.0f, 1.0f); repaint();
+    progressValue = std::clamp(progress, 0.0f, 1.0f);
+    warnings = std::move(chainWarnings); repaint();
 }
 
 void ReconstructionView::paint(juce::Graphics& graphics)
@@ -88,6 +90,29 @@ void ReconstructionView::paint(juce::Graphics& graphics)
                             "loudness and production differences.",
                             report.toNearestInt(), juce::Justification::centredLeft, 2);
 
+    // Taken off the bottom before the cards are measured, so a long list shortens the
+    // shortlist rather than being drawn across it.
+    if (! warnings.isEmpty())
+    {
+        constexpr auto lineHeight = 26.0f;
+        auto notice = area.removeFromBottom(std::min(area.getHeight() * 0.55f,
+            24.0f + static_cast<float>(warnings.size()) * lineHeight)).reduced(0.0f, 4.0f);
+        theme::well(graphics, notice, 6.0f);
+        notice = notice.reduced(11.0f, 7.0f);
+        graphics.setColour(theme::warn);
+        graphics.setFont(theme::font(8.5f, true));
+        theme::tracked(graphics, "STILL IN THE CHAIN", notice.removeFromTop(12.0f).toNearestInt(),
+                       juce::Justification::centredLeft, 1.0f);
+        graphics.setFont(theme::font(10.5f));
+        for (const auto& warning : warnings)
+        {
+            if (notice.getHeight() < 11.0f) break;
+            graphics.drawFittedText(warning,
+                notice.removeFromTop(std::min(notice.getHeight(), lineHeight)).toNearestInt(),
+                juce::Justification::topLeft, 2);
+        }
+    }
+
     const auto count = std::max<std::size_t>(1, reconstruction.candidates.size());
     const auto cardHeight = std::min(58.0f, area.getHeight() / static_cast<float>(count));
     for (std::size_t index = 0; index < reconstruction.candidates.size(); ++index)
@@ -131,9 +156,17 @@ SongMatchPage::SongMatchPage(TubeForgeAudioProcessor& processorToUse)
     tf::ui::configureFieldCaption(captions[1], "Listen to");
     tf::ui::configureFieldCaption(captions[2], "Part of the song");
     tf::ui::configureFieldCaption(captions[3], "Rig candidate");
+    isolateChain.setToggleState(true, juce::dontSendNotification);
+    isolateChain.setTooltip("Bypasses the four pedal slots and closes the delay and reverb sends "
+                            "when a candidate is applied. None of them were in the offline "
+                            "render the candidate was ranked from, so leaving them in means "
+                            "judging the match through a sound it was never compared against. "
+                            "Pedal slots keep their settings and their loaded models; the two "
+                            "sends have no bypass, so their mix is turned down instead.");
     for (auto* component : std::initializer_list<juce::Component*> { &importSong, &cancel,
              &applyCandidate, &exportCandidate, &target, &stereoMode, &region, &useRegion,
-             &candidate, &captions[0], &captions[1], &captions[2], &captions[3], &view })
+             &candidate, &captions[0], &captions[1], &captions[2], &captions[3], &isolateChain,
+             &view })
         addAndMakeVisible(*component);
 
     importSong.onClick = [this] { chooseSong(); };
@@ -146,7 +179,8 @@ SongMatchPage::SongMatchPage(TubeForgeAudioProcessor& processorToUse)
     applyCandidate.onClick = [this]
     {
         const auto index = std::max(0, candidate.getSelectedId() - 1);
-        (void) processor.applyReconstructionCandidate(static_cast<std::size_t>(index));
+        (void) processor.applyReconstructionCandidate(static_cast<std::size_t>(index),
+                                                      isolateChain.getToggleState());
     };
     exportCandidate.onClick = [this] { chooseExportDestination(); };
 }
@@ -162,6 +196,8 @@ void SongMatchPage::resized()
     tf::ui::layOutField(top.removeFromLeft(160), captions[1], stereoMode);
     top.removeFromLeft(12);
     cancel.setBounds(top.removeFromLeft(84).withTrimmedTop(13).withHeight(28));
+    top.removeFromLeft(16);
+    isolateChain.setBounds(top.withTrimmedTop(13).withHeight(28));
     area.removeFromTop(8);
 
     auto regionRow = area.removeFromTop(44);
@@ -216,7 +252,7 @@ void SongMatchPage::refresh()
     }
 
     view.setResult(reconstruction, processor.reconstructionStatusText(),
-                   processor.reconstructionProgress());
+                   processor.reconstructionProgress(), processor.reconstructionApplyWarnings());
     const auto candidateCount = reconstruction ? static_cast<int>(reconstruction->candidates.size()) : 0;
     if (candidate.getNumItems() != candidateCount)
     {

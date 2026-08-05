@@ -156,6 +156,42 @@ int main()
     tests.expect(mid.left == mid.right && side.left == side.right && panned.left == panned.right,
                  "mid, side, and panned-source stereo modes produce stable mono analysis views");
 
+    {
+        // A double-tracked reference has to be analysed one side at a time: the sum of two takes
+        // has a crest factor and an attack time that belong to the arrangement rather than to the
+        // amplifier, and the dynamics axis is fitted from exactly those two numbers.
+        StereoAudio layered;
+        layered.sampleRate = sampleRate;
+        layered.left.resize(static_cast<std::size_t>(sampleRate * 0.5));
+        layered.right.resize(layered.left.size());
+        // Same note both sides, but the right channel's attacks are deliberately blunter: a
+        // one-pole smoother on the transients and nothing else, so total energy stays comparable
+        // and only the transient content separates the two. The recommendation must follow the
+        // sharper side rather than the louder one.
+        float smoothed {};
+        for (std::size_t index = 0; index < layered.samples(); ++index)
+        {
+            const auto phase = 2.0 * std::numbers::pi * 110.0 * static_cast<double>(index) / sampleRate;
+            const auto pluck = static_cast<float>(std::sin(phase))
+                             * (index % 6000 < 400 ? 0.9f : 0.25f);
+            layered.left[index] = pluck;
+            smoothed += 0.02f * (pluck - smoothed);
+            layered.right[index] = smoothed * 3.0f;
+        }
+
+        tests.expectEqual(recommendStereoMode(layered, 0.8f), StereoMode::left,
+                          "a likely double-track is analysed through its sharper-picked side");
+        tests.expectEqual(recommendStereoMode(layered, 0.1f), StereoMode::fullStereo,
+                          "a reference that reads as one source keeps the full-stereo view");
+        StereoAudio mono;
+        mono.sampleRate = sampleRate;
+        mono.left = layered.left;
+        tests.expectEqual(recommendStereoMode(mono, 0.9f), StereoMode::fullStereo,
+                          "mono input has no side to choose");
+        tests.expectEqual(recommendStereoMode({}, 0.9f), StereoMode::fullStereo,
+                          "empty input is safe to recommend for");
+    }
+
     StereoAudio cleanPitch;
     cleanPitch.sampleRate = sampleRate;
     cleanPitch.left.resize(static_cast<std::size_t>(sampleRate * 2.0));
@@ -313,6 +349,68 @@ int main()
             };
             tests.expect(rank(single.candidates.front()) >= rank(shortlist.candidates.front()) - 1.0e-4f,
                          "the top candidate is the best the search found");
+        }
+
+        {
+            // The dynamics axis has to actuate, not merely be measured. Two references with the
+            // same spectrum and different transient behaviour must produce rigs that differ in
+            // the three parameters it drives -- attack reduction and pick emphasis, which no
+            // candidate ever set at all before, and supply sag.
+            //
+            // The reference is copied and its dynamic features are edited directly rather than
+            // synthesising two clips that happen to analyse differently: what is under test is
+            // the measurement-to-parameter mapping, and driving it from the measurement makes the
+            // test about that mapping instead of about the analyser.
+            auto openReference = reference;
+            openReference.tone.features.dynamic.crestFactorDb = 17.0f;
+            openReference.tone.features.dynamic.attackMilliseconds = 3.0f;
+            auto squashedReference = reference;
+            squashedReference.tone.features.dynamic.crestFactorDb = 4.0f;
+            squashedReference.tone.features.dynamic.attackMilliseconds = 32.0f;
+
+            const auto open = reconstructor.reconstruct(openReference, di, sampleRate, 1);
+            const auto squashed = reconstructor.reconstruct(squashedReference, di, sampleRate, 1);
+            tests.expect(open.success && squashed.success && ! open.candidates.empty()
+                         && ! squashed.candidates.empty(),
+                         "both dynamics references reconstruct: " + open.error + squashed.error);
+            if (open.success && squashed.success && ! open.candidates.empty()
+                && ! squashed.candidates.empty())
+            {
+                const auto& openRig = open.candidates.front().rigPreset.parameters;
+                const auto& squashedRig = squashed.candidates.front().rigPreset.parameters;
+                tests.expect(openRig.stages[0].attackReduction < squashedRig.stages[0].attackReduction,
+                             "an open reference softens the pick less than a squashed one");
+                tests.expect(openRig.preEq.pickEmphasisDb > squashedRig.preEq.pickEmphasisDb,
+                             "an open reference gets more pick emphasis than a squashed one");
+                tests.expect(openRig.powerAmp.sag < squashedRig.powerAmp.sag,
+                             "an open reference asks for less supply sag than a squashed one");
+            }
+
+            // Double-tracking corrupts both of those measurements in the same direction: two takes
+            // sum with their peaks apart, so crest factor reads low, and two pick attacks tens of
+            // milliseconds apart read as one slow attack. Neither is a property of the amplifier,
+            // so the seed corrects for it -- otherwise a hard-panned rhythm part fits a rig softer
+            // and more compressed than the one in the recording.
+            auto layeredReference = squashedReference;
+            layeredReference.tone.features.spatial.doubleTrackingLikelihood = 0.9f;
+            auto singleReference = squashedReference;
+            singleReference.tone.features.spatial.doubleTrackingLikelihood = 0.0f;
+
+            const auto layered = reconstructor.reconstruct(layeredReference, di, sampleRate, 1);
+            const auto unlayered = reconstructor.reconstruct(singleReference, di, sampleRate, 1);
+            tests.expect(layered.success && unlayered.success && ! layered.candidates.empty()
+                         && ! unlayered.candidates.empty(),
+                         "both layering references reconstruct: " + layered.error + unlayered.error);
+            if (layered.success && unlayered.success && ! layered.candidates.empty()
+                && ! unlayered.candidates.empty())
+            {
+                const auto& layeredRig = layered.candidates.front().rigPreset.parameters;
+                const auto& singleRig = unlayered.candidates.front().rigPreset.parameters;
+                tests.expect(layeredRig.stages[0].attackReduction < singleRig.stages[0].attackReduction,
+                             "the same measurements read as double-tracked soften the pick less");
+                tests.expect(layeredRig.preEq.pickEmphasisDb > singleRig.preEq.pickEmphasisDb,
+                             "the same measurements read as double-tracked keep more pick emphasis");
+            }
         }
 
         // Progress has to finish at 1 even though refinement can stop early and

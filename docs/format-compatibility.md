@@ -11,6 +11,17 @@ modulation, gated activations, grouped convolutions, an active head 1x1, seconda
 bottleneck channels differing from layer channels, and any weight vector that disagrees with the
 declared geometry.
 
+Conversion happens in two places — `nts-nam-import` and the plug-in itself — and the two are
+required to be byte-for-byte identical. `nts_nam_parity` packs every corpus capture at both tiers
+with both converters and compares the resulting `model.bin`; a single differing byte fails the
+build. That is what allows the plug-in to carry its own reader without the duplicate drifting.
+
+The two differ in one respect, and the artifact records it. `nts-nam-import` writes test vectors
+rendered by the Python implementation, which is checked against upstream `neural-amp-modeler`, so
+validating them at load time is a parity gate. The plug-in cannot render independent vectors — the
+renderer would be the implementation under test — so its artifacts carry
+`"testVectorSource": "runtime"` and their vectors establish load, priming and determinism instead.
+
 See [nam-capture-guide.md](nam-capture-guide.md) for the tools and
 [nam-integration-plan.md](nam-integration-plan.md) for the format derivation.
 
@@ -21,6 +32,7 @@ Versions evolve independently. Application SemVer changes do not imply a package
 | Format | Current writer | Accepted readers | Compatibility rule |
 |---|---:|---:|---|
 | Application | 0.10.0 | n/a | SemVer; project declares minimum runtime |
+| `.tforge` project schema | 4 | 0–4 | Each older version migrates forward in turn; newer versions rejected |
 | `.ntone` package | 1 | 1 | Unknown package versions rejected before asset reads |
 | Packed neural model | 2 | 1–2 | Architecture/version pair, dimensions, size and test vector must validate |
 | Circuit graph | 1 | 0–1 | v0 migrates to v1; newer versions rejected |

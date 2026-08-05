@@ -15,11 +15,17 @@ public:
     void refresh() override;
 
 private:
+    /// Opens the capture picker: the imported `.nam` collection, which is where an amp capture
+    /// comes from.
     void chooseModel();
+    /// The other kind of model: an artifact directory this plug-in's own capture wizard trained
+    /// and exported, which never passes through the capture library.
+    void chooseArtifactDirectory();
 
     tf::ui::SectionPanel modelPanel { "Model" };
     tf::ui::SectionPanel calibrationPanel { "Input calibration" };
-    juce::TextButton loadModel { "Load a model" };
+    juce::TextButton loadModel { "Load a capture" };
+    juce::TextButton loadArtifact { "Load a trained model" };
     juce::Label monitorCaption;
     juce::ComboBox monitorSelector;
     juce::ToggleButton compensation { "Match the model's expected input level" };

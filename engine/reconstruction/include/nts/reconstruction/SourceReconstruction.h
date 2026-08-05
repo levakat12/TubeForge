@@ -100,6 +100,24 @@ struct PlayableRegion
 
 [[nodiscard]] StereoAudio selectStem(const StemSet& stems, TargetInstrument target);
 [[nodiscard]] StereoAudio applyStereoMode(const StereoAudio& audio, StereoMode mode);
+
+/** Which stereo mode to analyse a target stem through.
+
+    `fullStereo` for anything that reads as one source, which is the safe general answer and what
+    this used to be pinned to. A hard-panned double-tracked rhythm part is the case that needs
+    something else: analysing both takes at once measures their sum, and the sum's crest factor and
+    attack time belong to the arrangement rather than to the amplifier. One side alone is a real
+    performance through a real rig, so that is what gets analysed.
+
+    The side is chosen by transient peak energy -- the sharper-picked channel -- rather than by
+    total energy, because the axis this protects is the transient one. `mid` is never recommended:
+    summing two hard-panned takes with micro-delays between them comb-filters, which is the
+    failure it would be picked to avoid.
+
+    Returns `fullStereo` for mono or near-silent input, so a caller can use it unconditionally.
+*/
+[[nodiscard]] StereoMode recommendStereoMode(const StereoAudio& audio,
+                                             float doubleTrackingLikelihood);
 [[nodiscard]] std::vector<RegionQuality> scoreRegions(const StemSet& stems, TargetInstrument target,
                                                       double regionSeconds = 5.0,
                                                       double hopSeconds = 2.5);

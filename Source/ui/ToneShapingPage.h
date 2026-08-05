@@ -15,6 +15,7 @@ public:
     explicit ToneShapingPage(TubeForgeAudioProcessor& processor);
 
     void resized() override;
+    void setPerformanceLimits(int maximumOversamplingFactor, bool singleCabinet) override;
 
     static constexpr int controlCount = 19;
 
@@ -24,6 +25,7 @@ private:
     juce::ComboBox topologySelector;
     juce::ComboBox oversamplingSelector;
     juce::ToggleButton gateEnabled { "Noise gate" };
+    juce::ToggleButton loudnessMatch { "Loudness match" };
 
     std::array<tf::ui::SectionPanel, 4> groups { tf::ui::SectionPanel { "Preamp" },
                                                  tf::ui::SectionPanel { "Filter & feel" },
@@ -35,6 +37,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> topologyAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> oversamplingAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> gateAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> loudnessMatchAttachment;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliderAttachments;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ToneShapingPage)

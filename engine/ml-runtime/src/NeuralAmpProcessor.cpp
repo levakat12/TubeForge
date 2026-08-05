@@ -57,6 +57,8 @@ void NeuralAmpProcessor::reset() noexcept
 {
     for (auto& slot : slots) for (auto& model : slot.models) model.reset();
     calibration.reset(); fadePosition = 0; fadingFromSlot = -1; resetRequested.store(false, std::memory_order_relaxed);
+    // Every instance is back at its primed state, so none is stale and nothing needs fading in.
+    monoCollapsed = false; stereoRestoreRemaining = 0;
 }
 
 bool NeuralAmpProcessor::stageModel(std::span<const std::byte> bytes,
@@ -111,6 +113,9 @@ void NeuralAmpProcessor::process(float* const* channels, std::size_t channelCoun
         if (previous >= 0 && previous != current)
             for (auto& model : slots[static_cast<std::size_t>(previous)].models) model.reset();
         calibration.reset();
+        // Both instances are primed again, so neither is stale and any pending restore fade is
+        // moot -- leaving it running would blend against an instance that no longer needs it.
+        monoCollapsed = false; stereoRestoreRemaining = 0;
     }
     const auto pending = pendingSlot.exchange(-1, std::memory_order_acq_rel);
     if (pending >= 0)
@@ -130,7 +135,27 @@ void NeuralAmpProcessor::process(float* const* channels, std::size_t channelCoun
     }
     auto compensation = 1.0f;
     if (compensateInput.load(std::memory_order_relaxed)) compensation = dbToAmplitude(calibration.reading().suggestedCompensationDb);
-    for (std::size_t channel = 0; channel < count; ++channel)
+    // Does this block carry the same signal on both channels? Exits on the first difference,
+    // so genuine stereo pays a couple of comparisons and duplicated mono pays one scan.
+    auto duplicated = count == 2;
+    if (duplicated && ! forceMonoCollapse.load(std::memory_order_relaxed))
+        for (std::size_t sample = 0; sample < samples && duplicated; ++sample)
+            duplicated = dryScratch[0][sample] == dryScratch[1][sample];
+
+    if (monoCollapsed && ! duplicated)
+    {
+        // Back to real stereo. The second instance has been idle and its state no longer
+        // corresponds to anything, so start it from its primed state and fade its output in.
+        slots[static_cast<std::size_t>(active)].models[1].reset();
+        if (fadingFromSlot >= 0) slots[static_cast<std::size_t>(fadingFromSlot)].models[1].reset();
+        stereoRestoreRemaining = stereoRestoreSamples;
+    }
+    monoCollapsed = duplicated;
+    // While restoring, both instances must run: the fade needs the second one's real output.
+    const auto inferenceChannels = duplicated && stereoRestoreRemaining == 0
+                                 ? std::size_t { 1 } : count;
+
+    for (std::size_t channel = 0; channel < inferenceChannels; ++channel)
     {
         auto& activeModel = slots[static_cast<std::size_t>(active)].models[channel]; activeModel.setControls(controlValues);
         for (std::size_t sample = 0; sample < samples; ++sample) newScratch[channel][sample] = dryScratch[channel][sample] * compensation;
@@ -142,15 +167,35 @@ void NeuralAmpProcessor::process(float* const* channels, std::size_t channelCoun
             oldModel.process(std::span(oldScratch[channel].data(), samples), std::span(oldScratch[channel].data(), samples));
         }
     }
+    // The channels the skipped instance would have produced, which for identical input is what
+    // it would have produced anyway.
+    for (std::size_t channel = inferenceChannels; channel < count; ++channel)
+    {
+        std::copy_n(newScratch[0].begin(), samples, newScratch[channel].begin());
+        if (fadingFromSlot >= 0)
+            std::copy_n(oldScratch[0].begin(), samples, oldScratch[channel].begin());
+    }
     const auto mode = monitorMode.load(std::memory_order_relaxed);
+    const auto restoreStart = stereoRestoreRemaining;
     for (std::size_t sample = 0; sample < samples; ++sample)
     {
         const auto crossfade = fadingFromSlot < 0 ? 1.0f
             : std::min(1.0f, static_cast<float>(fadePosition + sample) / static_cast<float>(fadeSamples));
+        // Fades the second instance's own output in over its reset state, which is otherwise a
+        // step from an exact copy of channel one to a model starting from silence.
+        const auto restore = restoreStart == 0 ? 1.0f
+            : std::min(1.0f, static_cast<float>(stereoRestoreSamples - restoreStart + sample)
+                             / static_cast<float>(stereoRestoreSamples));
         for (std::size_t channel = 0; channel < count; ++channel)
         {
             auto modelOutput = fadingFromSlot < 0 ? newScratch[channel][sample]
                 : oldScratch[channel][sample] + crossfade * (newScratch[channel][sample] - oldScratch[channel][sample]);
+            if (channel > 0 && restore < 1.0f)
+            {
+                const auto collapsed = fadingFromSlot < 0 ? newScratch[0][sample]
+                    : oldScratch[0][sample] + crossfade * (newScratch[0][sample] - oldScratch[0][sample]);
+                modelOutput = collapsed + restore * (modelOutput - collapsed);
+            }
             if (mode == NeuralMonitorMode::bypassDi) modelOutput = dryScratch[channel][sample];
             else if (mode == NeuralMonitorMode::loudnessMatchedModel)
                 modelOutput *= dbToAmplitude(std::clamp(-calibration.reading().mismatchDb, -6.0f, 6.0f));
@@ -162,6 +207,7 @@ void NeuralAmpProcessor::process(float* const* channels, std::size_t channelCoun
         fadePosition += samples;
         if (fadePosition >= fadeSamples) { fadingFromSlot = -1; fadePosition = 0; }
     }
+    stereoRestoreRemaining -= std::min(stereoRestoreRemaining, samples);
 }
 
 std::size_t NeuralAmpProcessor::modelMemoryBytes() const noexcept

@@ -29,6 +29,16 @@ public:
     [[nodiscard]] int sampleRate() const noexcept;
     [[nodiscard]] std::size_t memoryBytes() const noexcept;
     [[nodiscard]] bool isWaveNet() const noexcept { return wavenetSelected; }
+
+    /** Opts the recurrent architectures into approximate gate activations. Off by default.
+
+        A no-op for WaveNet captures, whose only nonlinearity is a leaky ReLU that is already two
+        instructions. See PackedTanhModel::setApproximateActivations for the trade.
+    */
+    void setApproximateActivations(bool enabled) noexcept
+    { recurrent.setApproximateActivations(enabled); }
+    [[nodiscard]] bool approximatesActivations() const noexcept
+    { return recurrent.approximatesActivations(); }
     /** Samples of history a freshly reset model needs before its output is meaningful. */
     [[nodiscard]] std::size_t warmUpSamples() const noexcept;
 

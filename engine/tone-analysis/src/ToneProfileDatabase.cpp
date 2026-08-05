@@ -176,7 +176,18 @@ SimilarityBreakdown ToneSimilarity::compare(const ToneProfile& left, const ToneP
     constexpr auto embeddingWeight = 0.30f;
     constexpr auto spectralWeight = 0.07f;
     const auto dynamicsWeight = bass ? 0.12f : 0.10f;
-    const auto transientWeight = bass ? 0.07f : 0.06f;
+    /* Raised from 0.07/0.06, taken out of `nonlinearWeight` via the subtraction below.
+
+       At 0.06 against nonlinear's 0.42 the transient term could not discriminate feel: a
+       candidate that matched the reference's harmonic content while responding to a pick quite
+       differently outscored one that got the response right, so the search had no reason to use
+       the dynamics axis even once that axis existed. Doubling it is the smallest change that lets
+       the term decide between two otherwise close rigs.
+
+       This is a judgement, not a measurement -- unlike the rest of the tone-life work it has no
+       failing case that pins the right value, so it is deliberately a modest step and wants an
+       A/B against a fixed reference clip before it moves again. Nonlinear still leads at 0.36. */
+    const auto transientWeight = bass ? 0.13f : 0.12f;
     const auto lowWeight = bass ? 0.14f : 0.05f;
     const auto nonlinearWeight = 1.0f - embeddingWeight - spectralWeight - dynamicsWeight
                                - transientWeight - lowWeight;

@@ -59,6 +59,10 @@ void TubeForgeAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     };
     sharedGate.prepare(sharedSpec);
     sharedGate.reset();
+    gateSidechain.assign(sharedSpec.channels * sharedSpec.maximumBlockSize, 0.0f);
+    // Re-prepares every slot against the new rate and block size. A staged capture stays
+    // loaded across this, exactly as the amplifier's neural engine does.
+    pedalBoard.prepare(sharedSpec);
     delayEffect.prepare(sharedSpec);
     reverbEffect.prepare(sharedSpec);
     refreshEffectParameters();
@@ -116,6 +120,7 @@ void TubeForgeAudioProcessor::releaseResources()
     traditionalAmp.reset();
     physicalCircuit.reset();
     neuralAmp.reset();
+    pedalBoard.reset();
 }
 
 bool TubeForgeAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -146,7 +151,14 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         }
     }
     const auto startedAt = diagnostics.beginCallback();
-    const auto assistantInputMeasurement = measureBuffer(buffer);
+    // Both of these feed queues that only the editor drains; see setEditorActive. Eco declines
+    // the assistant's measurement outright -- it is an advisory display, and the tier exists for
+    // machines that would rather spend the block on audio.
+    const auto tier = tierLimits();
+    const auto displayFeedsActive = editorActive.load(std::memory_order_relaxed);
+    const auto assistantActive = displayFeedsActive && tier.assistantMetering;
+    const auto assistantInputMeasurement = assistantActive ? measureBuffer(buffer)
+                                                           : BufferMeasurement {};
 
     runtimeParameters.inputGainDb.store(0.0f, std::memory_order_relaxed);
     runtimeParameters.outputGainDb.store(parameterOf(Param::output), std::memory_order_relaxed);
@@ -172,20 +184,26 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     // Feed the tuner from the untouched input, before any trim or amplifier stage: it has to
     // track the string, not what the amp does to it. Box-average while decimating so the
     // discarded samples still contribute rather than aliasing into the reading.
-    for (int sample = 0; sample < snapshotSamples; ++sample)
+    if (displayFeedsActive)
     {
-        auto sum = 0.0f;
+        const auto channelScale = 1.0f / static_cast<float>(std::max(1, snapshotChannels));
+        const auto decimationScale = 1.0f / static_cast<float>(tunerDecimationFactor);
         for (int channel = 0; channel < snapshotChannels; ++channel)
-            sum += inputSnapshot.getSample(channel, sample);
-        tunerDecimationAccumulator += sum / static_cast<float>(std::max(1, snapshotChannels));
-        if (++tunerDecimationCounter >= tunerDecimationFactor)
+            tunerReadPointers[static_cast<std::size_t>(channel)] = inputSnapshot.getReadPointer(channel);
+        for (int sample = 0; sample < snapshotSamples; ++sample)
         {
-            // A full queue simply drops the sample: the tuner is a display, and stalling the
-            // audio thread to keep it fed would be the wrong trade.
-            static_cast<void>(tunerQueue.push(tunerDecimationAccumulator
-                                              / static_cast<float>(tunerDecimationFactor)));
-            tunerDecimationAccumulator = 0.0f;
-            tunerDecimationCounter = 0;
+            auto sum = 0.0f;
+            for (int channel = 0; channel < snapshotChannels; ++channel)
+                sum += tunerReadPointers[static_cast<std::size_t>(channel)][sample];
+            tunerDecimationAccumulator += sum * channelScale;
+            if (++tunerDecimationCounter >= tunerDecimationFactor)
+            {
+                // A full queue simply drops the sample: the tuner is a display, and stalling the
+                // audio thread to keep it fed would be the wrong trade.
+                static_cast<void>(tunerQueue.push(tunerDecimationAccumulator * decimationScale));
+                tunerDecimationAccumulator = 0.0f;
+                tunerDecimationCounter = 0;
+            }
         }
     }
 
@@ -246,15 +264,49 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
             }
         }
 
-        // The gate, for the engines that have none.
+        // The pedals, between the trim and everything else.
         //
-        // Deliberately *not* hoisted out of the traditional path as well, even though that
-        // would be tidier. AmpVoice captures its dry reference between the trim and the gate,
-        // and feeds it to the loudness match; gating upstream would lower the input energy
-        // that match tracks during gated passages and quietly push its gain up. The neural and
-        // circuit engines have no such reference, so they can be gated here for free.
-        if (activeEngineMode != 0 && parameterOf(Param::gateEnabled) >= 0.5f)
+        // This is where a board sits on a real rig, and the position is the whole point: a
+        // boost in front of the amplifier drives the amplifier's own front end harder, which
+        // is a different sound from the same boost applied after it. It also puts the board
+        // ahead of the gate, so the gate is deciding about the noise the pedals actually
+        // produce rather than the noise they were given.
+        //
+        // Every engine shares it, because pedals belong to the rig rather than to one of the
+        // three ways of making the distortion -- the same reason the delay and reverb are
+        // shared at the other end of the chain.
+        for (std::size_t slot = 0; slot < nts::pedals::slotCount; ++slot)
+            pedalBoard.setParameters(slot, currentPedalParameters(slot));
+        pedalBoard.process(outputs.data(), static_cast<std::size_t>(outputCount),
+                           static_cast<std::size_t>(buffer.getNumSamples()));
+
+        /* The gate for the engines that have none: keyed here, applied after the engine.
+
+           Neither side alone works for a high-gain rig. Attenuating here means whatever survives
+           is amplified afterwards, including the gate's own decay -- the chopped-sustain
+           complaint. Keying off the output means the threshold has to clear the *amplified* noise
+           floor, which a quiet passage easily exceeds, so the gate never closes and removes
+           nothing; that is what a purely post-engine gate did, and it is why the circuit engine
+           stopped gating a -46 dBFS input at a -30 dB threshold. Detector on the input and
+           attenuation on the output is what real high-gain noise gates do, and it is the only
+           arrangement where the threshold is set in terms the player recognises and the noise
+           actually goes away.
+
+           Deliberately not hoisted out of the traditional path as well, even though that would be
+           tidier. AmpVoice captures its dry reference between the trim and the gate, and feeds it
+           to the loudness match; gating upstream would lower the input energy that match tracks
+           during gated passages and quietly push its gain up. The neural and circuit engines have
+           no such reference. */
+        const auto gateActive = activeEngineMode != 0 && parameterOf(Param::gateEnabled) >= 0.5f;
+        if (gateActive)
+            for (int channel = 0; channel < outputCount; ++channel)
+                std::copy_n(outputs[static_cast<std::size_t>(channel)], buffer.getNumSamples(),
+                            gateSidechain.data() + static_cast<std::size_t>(channel)
+                                * static_cast<std::size_t>(buffer.getNumSamples()));
+
+        const auto runSharedGate = [&]
         {
+            if (! gateActive) return;
             // Mapped with the same clamps AmpVoice uses, so the same control settings give the
             // same gate behaviour whichever engine is running.
             nts::dsp::NoiseGateParameters gate;
@@ -264,9 +316,13 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
             gate.holdMs = std::clamp(static_cast<double>(parameterOf(Param::gateHold)), 0.0, 500.0);
             gate.releaseMs = std::clamp(static_cast<double>(parameterOf(Param::gateRelease)), 5.0, 2000.0);
             sharedGate.setParameters(gate);
+            std::array<const float*, nts::dsp::maximumChannels> sidechain {};
+            for (int channel = 0; channel < outputCount; ++channel)
+                sidechain[static_cast<std::size_t>(channel)] = gateSidechain.data()
+                    + static_cast<std::size_t>(channel) * static_cast<std::size_t>(buffer.getNumSamples());
             sharedGate.process(outputs.data(), static_cast<std::size_t>(outputCount),
-                               static_cast<std::size_t>(buffer.getNumSamples()));
-        }
+                               static_cast<std::size_t>(buffer.getNumSamples()), sidechain.data());
+        };
 
         if (activeEngineMode == 1)
         {
@@ -276,7 +332,13 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
                             + parameterOf(Param::mid)
                             + parameterOf(Param::treble)) / 15.0f - 1.0f, -1.0f, 1.0f),
                 std::clamp((parameterOf(Param::master) + 24.0f) / 36.0f - 1.0f, -1.0f, 1.0f),
-                std::clamp(parameterOf(Param::topology) * 2.0f - 1.0f, -1.0f, 1.0f),
+                // Normalised across however many voicings there are, not hard-coded to two.
+                // A model conditioned on this control expects the full -1..1 span; with the
+                // old `* 2 - 1` every topology past the second pinned it at +1 and the
+                // conditioning stopped distinguishing them.
+                std::clamp(parameterOf(Param::topology)
+                               * (2.0f / static_cast<float>(nts::amp::topologyCount - 1)) - 1.0f,
+                           -1.0f, 1.0f),
                 std::clamp(parameterOf(Param::instrument) * 2.0f - 1.0f, -1.0f, 1.0f)
             };
             neuralAmp.setControls(controls);
@@ -284,6 +346,8 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
                 static_cast<int>(parameterOf(Param::neuralMonitor)), 0, 2)));
             neuralAmp.setInputCompensationEnabled(
                 parameterOf(Param::neuralCompensation) >= 0.5f);
+            neuralAmp.setForceMonoCollapse(tier.forceNeuralMonoCollapse);
+            neuralAmp.setApproximateActivations(tier.approximateNonlinearities);
             neuralAmp.process(outputs.data(), static_cast<std::size_t>(outputCount),
                               static_cast<std::size_t>(buffer.getNumSamples()));
         }
@@ -299,6 +363,11 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
             traditionalAmp.process(outputs.data(), static_cast<std::size_t>(outputCount),
                                    static_cast<std::size_t>(buffer.getNumSamples()));
         }
+
+        // Attenuate here, having keyed off the pre-engine signal above. The traditional engine is
+        // unaffected: it returns early and keeps gating inside AmpVoice, where its dry reference
+        // requires.
+        runSharedGate();
 
         // Delay then reverb, in that order: reverb on the repeats sounds like a room the
         // echoes happen in, whereas delaying a reverb tail smears it into mush.
@@ -397,20 +466,24 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     }
 
     diagnostics.endCallback(startedAt, static_cast<std::uint32_t>(buffer.getNumSamples()), absoluteSamplePosition);
-    const auto assistantOutputMeasurement = measureBuffer(buffer);
-    nts::assistant::AudioSummaryFrame assistantFrame;
-    assistantFrame.inputPeak = assistantInputMeasurement.peak;
-    assistantFrame.inputRms = assistantInputMeasurement.rms;
-    assistantFrame.outputPeak = assistantOutputMeasurement.peak;
-    assistantFrame.outputRms = assistantOutputMeasurement.rms;
-    assistantFrame.zeroCrossingRate = assistantInputMeasurement.zeroCrossingRate;
-    assistantFrame.channelCorrelation = assistantOutputMeasurement.correlation;
-    assistantFrame.inputClipped = assistantInputMeasurement.clipped;
-    assistantFrame.outputClipped = assistantOutputMeasurement.clipped;
-    assistantFrame.samples = static_cast<std::uint32_t>(buffer.getNumSamples());
-    assistantFrame.latencySamples = pendingOversamplingLatencySamples.load(std::memory_order_relaxed);
-    assistantFrame.sampleRate = currentSampleRate;
-    (void) assistantSummaryQueue.push(assistantFrame);
+    considerAutomaticTierReduction();
+    if (assistantActive)
+    {
+        const auto assistantOutputMeasurement = measureBuffer(buffer);
+        nts::assistant::AudioSummaryFrame assistantFrame;
+        assistantFrame.inputPeak = assistantInputMeasurement.peak;
+        assistantFrame.inputRms = assistantInputMeasurement.rms;
+        assistantFrame.outputPeak = assistantOutputMeasurement.peak;
+        assistantFrame.outputRms = assistantOutputMeasurement.rms;
+        assistantFrame.zeroCrossingRate = assistantInputMeasurement.zeroCrossingRate;
+        assistantFrame.channelCorrelation = assistantOutputMeasurement.correlation;
+        assistantFrame.inputClipped = assistantInputMeasurement.clipped;
+        assistantFrame.outputClipped = assistantOutputMeasurement.clipped;
+        assistantFrame.samples = static_cast<std::uint32_t>(buffer.getNumSamples());
+        assistantFrame.latencySamples = pendingOversamplingLatencySamples.load(std::memory_order_relaxed);
+        assistantFrame.sampleRate = currentSampleRate;
+        (void) assistantSummaryQueue.push(assistantFrame);
+    }
     absoluteSamplePosition += static_cast<std::uint64_t>(buffer.getNumSamples());
 }
 
@@ -453,17 +526,63 @@ void TubeForgeAudioProcessor::updateTuner()
 
     const auto pitch = tunerDetector.analyse(tunerFrame);
     TunerReading reading;
+    // The reference the user has chosen, not a fixed 440. `nearestNote` has always taken it; only
+    // the plug-in was pinning it. Read once per reading so the note, the cents and the target
+    // frequency below cannot disagree about which reference they were resolved against.
+    const auto referenceHz = std::clamp(parameterOf(Param::tunerReference), 380.0f, 500.0f);
+    reading.referenceHz = referenceHz;
     if (pitch.voiced)
     {
-        const auto note = nts::dsp::nearestNote(pitch.frequencyHz);
+        const auto note = nts::dsp::nearestNote(pitch.frequencyHz, referenceHz);
         reading.midiNote = note.midiNote;
         reading.cents = note.cents;
         reading.frequencyHz = pitch.frequencyHz;
         reading.confidence = pitch.confidence;
         reading.voiced = note.midiNote >= 0;
+        // Equal temperament from the same reference, so this is exactly the pitch the needle is
+        // measuring against rather than an approximation of it.
+        if (reading.voiced)
+            reading.targetHz = referenceHz
+                * std::pow(2.0f, static_cast<float>(note.midiNote - 69) / 12.0f);
     }
     const std::scoped_lock lock(tunerMutex);
     latestTunerReading = reading;
+}
+
+void TubeForgeAudioProcessor::considerAutomaticTierReduction() noexcept
+{
+    // Sampled every few dozen blocks rather than every block: the snapshot reads a handful of
+    // atomics, which is cheap but not free, and the condition it is looking for is a sustained
+    // one by definition.
+    if (++automaticTierCheckCounter < automaticTierCheckBlocks) return;
+    automaticTierCheckCounter = 0;
+
+    const auto snapshot = diagnostics.snapshot();
+    const auto droppedSinceLastCheck = snapshot.dropoutCount > lastSeenDropoutCount;
+    lastSeenDropoutCount = snapshot.dropoutCount;
+
+    // A dropout is not a warning, it is the failure -- so it counts immediately rather than
+    // having to persist. Sustained high load is the case worth waiting out, because a single
+    // busy callback happens for reasons that have nothing to do with this plug-in.
+    if (droppedSinceLastCheck) overloadStreak = overloadChecksBeforeStepDown;
+    else if (snapshot.cpuLoadPercent > overloadLoadPercent) ++overloadStreak;
+    else overloadStreak = 0;
+
+    if (overloadStreak < overloadChecksBeforeStepDown) return;
+    overloadStreak = 0;
+
+    const auto current = static_cast<int>(performanceTier());
+    if (current <= static_cast<int>(PerformanceTier::eco)) return;
+    // Only ever downward, and only one step at a time, so a machine that is briefly in trouble
+    // does not end up at Eco because of it.
+    automaticTierRequest.store(current - 1, std::memory_order_relaxed);
+    triggerAsyncUpdate();
+}
+
+TubeForgeAudioProcessor::PerformanceTier TubeForgeAudioProcessor::performanceTier() const noexcept
+{
+    return static_cast<PerformanceTier>(std::clamp(
+        static_cast<int>(std::lround(parameterOf(Param::performanceTier))), 0, 2));
 }
 
 TubeForgeAudioProcessor::TunerReading TubeForgeAudioProcessor::tunerReading() const noexcept
@@ -502,11 +621,9 @@ int TubeForgeAudioProcessor::automaticOversamplingFactor(
 
 nts::amp::AmpParameters TubeForgeAudioProcessor::currentAmpParameters() const noexcept
 {
-    const auto instrumentIndex = std::clamp(static_cast<int>(
-        parameterOf(Param::instrument)), 0, 1);
-    const auto topologyIndex = std::clamp(static_cast<int>(
-        parameterOf(Param::topology)), 0, 1);
-    auto parameters = factoryAmpParameters[static_cast<std::size_t>(instrumentIndex * 2 + topologyIndex)];
+    auto parameters = factoryAmpParameters[factoryAmpIndex(
+        static_cast<int>(parameterOf(Param::instrument)),
+        static_cast<int>(parameterOf(Param::topology)))];
     // Zero: the shared front end in processBlock applies the trim for every engine, so
     // leaving it here as well would apply it twice.
     parameters.manualInputTrimDb = 0.0f;
@@ -528,18 +645,26 @@ nts::amp::AmpParameters TubeForgeAudioProcessor::currentAmpParameters() const no
         parameters.stages[stage].driveDb = parameterOf(stageParam) + simpleGainOffset;
         parameters.stages[stage].bias = bias;
     }
+    const auto limits = tierLimits();
     const auto oversamplingIndex = std::clamp(static_cast<int>(
         parameterOf(Param::oversampling)), 0, automaticOversamplingIndex);
-    const auto oversamplingFactor = oversamplingIndex == automaticOversamplingIndex
+    const auto requestedFactor = oversamplingIndex == automaticOversamplingIndex
         ? automaticOversamplingFactor(parameters)
         : std::array { 1, 2, 4, 8 }[static_cast<std::size_t>(oversamplingIndex)];
+    // The tier caps the factor rather than the control: the user's choice is remembered and comes
+    // back when they raise the tier, instead of being silently rewritten in the saved project.
+    const auto oversamplingFactor = std::min(requestedFactor, limits.maximumOversamplingFactor);
     for (auto& stage : parameters.stages) stage.oversamplingFactor = oversamplingFactor;
+    // Eco runs one convolution, not two. Forcing the blend to slot A is what makes the second
+    // convolver idle, which CabinetSection then skips entirely.
+    for (auto& stage : parameters.stages) stage.approximateSaturation = limits.approximateNonlinearities;
     parameters.gateEnabled = parameterOf(Param::gateEnabled) >= 0.5f;
     parameters.gateThresholdDb = parameterOf(Param::gateThreshold);
     parameters.gateDepthDb = parameterOf(Param::gateDepth);
     parameters.gateAttackMs = parameterOf(Param::gateAttack);
     parameters.gateHoldMs = parameterOf(Param::gateHold);
     parameters.gateReleaseMs = parameterOf(Param::gateRelease);
+    parameters.loudnessMatch = parameterOf(Param::loudnessMatch) >= 0.5f;
     parameters.preEq.lowCutHz = parameterOf(Param::lowCut);
     parameters.preEq.highCutHz = parameterOf(Param::highCut);
     parameters.preEq.tightness = parameterOf(Param::tightness) * 0.1f;
@@ -550,7 +675,42 @@ nts::amp::AmpParameters TubeForgeAudioProcessor::currentAmpParameters() const no
     parameters.bass.cleanBlend = parameterOf(Param::cleanBlend) * 0.01f;
     parameters.cabinet.delaySamplesB = static_cast<std::size_t>(
         parameterOf(Param::cabinetAlignment));
-    parameters.cabinet.blend = parameterOf(Param::cabinetBlend) * 0.01f;
+    // Eco runs one convolution rather than two: pinning the blend to slot A leaves the second
+    // convolver contributing nothing, which CabinetSection then skips outright.
+    parameters.cabinet.blend = limits.singleCabinet ? 0.0f
+                                                    : parameterOf(Param::cabinetBlend) * 0.01f;
+    // Zeroed on the single-cabinet tier for the same reason, and this one has to be: width keeps
+    // both convolvers engaged whatever the blend says, so leaving it up would reinstate the second
+    // convolution the tier exists to avoid.
+    parameters.cabinet.width = limits.singleCabinet ? 0.0f
+                                                   : parameterOf(Param::cabinetWidth) * 0.01f;
+    return parameters;
+}
+
+nts::pedals::PedalParameters TubeForgeAudioProcessor::currentPedalParameters(
+    std::size_t slot) const noexcept
+{
+    // The six per-slot parameters are contiguous and in slot order, so the slot index walks
+    // them rather than needing a table indexed by two things that could disagree.
+    static_assert(static_cast<std::size_t>(Param::pedal2Kind)
+                      - static_cast<std::size_t>(Param::pedal1Kind) == pedalParameterStride,
+                  "the per-slot pedal parameters must stay contiguous for this indexing to hold");
+    static_assert(static_cast<std::size_t>(Param::pedal1Mix)
+                      - static_cast<std::size_t>(Param::pedal1Kind) == pedalParameterStride - 1,
+                  "a slot's six parameters must stay in PedalParameters order");
+
+    const auto base = static_cast<std::size_t>(Param::pedal1Kind) + slot * pedalParameterStride;
+    const auto at = [this, base](std::size_t offset)
+    { return parameterOf(static_cast<Param>(base + offset)); };
+
+    nts::pedals::PedalParameters parameters;
+    parameters.kind = static_cast<nts::pedals::PedalKind>(
+        std::clamp(static_cast<int>(std::lround(at(0))), 0, static_cast<int>(nts::pedals::kindCount) - 1));
+    parameters.bypassed = at(1) >= 0.5f;
+    parameters.drive = at(2);
+    parameters.tone = at(3);
+    parameters.levelDb = at(4);
+    parameters.mix = at(5);
     return parameters;
 }
 
@@ -574,6 +734,25 @@ void TubeForgeAudioProcessor::handleAsyncUpdate()
     {
         setCurrentProgram(program);
         updateHostDisplay();
+    }
+
+    // The import worker writes artifact directories; the list of them is rebuilt here, on the
+    // message thread, which is the only thread that reads it.
+    if (pendingCaptureRefresh.exchange(false, std::memory_order_acquire)) captures.refresh();
+
+    if (const auto tier = automaticTierRequest.exchange(-1, std::memory_order_relaxed); tier >= 0)
+    {
+        // Re-read rather than trusting the request: the user may have moved the control between
+        // the audio thread asking and this running, and their choice wins over a stale request.
+        if (const auto current = static_cast<int>(performanceTier()); tier < current)
+        {
+            setParameterValue(parameterState, ParameterIds::performanceTier, static_cast<float>(tier));
+            logger.log({ std::chrono::system_clock::now(), nts::diagnostics::LogSeverity::warning,
+                         "audio", "performanceTierReduced",
+                         "Performance tier lowered automatically after sustained overload",
+                         "tier=" + std::to_string(tier) });
+            updateHostDisplay();
+        }
     }
 
     latencyBudget.oversamplingSamples = pendingOversamplingLatencySamples.load(std::memory_order_relaxed);

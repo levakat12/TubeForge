@@ -37,6 +37,7 @@ std::vector<std::byte> recurrentFixture(std::size_t hidden)
     for (std::size_t row = 0; row < hidden; ++row) appendFloat(bytes, 0.01f);
     appendFloat(bytes, 0.0f); return bytes;
 }
+
 }
 
 int main()
@@ -90,6 +91,42 @@ int main()
                   << processor.modelMemoryBytes() << ',' << p99 / budgetUs * 100.0 << "\n";
         const auto targetFraction = channels == 1 ? 0.5 : 0.75;
         if (p99 >= budgetUs * targetFraction) return 3;
+    }
+
+    // Exact against approximate gate activations, measured on the model rather than through the
+    // processor so nothing else is in the way. Reported, not gated: the approximation is opt-in
+    // and no shipping path takes it yet, so a budget here would be asserting against a
+    // configuration the plug-in does not currently run.
+    const auto lstmBytes = nts::test::lstmFixture(64);
+    const std::array<std::pair<const char*, const std::vector<std::byte>*>, 2> activationCases {
+        std::pair { "recurrent64", &bytes }, std::pair { "lstm64", &lstmBytes } };
+    for (const auto& [label, source] : activationCases)
+    for (const auto approximate : { false, true })
+    {
+        nts::ml::PackedTanhModel timed;
+        if (! timed.load(*source, error)) { std::cerr << error << '\n'; return 4; }
+        timed.setApproximateActivations(approximate);
+        std::array<float, blockSize> scratch {};
+        for (std::size_t iteration = 0; iteration < 256; ++iteration)
+        { scratch = testInput; timed.process(scratch, scratch); }
+        std::array<double, batches> averages {};
+        for (std::size_t batch = 0; batch < batches; ++batch)
+        {
+            std::vector<double> timings; timings.reserve(iterations);
+            for (std::size_t iteration = 0; iteration < iterations; ++iteration)
+            {
+                scratch = testInput;
+                const auto start = std::chrono::steady_clock::now(); timed.process(scratch, scratch);
+                const auto end = std::chrono::steady_clock::now();
+                timings.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+            }
+            std::sort(timings.begin(), timings.end());
+            averages[batch] = std::accumulate(timings.begin(), timings.end(), 0.0) / timings.size();
+        }
+        std::sort(averages.begin(), averages.end());
+        std::cout << label << (approximate ? "_approx" : "_exact")
+                  << ",48000,64,1," << averages[batches / 2] << ",0,"
+                  << timed.memoryBytes() << ",0\n";
     }
 
     // The NAM corpus geometry: 23 layers, kernels of 6 with two of 15, dilations cycling to 239.

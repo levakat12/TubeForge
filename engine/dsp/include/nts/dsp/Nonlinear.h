@@ -9,6 +9,44 @@
 
 namespace nts::dsp
 {
+/** Rational approximations to tanh and the logistic sigmoid.
+
+    A recurrent model spends most of its time here rather than in its matrix products: an LSTM
+    evaluates three sigmoids and two tanh per hidden unit per sample, which at 64 units and
+    48 kHz is around fifteen million transcendental calls a second. `std::tanh` and `std::exp`
+    are correctly rounded and cost roughly twenty-five cycles each; these cost about ten
+    operations with no branch beyond the saturation test.
+
+    Accuracy is a Pade-derived rational, exact to under 1e-6 for |x| below about 4 and bounded
+    by 1e-4 everywhere, the error concentrated where the true function is already saturated past
+    0.9999. That is far tighter than a gate activation needs -- an LSTM's recurrence is
+    contractive, so an error of this size does not accumulate -- but it is not bit-exact, which
+    is why the runtime keeps the exact path and takes these only when asked.
+
+    The sigmoid is derived from the tanh rather than approximated separately, because
+    `sigmoid(x) = (1 + tanh(x/2)) / 2` is an identity: one approximation, one error bound.
+*/
+[[nodiscard]] inline float fastTanh(float value) noexcept
+{
+    // Guards the sixth power below against overflowing float, which would make both halves of
+    // the ratio infinite and the result NaN. Well outside any range where tanh is not already 1.
+    if (value <= -20.0f) return -1.0f;
+    if (value >= 20.0f) return 1.0f;
+    const auto square = value * value;
+    const auto numerator = value * (135135.0f + square * (17325.0f + square * (378.0f + square)));
+    const auto denominator = 135135.0f + square * (62370.0f + square * (3150.0f + 28.0f * square));
+    // Clamped on the *output*, not the input. Past about |x| = 5 the rational drifts above
+    // unity, and clamping there is not merely safe but more accurate than either continuing the
+    // rational or cutting over to a constant earlier: the true function is already within 1e-4
+    // of its limit, so the clamp inherits that as its whole error.
+    return std::clamp(numerator / denominator, -1.0f, 1.0f);
+}
+
+[[nodiscard]] inline float fastSigmoid(float value) noexcept
+{
+    return 0.5f * (1.0f + fastTanh(0.5f * value));
+}
+
 enum class Waveshape
 {
     hyperbolicTangent,

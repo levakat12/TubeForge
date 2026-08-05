@@ -1,33 +1,66 @@
 #include "AmplifierPage.h"
 #include "../PluginProcessor.h"
-#include "../TubeForgeTheme.h"
 
 #include <algorithm>
-
-namespace theme = tf::theme;
+#include <cmath>
 
 namespace
 {
 constexpr std::array knobIds { "gain", "bass", "mid", "treble", "presence", "resonance", "master" };
 constexpr std::array knobNames { "Gain", "Bass", "Mid", "Treble", "Presence", "Resonance", "Master" };
+/// What each knob does, in the order above. Says what turning it changes, not what it is called.
+constexpr std::array knobHints {
+    "How hard the preamp is driven. The main control over how clean or distorted the amp is, and the "
+    "first thing to set.",
+    "Low end, in the tone stack after the distortion. Cuts and boosts what is already there rather "
+    "than changing how the amp breaks up.",
+    "Midrange. Most of a guitar's body and cut lives here -- scooping it sounds heavy alone and "
+    "vanishes in a mix; pushing it cuts through.",
+    "Top end of the tone stack. Adds definition and pick attack; too much on a high-gain setting "
+    "turns into fizz.",
+    "A high shelf around 2.6 kHz in the power section, after the tone stack. Presence bites where "
+    "Treble brightens -- reach for it when the amp sounds dull but not dark.",
+    "Low-end resonance in the power section, the interaction between the output stage and the "
+    "speaker. Adds thump and looseness down low.",
+    "Power-amp level. On a real amp this is where power-stage saturation comes from, so it changes "
+    "the tone as well as the volume, not just how loud it is."
+};
 static_assert(knobIds.size() == knobNames.size(), "each amp knob needs a matching display name");
+static_assert(knobIds.size() == knobHints.size(), "each amp knob needs a hint describing what it does");
 } // namespace
 
 AmplifierPage::AmplifierPage(TubeForgeAudioProcessor& processorToUse)
-    : ModulePage(processorToUse), faceplate(processorToUse.ampFaceplateArtwork())
+    : ModulePage(processorToUse)
 {
     tf::ui::configureFieldCaption(instrumentCaption, "Instrument");
     tf::ui::populateFromParameter(instrumentSelector, processor.getParameters(), "instrument");
+    tf::ui::configureFieldCaption(voicingCaption, "Voicing");
     addAndMakeVisible(instrumentCaption);
     addAndMakeVisible(instrumentSelector);
+    addAndMakeVisible(voicingCaption);
     addAndMakeVisible(cabinetEnabled);
+
+    if (auto* topology = processor.getParameters().getParameter("topology"))
+    {
+        voicing = std::make_unique<tf::ui::GearChip>(*topology, "Voicing");
+        voicing->buildCatalogue = [this] { return buildVoicingCatalogue(); };
+        // Opened over the page rather than the whole editor: the shell's own chrome -- preset
+        // rail, input and output trims -- stays reachable, and the panel folds back into a chip
+        // that is in the same coordinate space it grew from.
+        voicing->overlayHost = this;
+        addAndMakeVisible(*voicing);
+    }
 
     for (std::size_t index = 0; index < knobs.size(); ++index)
     {
+        // The colour here is a placeholder: applyFaceplateStyle repaints the lettering in
+        // whatever the current voicing's control panel calls for before the page is shown.
         tf::ui::configureLabel(knobLabels[index], juce::String(knobNames[index]).toUpperCase(),
-                               10.0f, true, juce::Colour(0xfff0dcc0));
+                               10.0f, true, juce::Colours::white);
         knobLabels[index].setJustificationType(juce::Justification::centred);
         tf::ui::configureKnob(knobs[index], true);
+        knobs[index].setTooltip(knobHints[index]);
+        knobLabels[index].setTooltip(knobHints[index]);
         addAndMakeVisible(knobLabels[index]);
         addAndMakeVisible(knobs[index]);
     }
@@ -39,11 +72,75 @@ AmplifierPage::AmplifierPage(TubeForgeAudioProcessor& processorToUse)
     for (std::size_t index = 0; index < knobs.size(); ++index)
         knobAttachments.push_back(std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
             processor.getParameters(), knobIds[index], knobs[index]));
+
+    // The art covers as many voicings as the parameter offers choices. If someone adds a
+    // topology and stops there, the extra choice silently reuses the first livery, so say so
+    // here rather than leaving it to be noticed by eye.
+    jassert(tf::ui::faceplateStyleCount()
+            == static_cast<std::size_t>(processor.getParameters()
+                                            .getParameter("topology")->getAllValueStrings().size()));
+    applyFaceplateStyle();
 }
 
 juce::Rectangle<int> AmplifierPage::faceplateArea() const
 {
     return getLocalBounds().withTrimmedTop(chipRowHeight + 10);
+}
+
+int AmplifierPage::choiceIndex(const juce::String& parameterId) const
+{
+    const auto* value = processor.getParameters().getRawParameterValue(parameterId);
+    if (value == nullptr) return 0;
+    return static_cast<int>(std::lround(value->load(std::memory_order_relaxed)));
+}
+
+void AmplifierPage::applyFaceplateStyle()
+{
+    paintedTopology = choiceIndex("topology");
+    paintedInstrument = choiceIndex("instrument");
+    faceplate.setStyle(tf::ui::faceplateStyle(paintedTopology, paintedInstrument));
+
+    const auto lettering = faceplate.style().panelText;
+    for (auto& label : knobLabels) label.setColour(juce::Label::textColourId, lettering);
+    for (auto& knob : knobs)
+        knob.setColour(juce::Slider::textBoxTextColourId, lettering.withAlpha(0.88f));
+    // The chip watches the voicing parameter but cannot see the instrument, and a bass rig
+    // wears a different cabinet -- so tell it rather than waiting for it to notice.
+    if (voicing != nullptr) voicing->invalidate();
+    repaint();
+}
+
+tf::ui::GearCatalogue AmplifierPage::buildVoicingCatalogue()
+{
+    tf::ui::GearCatalogue catalogue;
+    catalogue.heading = "Choose an amplifier";
+    for (std::size_t index = 0; index < tf::ui::ampCharacterCount; ++index)
+        catalogue.categories.push_back(
+            tf::ui::ampCharacterName(static_cast<tf::ui::AmpCharacter>(index)));
+
+    // The instrument is read once here rather than captured per tile: a bass rig wears a
+    // different cabinet, and the faces in the picker should be the ones the user will get.
+    const auto instrument = choiceIndex("instrument");
+    for (std::size_t index = 0; index < tf::ui::faceplateStyleCount(); ++index)
+    {
+        const auto topology = static_cast<int>(index);
+        const auto style = tf::ui::faceplateStyle(topology, instrument);
+        catalogue.tiles.push_back(
+            { topology, style.badge, style.blurb, static_cast<int>(style.character),
+              [this, topology, instrument](juce::Graphics& graphics, juce::Rectangle<float> area)
+              { thumbnails.paint(graphics, area, topology, instrument); } });
+    }
+    return catalogue;
+}
+
+void AmplifierPage::refresh()
+{
+    // The voicing can also be changed from the tone page, from a preset recall, from a
+    // recovered rig or from host automation, so this one only ever learns about a change by
+    // looking. Cheap enough to check every tick.
+    if (choiceIndex("topology") != paintedTopology || choiceIndex("instrument") != paintedInstrument)
+        applyFaceplateStyle();
+    if (voicing != nullptr) voicing->refresh();
 }
 
 void AmplifierPage::resized()
@@ -52,18 +149,23 @@ void AmplifierPage::resized()
     chipBounds = chip;
     tf::ui::layOutField(chip.removeFromLeft(160), instrumentCaption, instrumentSelector);
     chip.removeFromLeft(12);
+    if (voicing != nullptr)
+    {
+        tf::ui::layOutField(chip.removeFromLeft(230), voicingCaption, *voicing);
+        chip.removeFromLeft(12);
+    }
     cabinetEnabled.setBounds(chip.removeFromLeft(130).withTrimmedTop(13).withHeight(28));
 
     const auto face = faceplateArea().toFloat();
     const auto width = face.getWidth();
     const auto height = face.getHeight();
-    // The art is a grille above a blank control panel that runs from roughly 62% to 93% of
-    // its height. Anchoring the knob row to those proportions -- and drawing the art with its
-    // aspect preserved -- keeps the knobs on the panel at every window size.
+    // The art paints its control panel around this band rather than the other way round, so
+    // the knobs land on the panel at every window size and aspect ratio.
     auto deck = juce::Rectangle<int>(juce::roundToInt(face.getX() + width * 0.055f),
-                                     juce::roundToInt(face.getY() + height * 0.618f),
+                                     juce::roundToInt(face.getY() + height * tf::ui::FaceplateArt::deckTop),
                                      juce::roundToInt(width * 0.890f),
-                                     juce::roundToInt(height * 0.312f));
+                                     juce::roundToInt(height * (tf::ui::FaceplateArt::deckBottom
+                                                                - tf::ui::FaceplateArt::deckTop)));
     constexpr int groupGap = 16;
     const auto columns = static_cast<float>(knobs.size());
     const auto columnWidth = (static_cast<float>(deck.getWidth())
@@ -90,26 +192,10 @@ void AmplifierPage::resized()
 
 void AmplifierPage::paint(juce::Graphics& graphics)
 {
-    auto area = faceplateArea().toFloat();
-    juce::Path clip;
-    clip.addRoundedRectangle(area, 9.0f);
-    graphics.saveState();
-    graphics.reduceClipRegion(clip);
-
-    if (faceplate.isValid())
-        // fillDestination, not stretchToFit: the art is far wider than the page, and stretching
-        // it squashes the grille and the corner brackets. Cropping the sides instead keeps the
-        // vertical proportions the knob layout is anchored to exactly right.
-        graphics.drawImage(faceplate, area, juce::RectanglePlacement::fillDestination);
-    else
-    {
-        graphics.setColour(theme::panel);
-        graphics.fillRect(area);
-    }
-    // The photograph is warm and busy; a scrim keeps the knobs and text legible on top of it.
-    graphics.setColour(juce::Colours::black.withAlpha(0.32f));
-    graphics.fillRect(area);
-    graphics.restoreState();
+    // Drawn to the area rather than cropped to fit it, and no scrim: the art keeps its own
+    // control panel dark and the lettering takes its colour from the same style, so nothing
+    // has to be dimmed to stay readable.
+    faceplate.paint(graphics, faceplateArea().toFloat());
 
     for (const auto x : dividerX)
     {

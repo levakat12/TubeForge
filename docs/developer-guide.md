@@ -19,6 +19,28 @@ assistant, package security, wrappers, and a real JUCE VST3 scan/instance/proces
 Timing acceptance tests should also be run individually on an otherwise idle machine. Python tests require
 `python -m pip install -e ml`.
 
+The editor draws its own artwork rather than shipping images. `Source/ui/FaceplateArt.*` renders an
+amplifier from one row of a style table sized against `nts::amp::topologyCount`, and
+`Source/ui/PedalArt.*` does the same for pedals against `nts::pedals::kindCount` — so a voicing or a
+pedal kind appended to an engine enum without a livery is a compile error, not something to notice
+by eye. Both are procedural: any noise lattice must use a cell count that divides its tile edge
+exactly, or the pattern beats against the pixel grid and reads as mottled stone. Review changes to
+either with `nts_art_renderer`, which writes every face to PNGs and is the only way to tell whether
+a palette change actually improved anything:
+
+```powershell
+cmake --build build --config Release --target nts_art_renderer
+build\nts_art_renderer_artefacts\Release\nts_art_renderer.exe out
+```
+
+`Source/ui/GearPicker.*` is the shared selection component behind both the amplifier voicing and the
+pedal kinds: a chip showing what is loaded, expanding into a grid of faces shelved by the character
+of the sound. It knows nothing about amplifiers or pedals — a page hands it a `GearCatalogue` of
+tiles carrying a parameter index and a paint callback. It cannot use a `ComboBoxAttachment`, so it
+writes its parameter through `beginChangeGesture` / `setValueNotifyingHost` / `endChangeGesture`;
+the gesture pair is not optional, because a choice written without one appears as an un-writable
+automation lane in several hosts.
+
 Format changes require an independent version, bounds validation, migration or explicit rejection, fixtures,
 and compatibility-matrix update. A package parser must use the allowlist and limits in
 `engine/ecosystem`; do not extract arbitrary archive paths. New telemetry fields require privacy review and

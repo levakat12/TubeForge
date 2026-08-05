@@ -58,6 +58,7 @@ private:
         std::size_t historyOffset {};   // into `history`
         std::size_t historyColumns {};
         std::size_t position {};
+        std::size_t packedWeightOffset {}; // into `packedWeights`, tap-major
     };
 
     void primeFromSilence() noexcept;
@@ -72,6 +73,20 @@ private:
     std::size_t rechannelOffset {};
     std::size_t headOffset {};
     std::vector<float> weights;
+
+    /** The dilated-convolution and head kernels, repacked tap-major at load time.
+
+        The packed file stores the layer kernel as [row][column][tap] and the head as [row][tap],
+        so the inner loop -- which runs over `column` for a fixed tap -- reads with a stride of
+        `kernelSize`. At the kernel sizes these models use that is roughly one useful float per
+        cache line, and it cannot vectorise, because consecutive iterations touch non-adjacent
+        memory. Transposed to [tap][row][column] the same loop is a contiguous dot product.
+
+        This is an in-memory transformation only. The on-disk format, its version field, and its
+        SHA validation are untouched, so existing artifacts keep loading unchanged.
+    */
+    std::vector<float> packedWeights;
+    std::vector<float> packedHeadWeights;
     std::vector<Layer> layers;
     std::vector<float> history;
     std::vector<float> headHistory;

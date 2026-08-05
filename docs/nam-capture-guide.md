@@ -5,11 +5,53 @@ and **distilled**, which trains one of the built-in recurrent models to imitate 
 almost always what you want. Distilled exists for cases where the CPU cost of the original matters
 more than the last few percent of accuracy.
 
-Both paths are offline tools in the `nts-ml` package. Neither redistributes anything: a converted
-artifact carries the capture author's name in its `license.txt`, and converting does not grant you
-the right to pass the result on.
+Converting needs no tools at all — the plug-in does it. Distilling is an offline job in the
+`nts-ml` package. Neither redistributes anything: a converted artifact carries the capture
+author's name in its `license.txt`, and converting does not grant you the right to pass the
+result on.
 
-## Converting a capture
+## Importing in the plug-in
+
+Open the **Captures** page and press **Import .zip or .nam**. Point it at an archive, a single
+capture, or a folder of either, and every capture inside is unpacked and converted in place. The
+same button is on the picker that opens from **Load capture** on the Pedals page and from **Load a
+capture** on Neural Capture, so an archive can go straight into a pedal slot without leaving the
+page.
+
+Whole archives are converted rather than one capture at a time because that is the shape the real
+packs come in: one pedal archive holds up to eighty-nine captures of the same box at different
+control settings, so there is no answer to "which one" until you are choosing a sound. Converting
+the lot turns that into browsing a list. Conversion is keyed by each capture's own SHA-256, so
+re-importing an archive you already have costs a stat per capture and cannot create duplicates.
+
+Captures are sorted into **amps**, **full rigs** and **pedals** from the `gear_type` the capture's
+author recorded. That ordering is advice, not a rule: a capture is offered first where it fits and
+flagged where it does not, but nothing is withheld — running a full-rig capture in a pedal slot is
+a strange thing to want and a legitimate thing to try.
+
+Converted captures live in `%APPDATA%\TubeForge\captures`, one directory per capture, and the
+originals are never modified. Deleting a capture from the page removes only the converted artifact.
+
+### What the plug-in checks, and what it does not
+
+An artifact produced by `nts-nam-import` carries test vectors rendered by the Python
+implementation, which is itself checked against upstream `neural-amp-modeler`. Re-running those
+vectors at load time is therefore a real parity gate on the C++ runtime.
+
+An artifact converted inside the plug-in cannot carry vectors like that — the thing rendering them
+would be the thing they were meant to check. Those artifacts record `"testVectorSource": "runtime"`
+in their manifest, and their vectors prove the model loads, primes and runs deterministically
+rather than proving parity.
+
+Parity for that path is enforced somewhere better: `nts_nam_parity` requires the plug-in's
+converter and `nts-nam-import` to produce **byte-identical** `model.bin` for every capture, at
+both tiers. Byte identity is a stronger claim than any audio tolerance, and it carries the whole
+existing chain across. All 354 corpus captures pass at both tiers.
+
+## Converting from the command line
+
+Still useful for converting in bulk outside the plug-in, for scripting, and for producing
+artifacts whose test vectors are independent of the runtime.
 
 ```bash
 nts-nam-import path/to/capture.nam --output ~/TubeForge/models
@@ -75,6 +117,25 @@ Requirements worth knowing before you start:
 Rendering runs at roughly 24x realtime, so a ten-minute DI corpus takes about 25 seconds; training
 dominates the total and needs the torch backend to be practical (`backend = "auto"` in the shipped
 config).
+
+## Pedal captures
+
+A pedal capture converts exactly like an amplifier capture — same reader, same artifact layout,
+same digest — and loads on the **Pedals** page instead of Neural Capture. Set a slot's Kind to
+*Neural capture*, press **Load capture**, and pick one from the list; the picker's own Import
+button takes the archive if you have not imported it yet.
+
+Two things are worth knowing about pedal captures specifically:
+
+- **Drive is the input level, not a gain control on the model.** A capture is trained at one input
+  level and reproduces its pedal faithfully only near it. The slot's Drive knob trims ±12 dB into
+  the model, which is the control that decides whether a captured screamer sounds like the pedal or
+  like a much quieter or much louder one.
+- **Cost is per slot and per channel.** Four standard-tier captures in stereo is eight model
+  instances — see the tier table above and budget accordingly. The lite tier exists for this.
+
+An empty *Neural capture* slot passes audio through rather than going silent, so selecting the kind
+before loading anything is harmless.
 
 ## Cabinet impulse responses
 

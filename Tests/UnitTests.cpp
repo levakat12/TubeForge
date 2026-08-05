@@ -168,6 +168,32 @@ void testStateMigrationAndValidation(TestHarness& tests)
         tests.expectNear(fromV2.state->engine.inputGainDb, 1.5, 1.0e-6,
                          "migrating from schema 2 preserves the engine settings");
     }
+
+    // A schema 3 project predates the pedalboard. An empty slot list is not a defaulted
+    // board -- it is the rig that project actually described, amplifier and cabinet with
+    // nothing in front, and the processor relies on that to leave the parameters alone.
+    const auto fromV3 = nts::state::deserialize(
+        R"({"schemaVersion":3,"applicationVersion":"0.10.0",)"
+        R"("engine":{"inputGainDb":2.5,"outputGainDb":0.0,"bypass":false,"ampControls":[]},)"
+        R"("device":{},"graph":{"physicalCircuitJson":""},"ui":{},)"
+        R"("assets":{"relativePaths":[],"cabinetIrPathA":"","cabinetIrPathB":""}})");
+    tests.expect(static_cast<bool>(fromV3), "a schema 3 project still loads");
+    if (fromV3)
+    {
+        tests.expectEqual(fromV3.state->schemaVersion, nts::state::currentSchemaVersion,
+                          "a schema 3 project is migrated to the current schema");
+        tests.expect(fromV3.state->pedalboard.slots.empty(),
+                     "migrating from schema 3 leaves the pedalboard empty");
+    }
+
+    nts::state::ProjectState tooManySlots;
+    tooManySlots.pedalboard.slots.assign(nts::state::maximumPedalSlots + 1, {});
+    tests.expect(! nts::state::validate(tooManySlots, error),
+                 "validation rejects a pedalboard with more slots than the board has");
+
+    nts::state::ProjectState badKind;
+    badKind.pedalboard.slots.push_back({ -1, false, 5.0f, 5.0f, 0.0f, 100.0f, {} });
+    tests.expect(! nts::state::validate(badKind, error), "validation rejects a negative pedal kind");
 }
 
 void testStateRoundTrip(TestHarness& tests)
@@ -181,6 +207,12 @@ void testStateRoundTrip(TestHarness& tests)
     original.assets.relativePaths = { "irs/cab.wav", "models/amp.ntm" };
     original.assets.cabinetIrPathA = "irs/greenback-57.wav";
     original.assets.cabinetIrPathB = "irs/v30-ribbon.wav";
+    original.pedalboard.slots = {
+        { 2, false, 7.5f, 3.0f, -2.5f, 80.0f, "" },
+        { 6, true, 5.0f, 9.0f, 1.5f, 100.0f, "C:/captures/ts9-drive-7" },
+        {},
+        {},
+    };
 
     const auto parsed = nts::state::deserialize(nts::state::serialize(original));
     tests.expect(static_cast<bool>(parsed), "serialized state parses successfully");

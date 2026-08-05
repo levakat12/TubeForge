@@ -14,7 +14,13 @@ enum class GateState { closed, opening, open, holding, closing };
 struct NoiseGateParameters
 {
     float thresholdDb { -50.0f };
-    float rangeDb { -80.0f };
+    /** How far the gate ducks, not whether it mutes.
+
+        -15 dB rather than -80: what players usually want from a gate on a high-gain rig is the
+        noise floor pushed under the music, and -80 dB is a full mute that takes the tail of every
+        note with it. The full range remains available for anyone who does want a hard gate.
+    */
+    float rangeDb { -15.0f };
     double attackMs { 2.0 };
     double holdMs { 20.0 };
     double releaseMs { 80.0 };
@@ -29,6 +35,21 @@ public:
     void reset() noexcept;
     void setParameters(const NoiseGateParameters& parameters) noexcept;
     void process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept;
+    /** Attenuates `channels` but decides from `sidechain`.
+
+        For a high-gain rig the two cannot be the same signal. Keyed on the amplifier's output, the
+        threshold has to sit above the *amplified* noise floor, which a quiet passage easily exceeds,
+        so the gate never closes and removes nothing. Keyed on the amplifier's input but also
+        attenuating there, whatever survives is amplified afterwards -- including the gate's own
+        decay, which is the chopped-sustain complaint. Detector on the input and attenuation on the
+        output is what real noise gates for high-gain rigs do, and it is the only arrangement where
+        the threshold is set in terms the player recognises and the noise actually goes away.
+
+        `sidechain` must hold at least `channelCount` pointers and `samples` samples. Passing the
+        same buffer as `channels` is exactly equivalent to the overload above.
+    */
+    void process(float* const* channels, std::size_t channelCount, std::size_t samples,
+                 const float* const* sidechain) noexcept;
     [[nodiscard]] GateState state() const noexcept { return currentState; }
     [[nodiscard]] float gainReductionDb() const noexcept { return -linearToDb(std::max(gain, 1.0e-8f)); }
 

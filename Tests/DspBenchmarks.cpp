@@ -99,6 +99,13 @@ int main()
     const Configuration configurations[] { { 44100.0, 64 }, { 48000.0, 128 }, { 96000.0, 64 } };
     bool meteringWithinBudget = true;
     bool simdBenefitObserved = nts::dsp::simdAvailable();
+    // Ratios rather than absolute microsecond ceilings, deliberately. An absolute budget encodes
+    // the machine it was recorded on and fails the build on any slower one; a ratio between two
+    // implementations measured in the same process survives being run anywhere. The wins these
+    // guard are structural -- a vector kernel against a scalar one, an O(log N) convolution
+    // against an O(N) one -- so if either ratio collapses, something real has been undone.
+    bool longImpulseAdvantageHolds = true;
+    bool dotProductVectorised = nts::dsp::simdAvailable();
     for (const auto configuration : configurations)
         for (const auto channels : { std::size_t { 1 }, std::size_t { 2 } })
         {
@@ -209,6 +216,36 @@ int main()
                            sizeof(partitioned) + longIr.size() * channels * 8 * sizeof(float), 0,
                            [&] { partitioned.process(pointers, channels, configuration.blockSize); });
 
+            // Direct against buffered-partitioned at the length that decides which one the
+            // cabinet should use. maximumIrLength is 4096, so this is the worst case a user can
+            // actually load, and the ratio here is what an integration would be worth.
+            std::vector<float> cabinetIr(4096);
+            for (std::size_t index = 0; index < cabinetIr.size(); ++index)
+                cabinetIr[index] = static_cast<float>(std::exp(-0.0012 * static_cast<double>(index))
+                                                      * std::sin(0.21 * static_cast<double>(index)));
+            DirectConvolver direct4096; direct4096.prepare(cabinetIr.size(), channels);
+            direct4096.loadImpulse(cabinetIr);
+            const auto directLongStatistics = measureAndEmit("direct_convolver_4096", configuration, channels,
+                           sizeof(direct4096) + cabinetIr.size() * channels * 3 * sizeof(float), 0,
+                           [&] { direct4096.process(pointers, channels, configuration.blockSize); });
+
+            BufferedCrossfadingConvolver buffered4096;
+            buffered4096.prepare(128, cabinetIr.size(), channels);
+            buffered4096.loadInactiveImpulse(cabinetIr);
+            buffered4096.requestSwap(1);
+            buffered4096.process(pointers, channels, configuration.blockSize);
+            const auto bufferedLongStatistics = measureAndEmit("buffered_partitioned_4096", configuration, channels,
+                           sizeof(buffered4096) + cabinetIr.size() * channels * 16 * sizeof(float),
+                           buffered4096.latencySamples(),
+                           [&] { buffered4096.process(pointers, channels, configuration.blockSize); });
+            // Guards the asymptotic advantage rather than an absolute time: partitioned
+            // convolution is O(log N) against the direct path's O(N), and at 4096 taps that
+            // measured 4.2x. Held to 2x so a slower or busier machine does not fail the build for
+            // being slow -- the thing worth catching is the ratio collapsing, which would mean
+            // the FFT path had silently stopped being the cheaper one.
+            longImpulseAdvantageHolds = longImpulseAdvantageHolds
+                && directLongStatistics.averageUs > bufferedLongStatistics.averageUs * 2.0;
+
             CrossfadingConvolver convolverSwitch; convolverSwitch.prepare(configuration.blockSize, 256, channels);
             convolverSwitch.loadInactiveImpulse(shortIr); convolverSwitch.requestSwap(configuration.blockSize);
             convolverSwitch.process(pointers, channels, configuration.blockSize);
@@ -280,6 +317,45 @@ int main()
             const auto simdSpeedup = scalarStatistics.averageUs / std::max(1.0e-9, simdStatistics.averageUs);
             emit("gain_simd", configuration, channels, 0, 0, simdStatistics, simdSpeedup);
             simdBenefitObserved = simdBenefitObserved && simdSpeedup > 1.05;
+
+            // The dot product is the kernel the convolver, the oversampler and the recurrent
+            // matrix-vector products all reduce to, so its vector advantage is the single
+            // measurement that covers the most optimised code in the engine.
+            std::vector<float> dotLeft(1024), dotRight(1024);
+            for (std::size_t index = 0; index < dotLeft.size(); ++index)
+            {
+                dotLeft[index] = std::sin(0.01f * static_cast<float>(index));
+                dotRight[index] = std::cos(0.02f * static_cast<float>(index));
+            }
+            volatile float dotSink {};
+            const auto dotScalar = benchmark([&]
+            { dotSink = nts::dsp::dotProductScalar(dotLeft.data(), dotRight.data(), dotLeft.size()); });
+            const auto dotWide = benchmark([&]
+            { dotSink = nts::dsp::dotProductWide(dotLeft.data(), dotRight.data(), dotLeft.size()); });
+            static_cast<void>(dotSink);
+            const auto dotSpeedup = dotScalar.averageUs / std::max(1.0e-9, dotWide.averageUs);
+            emit("dot_product_scalar", configuration, channels, 0, 0, dotScalar);
+            emit("dot_product_wide", configuration, channels, 0, 0, dotWide, dotSpeedup);
+            dotProductVectorised = dotProductVectorised && dotSpeedup > 1.3;
+
+            // SSE2 against AVX2, forced, back to back in one process. This is the same trick the
+            // other gates use and it is what makes the comparison meaningful on a noisy machine:
+            // both are measured under identical conditions moments apart, so the run-to-run spread
+            // that swamps an absolute figure cancels out of a ratio.
+            const auto restorePath = nts::dsp::activeSimdPath();
+            nts::dsp::setSimdPath(nts::dsp::SimdPath::sse2);
+            const auto sse2Statistics = benchmark([&]
+            { dotSink = nts::dsp::dotProductWide(dotLeft.data(), dotRight.data(), dotLeft.size()); });
+            nts::dsp::setSimdPath(nts::dsp::SimdPath::avx2);
+            const auto avx2Statistics = benchmark([&]
+            { dotSink = nts::dsp::dotProductWide(dotLeft.data(), dotRight.data(), dotLeft.size()); });
+            nts::dsp::setSimdPath(restorePath);
+            static_cast<void>(dotSink);
+            const auto avx2Speedup = sse2Statistics.averageUs / std::max(1.0e-9, avx2Statistics.averageUs);
+            emit("dot_product_sse2_forced", configuration, channels, 0, 0, sse2Statistics);
+            emit(nts::dsp::avx2Available() ? "dot_product_avx2_forced" : "dot_product_avx2_unavailable",
+                 configuration, channels, 0, 0, avx2Statistics, avx2Speedup);
         }
-    return meteringWithinBudget && simdBenefitObserved ? 0 : 1;
+    return meteringWithinBudget && simdBenefitObserved
+        && longImpulseAdvantageHolds && dotProductVectorised ? 0 : 1;
 }

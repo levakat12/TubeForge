@@ -55,6 +55,12 @@ void NoiseGate::updateCoefficients() noexcept
 }
 void NoiseGate::process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept
 {
+    process(channels, channelCount, samples, channels);
+}
+
+void NoiseGate::process(float* const* channels, std::size_t channelCount, std::size_t samples,
+                        const float* const* sidechain) noexcept
+{
     const auto count = std::min(channelCount, maximumChannels);
     for (std::size_t sample = 0; sample < samples; ++sample)
     {
@@ -66,7 +72,7 @@ void NoiseGate::process(float* const* channels, std::size_t channelCount, std::s
         float detector {};
         for (std::size_t channel = 0; channel < count; ++channel)
         {
-            const auto input = channels[channel][sample];
+            const auto input = sidechain[channel][sample];
             sidechainLow[channel] += highPassCoefficient * (input - sidechainLow[channel]);
             detector = std::max(detector, std::abs(input - sidechainLow[channel]));
         }
@@ -78,15 +84,18 @@ void NoiseGate::process(float* const* channels, std::size_t channelCount, std::s
             currentState = gain < 0.999f ? GateState::opening : GateState::open;
             holdRemaining = holdSamples;
         }
-        else if (envelope < closeThreshold)
+        else
         {
-            if (holdRemaining > 0)
-            {
-                --holdRemaining;
-                currentState = GateState::holding;
-            }
-            else
-                currentState = gain > closedGain + 1.0e-5f ? GateState::closing : GateState::closed;
+            // Counted down whenever the gate is not being held open, rather than only below the
+            // close threshold. Inside the hysteresis band the old form took neither branch, so
+            // hold stopped expiring and the state machine froze wherever it happened to be --
+            // hold behaved as "until the signal drops far enough" instead of as a duration.
+            if (holdRemaining > 0) --holdRemaining;
+
+            if (envelope < closeThreshold)
+                currentState = holdRemaining > 0
+                    ? GateState::holding
+                    : (gain > closedGain + 1.0e-5f ? GateState::closing : GateState::closed);
         }
 
         const auto target = currentState == GateState::closed || currentState == GateState::closing

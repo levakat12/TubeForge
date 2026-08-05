@@ -189,6 +189,20 @@ void StudioServices::reconstructSongFile(
     nts::reconstruction::StereoMode stereoMode,
     std::optional<std::size_t> regionOverride)
 {
+    /* Cleared on every exit path, which is why it is a guard rather than two stores.
+
+       This function leaves from about two dozen places -- every `fail(...)` and every cancellation
+       check returns early -- and a flag the UI veils itself on must not be able to stay set. Set
+       by hand at the top and cleared by hand at the bottom, the first failure would have left the
+       amplifier, tone and pedal pages greyed out for the rest of the session. */
+    struct RunningGuard
+    {
+        std::atomic<bool>& flag;
+        explicit RunningGuard(std::atomic<bool>& target) : flag(target)
+        { flag.store(true, std::memory_order_relaxed); }
+        ~RunningGuard() { flag.store(false, std::memory_order_relaxed); }
+    } runningGuard { reconstructionRunning };
+
     const auto fail = [this](std::string message)
     {
         reconstructionProgressValue.store(0.0f, std::memory_order_relaxed);
@@ -325,6 +339,50 @@ void StudioServices::reconstructSongFile(
     auto tone = analyzer.analyze({ normalized.audio.left, normalized.audio.right, workingSampleRate,
                                    nts::tone::SourceType::isolatedStem, regionQuality.confidence });
     if (! tone.success) { fail("Tone extraction failed: " + tone.error); return; }
+
+    /* Re-analyse one side alone when the part turns out to be double-tracked.
+
+       Only when the user left the choice at Full stereo, which is the "you decide" setting -- an
+       explicit Left, Right, Mid or Side is a decision and is not second-guessed here.
+
+       Two takes summed have a crest factor and an attack time that belong to the arrangement
+       rather than to the amplifier, and those two numbers are exactly what the rig search fits its
+       dynamics axis from. `dynamicsSeed` corrects for the effect when it has to, but one real
+       performance through one real rig is a better reference than a corrected estimate of one.
+
+       Done as a second pass rather than a cheaper up-front guess because the likelihood is
+       something the analyser already computes: estimating it separately would mean a second
+       definition of it that could drift from the first. The cost is one more analysis of a region
+       a few seconds long, against a separation pass that took orders of magnitude longer. */
+    if (stereoMode == nts::reconstruction::StereoMode::fullStereo)
+    {
+        const auto recommended = nts::reconstruction::recommendStereoMode(
+            region, tone.features.spatial.doubleTrackingLikelihood);
+        if (recommended != nts::reconstruction::StereoMode::fullStereo)
+        {
+            auto side = nts::reconstruction::applyStereoMode(selected, recommended);
+            auto sideRegion = nts::reconstruction::extractRegion(side, regionQuality.startSeconds,
+                                                                 regionQuality.endSeconds);
+            auto sideNormalized = nts::reconstruction::normalizeReference(
+                sideRegion, regionQuality.reverbAmount > 0.45f);
+            auto sideTone = analyzer.analyze({ sideNormalized.audio.left, sideNormalized.audio.right,
+                                               workingSampleRate, nts::tone::SourceType::isolatedStem,
+                                               regionQuality.confidence });
+            // Kept only if it actually analysed. A failure here is not worth failing the whole
+            // reconstruction over when a usable full-stereo analysis is already in hand.
+            if (sideTone.success)
+            {
+                selected = std::move(side);
+                region = std::move(sideRegion);
+                normalized = std::move(sideNormalized);
+                tone = std::move(sideTone);
+                stereoMode = recommended;
+                const std::scoped_lock lock(reconstructionMutex);
+                reconstructionStatus = std::string("Double-tracked part: analyzing the ")
+                    + std::string(nts::reconstruction::toString(recommended)) + " side alone";
+            }
+        }
+    }
     reconstructionProgressValue.store(0.72f, std::memory_order_relaxed);
     nts::reconstruction::ReconstructionReference reference;
     reference.sourceHash = stems.cacheKey;
@@ -538,7 +596,7 @@ bool StudioServices::requestReconstructionRegion(std::size_t index)
     return true;
 }
 
-bool StudioServices::applyReconstructionCandidate(std::size_t index)
+bool StudioServices::applyReconstructionCandidate(std::size_t index, bool isolateChain)
 {
     nts::reconstruction::RigCandidate candidate;
     {
@@ -549,8 +607,10 @@ bool StudioServices::applyReconstructionCandidate(std::size_t index)
     }
     const auto& p = candidate.rigPreset.parameters;
     // Handed back to the owner rather than written directly: the parameter objects belong
-    // to the processor, and reaching for them from here is what this split removes.
-    if (applyRig) applyRig(p);
+    // to the processor, and reaching for them from here is what this split removes. Called
+    // outside the lock, because it writes host parameters and those can call back into
+    // anything.
+    if (applyRig) applyRig(p, isolateChain);
 
     return true;
 }

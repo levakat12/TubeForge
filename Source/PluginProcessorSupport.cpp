@@ -18,7 +18,9 @@ TubeForgeAudioProcessor::TubeForgeAudioProcessor()
       parameterState(*this, nullptr, "TubeForgeParameters", createParameterLayout()),
       engine(runtimeParameters, meters),
       logger(logPath(), &diagnostics),
-      studio([this](const nts::amp::AmpParameters& rig) { applyRecoveredRig(rig); }),
+      captures(captureLibraryPath()),
+      studio([this](const nts::amp::AmpParameters& rig, bool isolateChain)
+             { applyRecoveredRig(rig, isolateChain); }),
       tonePackageLibrary(tonePackageLibraryPath())
 {
     // Resolved once: these stay valid for the lifetime of the value tree state, and
@@ -31,17 +33,13 @@ TubeForgeAudioProcessor::TubeForgeAudioProcessor()
         jassert(parameterPointers[index] != nullptr);
     }
 
-    ampFaceplateImage = juce::ImageFileFormat::loadFrom(
-        TubeForgeAssets::tubeforge_amp_faceplate_png,
-        TubeForgeAssets::tubeforge_amp_faceplate_pngSize);
-    factoryAmpParameters[0] = nts::amp::makeOriginalPreset(nts::amp::Topology::tightModern,
-                                                            nts::amp::Instrument::guitar).parameters;
-    factoryAmpParameters[1] = nts::amp::makeOriginalPreset(nts::amp::Topology::vintageBloom,
-                                                            nts::amp::Instrument::guitar).parameters;
-    factoryAmpParameters[2] = nts::amp::makeOriginalPreset(nts::amp::Topology::tightModern,
-                                                            nts::amp::Instrument::bass).parameters;
-    factoryAmpParameters[3] = nts::amp::makeOriginalPreset(nts::amp::Topology::vintageBloom,
-                                                            nts::amp::Instrument::bass).parameters;
+    for (int instrument = 0; instrument < 2; ++instrument)
+        for (std::size_t topology = 0; topology < nts::amp::topologyCount; ++topology)
+            factoryAmpParameters[factoryAmpIndex(instrument, static_cast<int>(topology))] =
+                nts::amp::makeOriginalPreset(
+                    static_cast<nts::amp::Topology>(topology),
+                    instrument == 1 ? nts::amp::Instrument::bass : nts::amp::Instrument::guitar)
+                    .parameters;
     logger.log({ std::chrono::system_clock::now(), nts::diagnostics::LogSeverity::info,
                  "runtime", "processor-created", "TubeForge processor created", modeName().toStdString() });
     const auto preferencesFile = assistantPreferencesFile();
@@ -89,8 +87,8 @@ juce::String TubeForgeAudioProcessor::reconstructionStatusText() const
 bool TubeForgeAudioProcessor::requestReconstructionRegion(std::size_t index)
 { return studio.requestReconstructionRegion(index); }
 
-bool TubeForgeAudioProcessor::applyReconstructionCandidate(std::size_t index)
-{ return studio.applyReconstructionCandidate(index); }
+bool TubeForgeAudioProcessor::applyReconstructionCandidate(std::size_t index, bool isolateChain)
+{ return studio.applyReconstructionCandidate(index, isolateChain); }
 
 juce::Result TubeForgeAudioProcessor::exportReconstruction(const juce::File& file) const
 { return studio.exportReconstruction(file); }

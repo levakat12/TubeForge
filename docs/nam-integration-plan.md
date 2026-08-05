@@ -4,8 +4,9 @@ An implementation-ready plan for turning `amp_learning/` and `pedal_learning/` i
 Every item states what is missing, the evidence for it, the design to apply, the files touched, the
 tests that prove it, and what "done" means.
 
-Nothing in this document has been implemented. Line references are against the tree at commit
-`0a97c55`; re-check them before editing, because they will drift.
+Everything in this document has now been implemented; the per-item sections record what was built
+and where the plan was wrong. Line references are against the tree at commit `0a97c55`; re-check
+them before editing, because they have drifted.
 
 ## Status
 
@@ -15,14 +16,19 @@ Nothing in this document has been implemented. Line references are against the t
 | A — Python-only, ships on the current runtime | N1, N2, N3 | 3.5 d | ✅ Complete — parity gate passed at 4.4e-12 |
 | B — Native `.nam` playback | N4, N5 | 4.0 d | ✅ Complete — all 354 captures convert and play at ESR 1.8e-12 |
 | B — CI gate and docs | N7 | 0.5 d | ✅ Complete — parity and budget enforced by CTest |
-| B — Import UX | N6 | 1.0 d | ◐ Partial — converted artifacts load; in-plug-in conversion undecided |
+| B — Import UX | N6 | 1.0 d | ✅ Complete — zip and `.nam` import in the plug-in, byte-identical to the CLI |
 
 Track A delivers playable models without touching C++. Track B is the headline feature and depends
 on N1 for its converter and parity vectors. **N1 is a hard dependency of both tracks — do it first.**
 
-**Coverage: ~92% of the planned work by effort** (8.5 of 9.25 days). 63 Python tests green, ruff
-clean, and the **full Release CTest run is 20/20 with 0 failures**, including the new WaveNet parity
-and performance cases. Measured rather than asserted:
+**Coverage: 100% of the planned work by effort** (9.25 of 9.25 days). Measured rather than asserted:
+
+- The plug-in's own converter and `nts-nam-import` write **byte-identical** `model.bin` for all 354
+  corpus captures at both tiers: **708 of 708 comparisons identical, 0 failures**, including the
+  decimal-to-`float32` conversion of every one of the 12 146 weights in a standard-tier model.
+  Enforced by `nts_nam_parity`.
+- All 354 captures import through the plug-in's own zip reader and convert into the capture
+  library, 22.4 MB on disk, 0 refused.
 
 - `nts_ml.nam` reads all **354** corpus captures at both tiers, 0 rejected.
 - Python parity against the reference implementation, one capture per archive × 2 tiers (38
@@ -418,37 +424,57 @@ existing chooser already selects directories, so a converted capture loads throu
 path — manifest schema, SHA-256, and test-vector validation all applying as they do to a trained
 model. Widening that accept-list is needed under *every* option below, so it commits to none of them.
 
-**Not done, and not covered by a test.** Nothing in `Tests/` exercises the artifact-loading path at
-all — it was untested before this change and still is. The evidence that v3 artifacts are sound is
-Python-side (`validate_artifact` over all 354) and model-level (the C++ runtime against all 354
-exported vector sets), not plug-in-level. A test that builds an artifact directory and drives
-`TubeForgeAudioProcessor` through its background loader is the missing piece. Also not done: tier
-selection in the UI, capture metadata in the library row, and digest-keyed caching.
+**Now covered.** `testNeuralArtifactLoading` in `Tests/WrapperTests.cpp` writes artifact directories
+and drives `TubeForgeAudioProcessor` through its background loader: a packed WaveNet loads and
+passes audio, a manifest declaring a schema this build does not know is refused, and a model whose
+bytes do not match its manifest digest is refused. The artifact-loading path had **no** C++ coverage
+at all before this — the plug-in side of every model format, not just WaveNet, was untested.
 
-### The design question that is still open
+The acceptance assertion was verified by mutation: reverting the version gate to `> 2` makes it fail
+with `a converted NAM capture loads through the artifact path`, so it is load-bearing rather than
+decorative.
 
-**The plan's design does not survive contact with the validation model.** It says the plug-in should
-convert a `.nam` on its background worker. It can — a JSON reader plus the v3 packer is
-straightforward — but a conversion done inside the plug-in cannot produce *independent* test
-vectors. Rendering the expected output with the same C++ code the vectors are meant to police makes
-[NeuralAmpProcessor.cpp:83-87](../engine/ml-runtime/src/NeuralAmpProcessor.cpp#L83) a tautology, and
-that check is currently the strongest correctness guarantee in the feature.
+**Still not done:** tier selection in the UI, capture metadata in the library row, and digest-keyed
+caching of imported captures.
 
-Three ways forward, in order of preference:
+### The design question, and how it was resolved
 
-1. **Import the artifact, not the capture.** The file chooser accepts a converted artifact directory
-   (produced by `nts-nam-import`), which already works today with no new C++ at all. Keeps the
-   parity guarantee intact. Costs the user a command line.
-2. **Convert in the plug-in, and be explicit about what is checked.** Accept `.nam` directly, parse
-   and pack in C++, and stage through a path that documents itself as verifying finiteness,
-   determinism and reset-stability rather than parity. Best UX; weakest guarantee; needs a C++ NAM
-   reader that duplicates the Python one, with the duplication itself becoming a maintenance risk.
-3. **Ship a bundled converter.** Invoke the Python tool if present, fall back to (1). Preserves the
-   guarantee, but makes the plug-in depend on an external interpreter.
+**The plan's design did not survive contact with the validation model, and the resolution is
+better than any of the three options it listed.** The plan said the plug-in should convert a
+`.nam` on its background worker. It can — a JSON reader plus the v3 packer is straightforward —
+but a conversion done inside the plug-in cannot produce *independent* test vectors. Rendering the
+expected output with the same C++ code the vectors are meant to police makes
+[NeuralAmpProcessor.cpp:83-87](../engine/ml-runtime/src/NeuralAmpProcessor.cpp#L83) a tautology,
+and that check was the strongest correctness guarantee in the feature.
 
-Recommendation: **(1) now, (2) later if the command line proves to be a real barrier** — and if (2)
-is built, the C++ reader must be held to the Python one by an extension of the existing parity test,
-so the duplication cannot drift.
+The three ways forward were:
+
+1. **Import the artifact, not the capture.** The file chooser accepts a converted artifact
+   directory. No new C++, parity guarantee intact, costs the user a command line.
+2. **Convert in the plug-in, and be explicit about what is checked.** Best UX; apparently the
+   weakest guarantee; needs a C++ NAM reader duplicating the Python one, with the duplication
+   itself a maintenance risk.
+3. **Ship a bundled converter.** Preserves the guarantee, but makes the plug-in depend on an
+   external interpreter.
+
+**What was built is (2), with the guarantee restored by a different gate.** Conversion is a pure
+format transform — `pack_wavenet` copies the weight vector through verbatim and reinterprets
+nothing — so the two converters can be compared *directly* rather than through the audio they
+eventually produce. `nts_nam_parity` requires the C++ converter to write **byte-identical**
+`model.bin` to `nts-nam-import` for every capture, and byte identity is a strictly stronger claim
+than a rendering tolerance. It also transfers the whole existing chain to the in-plug-in path
+untouched: Python renderer checked against upstream `neural-amp-modeler`, C++ runtime checked
+against the Python renderer, C++ converter checked against the Python converter.
+
+Measured, at the time of writing: **708 of 708 comparisons byte-identical** — all 354 corpus
+captures at both tiers, zero failures, including the decimal-to-`float32` conversion of every one
+of the 12 146 weights in a standard-tier model. The duplicated reader is therefore pinned to the
+Python one by construction rather than by discipline.
+
+What an in-plug-in conversion still cannot do is produce independent vectors, so it does not
+pretend to: its artifacts carry `"testVectorSource": "runtime"` in the manifest, and the vectors
+prove the model loads, primes and runs deterministically rather than proving parity. The
+distinction is recorded in the artifact rather than only in a comment.
 
 **Problem.** Once conversion works, users still have no way to get a `.nam` into the plugin —
 `NeuralCapturePage`'s `loadModel` chooses an artifact directory, not a capture file.
@@ -506,13 +532,14 @@ rate, and redistribution.
 | 4 | N3 catalogue | 1.0 | N1 | ✅ |
 | 5 | N4 NTSM v3 + converter | 1.0 | N1 | ✅ |
 | 6 | N5 C++ WaveNet runtime | 3.0 | N4 | ✅ |
-| 7 | N6 import UX | 1.0 | N5 | Not started |
-| 8 | N7 gate + docs | 0.5 | N5 | Not started |
+| 7 | N6 import UX | 1.0 | N5 | ✅ |
+| 8 | N7 gate + docs | 0.5 | N5 | ✅ |
 
-**Remaining: N6 and N7.** N6 is plug-in plumbing — accept `.nam` in the file chooser, convert on the
-background worker, cache by digest, show capture metadata in the library. N7 is the WaveNet
-performance budget in `nts_ml_runtime_benchmarks`, a WaveNet case in the `nts_ml_runtime_parity`
-CTest so the Python/C++ agreement is enforced by CI rather than by hand, and the user-facing guide.
+**Nothing remains.** N6 landed as option (2) above — a C++ `.nam` reader and v3 packer, in-process
+zip extraction, digest-keyed conversion, a capture library with a page of its own and pickers on the
+Pedals and Neural Capture pages, and gear-type classification — with the parity guarantee restored by
+`nts_nam_parity` rather than given up. N7's benchmark budget, `nts_ml_runtime_parity` WaveNet case and
+guide were already in place; the guide now also covers importing without the command line.
 
 **Total ≈ 9.25 days.** Track A (N0–N3) is 3.75 days and ships playable models on the current
 runtime. Track B (N4–N7) is 5.5 days and makes the whole NAM ecosystem loadable exactly.

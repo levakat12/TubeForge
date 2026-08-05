@@ -30,12 +30,18 @@ private:
     tf::ui::SectionPanel meterPanel { "Tuner" };
     juce::Label noteLabel, centsLabel, frequencyLabel, hint;
     juce::ToggleButton muteWhileTuning { "Mute the output while tuning" };
+    juce::Label referenceCaption;
+    juce::Slider reference;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> muteAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> referenceAttachment;
 
     /// Latest reading, cached so paint and refresh agree within a frame.
     int midiNote { -1 };
     float cents {};
     bool voiced {};
+    /// Where the needle's scale is anchored, and what it is measuring. See paint.
+    float targetHz {};
+    float measuredHz {};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TunerPage)
 };

@@ -18,6 +18,7 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_cryptography/juce_cryptography.h>
 
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -68,6 +69,9 @@ constexpr auto gateDepth = "gateDepth";
 constexpr auto gateAttack = "gateAttack";
 constexpr auto gateHold = "gateHold";
 constexpr auto gateRelease = "gateRelease";
+constexpr auto loudnessMatch = "loudnessMatch";
+constexpr auto cabinetWidth = "cabinetWidth";
+constexpr auto tunerReference = "tunerReference";
 constexpr auto delayMix = "delayMix";
 constexpr auto delayTime = "delayTime";
 constexpr auto delayFeedback = "delayFeedback";
@@ -77,6 +81,32 @@ constexpr auto reverbSize = "reverbSize";
 constexpr auto reverbDamping = "reverbDamping";
 constexpr auto cabinetBlend = "cabinetBlend";
 constexpr auto tunerMute = "tunerMute";
+constexpr auto performanceTier = "performanceTier";
+// Six per slot, in the order PedalParameters declares them, so the slot index can walk them.
+constexpr auto pedal1Kind = "pedal1Kind";
+constexpr auto pedal1Bypass = "pedal1Bypass";
+constexpr auto pedal1Drive = "pedal1Drive";
+constexpr auto pedal1Tone = "pedal1Tone";
+constexpr auto pedal1Level = "pedal1Level";
+constexpr auto pedal1Mix = "pedal1Mix";
+constexpr auto pedal2Kind = "pedal2Kind";
+constexpr auto pedal2Bypass = "pedal2Bypass";
+constexpr auto pedal2Drive = "pedal2Drive";
+constexpr auto pedal2Tone = "pedal2Tone";
+constexpr auto pedal2Level = "pedal2Level";
+constexpr auto pedal2Mix = "pedal2Mix";
+constexpr auto pedal3Kind = "pedal3Kind";
+constexpr auto pedal3Bypass = "pedal3Bypass";
+constexpr auto pedal3Drive = "pedal3Drive";
+constexpr auto pedal3Tone = "pedal3Tone";
+constexpr auto pedal3Level = "pedal3Level";
+constexpr auto pedal3Mix = "pedal3Mix";
+constexpr auto pedal4Kind = "pedal4Kind";
+constexpr auto pedal4Bypass = "pedal4Bypass";
+constexpr auto pedal4Drive = "pedal4Drive";
+constexpr auto pedal4Tone = "pedal4Tone";
+constexpr auto pedal4Level = "pedal4Level";
+constexpr auto pedal4Mix = "pedal4Mix";
 } // namespace ParameterIds
 
 namespace
@@ -110,8 +140,22 @@ constexpr std::array ampControlIds {
     // entries and must keep mapping onto the ids ahead of these.
     ParameterIds::delayMix, ParameterIds::delayTime, ParameterIds::delayFeedback,
     ParameterIds::delayTone, ParameterIds::reverbMix, ParameterIds::reverbSize,
-    ParameterIds::reverbDamping, ParameterIds::cabinetBlend
+    ParameterIds::reverbDamping, ParameterIds::cabinetBlend,
+    // Appended for the same reason as the blocks above.
+    ParameterIds::loudnessMatch, ParameterIds::cabinetWidth, ParameterIds::tunerReference
 };
+
+/// Row per slot, column per PedalControl. The single place the two are paired.
+constexpr std::array<std::array<const char*, TubeForgeAudioProcessor::pedalParameterStride>,
+                     nts::pedals::slotCount> pedalParameterIds { {
+    { ParameterIds::pedal1Kind, ParameterIds::pedal1Bypass, ParameterIds::pedal1Drive,
+      ParameterIds::pedal1Tone, ParameterIds::pedal1Level, ParameterIds::pedal1Mix },
+    { ParameterIds::pedal2Kind, ParameterIds::pedal2Bypass, ParameterIds::pedal2Drive,
+      ParameterIds::pedal2Tone, ParameterIds::pedal2Level, ParameterIds::pedal2Mix },
+    { ParameterIds::pedal3Kind, ParameterIds::pedal3Bypass, ParameterIds::pedal3Drive,
+      ParameterIds::pedal3Tone, ParameterIds::pedal3Level, ParameterIds::pedal3Mix },
+    { ParameterIds::pedal4Kind, ParameterIds::pedal4Bypass, ParameterIds::pedal4Drive,
+      ParameterIds::pedal4Tone, ParameterIds::pedal4Level, ParameterIds::pedal4Mix } } };
 
 void setCircuitParameter(nts::circuit::NodeSpec& node, std::string_view id, float value)
 {
@@ -145,6 +189,14 @@ juce::File assistantPreferencesFile()
         .getChildFile("TubeForge").getChildFile("assistant-preferences.json");
 }
 
+/// Where converted `.nam` captures live. Beside the profile library, for the same reason: it is
+/// user data that outlives any one project and must not sit inside the plug-in's install.
+juce::File captureLibraryPath()
+{
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("TubeForge").getChildFile("captures");
+}
+
 std::filesystem::path tonePackageLibraryPath()
 {
     return std::filesystem::path(juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
@@ -165,19 +217,21 @@ BufferMeasurement measureBuffer(const juce::AudioBuffer<float>& buffer) noexcept
     if (channels <= 0 || samples <= 0) return result;
     double energy = 0.0, cross = 0.0, leftEnergy = 0.0, rightEnergy = 0.0;
     std::uint32_t crossings {};
+    // Hoisted out of the loop. getSample is a bounds-checked accessor with two levels of
+    // indirection, and this ran up to five times per sample, twice per block.
+    const auto* const leftChannel = buffer.getReadPointer(0);
+    const auto* const rightChannel = channels > 1 ? buffer.getReadPointer(1) : nullptr;
     for (int sample = 0; sample < samples; ++sample)
     {
-        for (int channel = 0; channel < channels; ++channel)
+        const auto left = leftChannel[sample];
+        result.peak = std::max(result.peak, std::abs(left)); energy += left * left;
+        if (std::abs(left) >= 0.999f) ++result.clipped;
+        if (sample > 0 && std::signbit(left) != std::signbit(leftChannel[sample - 1])) ++crossings;
+        if (rightChannel != nullptr)
         {
-            const auto value = buffer.getSample(channel, sample);
-            result.peak = std::max(result.peak, std::abs(value)); energy += value * value;
-            if (std::abs(value) >= 0.999f) ++result.clipped;
-        }
-        const auto left = buffer.getSample(0, sample);
-        if (sample > 0 && std::signbit(left) != std::signbit(buffer.getSample(0, sample - 1))) ++crossings;
-        if (channels > 1)
-        {
-            const auto right = buffer.getSample(1, sample);
+            const auto right = rightChannel[sample];
+            result.peak = std::max(result.peak, std::abs(right)); energy += right * right;
+            if (std::abs(right) >= 0.999f) ++result.clipped;
             cross += left * right; leftEnergy += left * left; rightEnergy += right * right;
         }
     }

@@ -139,7 +139,12 @@ void Biquad::advanceCoefficients() noexcept
 void Biquad::process(float* const* channels, std::size_t channelCount, std::size_t samples) noexcept
 {
     const auto count = std::min(channelCount, maximumChannels);
-    for (std::size_t sample = 0; sample < samples; ++sample)
+    // While the coefficients are interpolating, every sample sees a different filter and the
+    // advance is shared across channels, so that stretch has to stay sample-outer to keep the
+    // exact per-sample coefficient trajectory. It is typically 64 samples against a block of
+    // several hundred, so the block is split rather than run wholly on the slow path.
+    const auto interpolated = std::min(remaining, samples);
+    for (std::size_t sample = 0; sample < interpolated; ++sample)
     {
         advanceCoefficients();
         for (std::size_t channel = 0; channel < count; ++channel)
@@ -151,6 +156,31 @@ void Biquad::process(float* const* channels, std::size_t channelCount, std::size
             z2[channel] = current.b2 * input - current.a2 * output;
             channels[channel][sample] = suppressDenormal(static_cast<float>(output));
         }
+    }
+    if (interpolated == samples) return;
+
+    // Settled. The coefficients are fixed for the rest of the block and each channel's state is
+    // independent, so both live in locals and the channel streams its own buffer -- instead of
+    // reloading z1[channel] and z2[channel] from memory on every sample, which is what the
+    // sample-outer shape above forces and what made this the most-executed avoidable load in
+    // the engine. The arithmetic, its order, and its precision are unchanged, so the output is
+    // bit-identical to the previous implementation.
+    const auto b0 = current.b0, b1 = current.b1, b2 = current.b2;
+    const auto a1 = current.a1, a2 = current.a2;
+    for (std::size_t channel = 0; channel < count; ++channel)
+    {
+        auto* const buffer = channels[channel];
+        if (buffer == nullptr) continue;
+        auto state1 = z1[channel], state2 = z2[channel];
+        for (std::size_t sample = interpolated; sample < samples; ++sample)
+        {
+            const auto input = static_cast<double>(buffer[sample]);
+            const auto output = b0 * input + state1;
+            state1 = b1 * input - a1 * output + state2;
+            state2 = b2 * input - a2 * output;
+            buffer[sample] = suppressDenormal(static_cast<float>(output));
+        }
+        z1[channel] = state1; z2[channel] = state2;
     }
 }
 

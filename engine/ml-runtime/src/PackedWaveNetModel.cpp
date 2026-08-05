@@ -1,5 +1,7 @@
 #include "nts/ml/PackedWaveNetModel.h"
 
+#include "nts/dsp/Simd.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -91,6 +93,28 @@ bool PackedWaveNetModel::load(std::span<const std::byte> bytes, std::string& err
     layers = std::move(parsed);
     channelCount = channels;
     headKernelSize = headKernel;
+
+    // Transpose the convolution kernels from the file's [row][column][tap] into [tap][row][column],
+    // and the head from [row][tap] into [tap][row]. See packedWeights.
+    std::size_t packedTotal {};
+    for (auto& layer : layers)
+    {
+        layer.packedWeightOffset = packedTotal;
+        packedTotal += channels * channels * layer.kernelSize;
+    }
+    packedWeights.assign(packedTotal, 0.0f);
+    for (const auto& layer : layers)
+        for (std::size_t tap = 0; tap < layer.kernelSize; ++tap)
+            for (std::size_t row = 0; row < channels; ++row)
+                for (std::size_t column = 0; column < channels; ++column)
+                    packedWeights[layer.packedWeightOffset + (tap * channels + row) * channels + column]
+                        = weights[layer.weightOffset + row * channels * layer.kernelSize
+                                  + column * layer.kernelSize + tap];
+    packedHeadWeights.assign(channels * headKernel, 0.0f);
+    for (std::size_t tap = 0; tap < headKernel; ++tap)
+        for (std::size_t row = 0; row < channels; ++row)
+            packedHeadWeights[tap * channels + row] = weights[head + row * headKernel + tap];
+
     headHasBias = flags == 1;
     rechannelOffset = 0;
     headOffset = head;
@@ -162,29 +186,23 @@ float PackedWaveNetModel::processSample(float input) noexcept
             const auto lag = (layer.kernelSize - 1 - tap) * layer.dilation;
             const auto column = (layer.position + columns - lag % columns) % columns;
             const float* const source = ring + column * channels;
-            const float* const kernel = weights.data() + layer.weightOffset + tap;
+            // Tap-major, so each row's weights are contiguous against `source`.
+            const float* const kernel = packedWeights.data() + layer.packedWeightOffset
+                                      + tap * channels * channels;
             for (std::size_t row = 0; row < channels; ++row)
-            {
-                float sum = 0.0f;
-                const float* const kernelRow = kernel + row * channels * layer.kernelSize;
-                for (std::size_t column2 = 0; column2 < channels; ++column2)
-                    sum += kernelRow[column2 * layer.kernelSize] * source[column2];
-                activation[row] += sum;
-            }
+                activation[row] += dsp::dotProduct(kernel + row * channels, source, channels);
         }
         for (std::size_t row = 0; row < channels; ++row)
         {
             activation[row] = leakyRelu(activation[row]);
             headAccumulator[row] += activation[row];
         }
+        // The one-by-one convolution's weights were already row-contiguous; only the loop needed
+        // widening.
         for (std::size_t row = 0; row < channels; ++row)
-        {
-            float sum = weights[layer.oneBiasOffset + row];
-            const float* const kernelRow = weights.data() + layer.oneOffset + row * channels;
-            for (std::size_t column2 = 0; column2 < channels; ++column2)
-                sum += kernelRow[column2] * activation[column2];
-            trunk[row] += sum;
-        }
+            trunk[row] += weights[layer.oneBiasOffset + row]
+                        + dsp::dotProduct(weights.data() + layer.oneOffset + row * channels,
+                                          activation.data(), channels);
         layer.position = layer.position + 1 == columns ? 0 : layer.position + 1;
     }
     std::copy(headAccumulator.begin(), headAccumulator.end(), headHistory.data() + headPosition * channels);
@@ -194,9 +212,7 @@ float PackedWaveNetModel::processSample(float input) noexcept
         const auto lag = headKernelSize - 1 - tap;
         const auto column = (headPosition + headKernelSize - lag % headKernelSize) % headKernelSize;
         const float* const source = headHistory.data() + column * channels;
-        const float* const kernel = weights.data() + headOffset + tap;
-        for (std::size_t row = 0; row < channels; ++row)
-            output += kernel[row * headKernelSize] * source[row];
+        output += dsp::dotProduct(packedHeadWeights.data() + tap * channels, source, channels);
     }
     headPosition = headPosition + 1 == headKernelSize ? 0 : headPosition + 1;
     return output * headScale;
@@ -217,8 +233,11 @@ bool PackedWaveNetModel::setControls(std::span<const float> values) noexcept
 
 std::size_t PackedWaveNetModel::memoryBytes() const noexcept
 {
-    return (weights.size() + history.size() + headHistory.size() + primedHistory.size()
-            + primedHeadHistory.size() + trunk.size() + headAccumulator.size() + activation.size())
+    // The tap-major copies are counted: they are a real second residency of the kernels, which
+    // is the cost this layout trades for the contiguous inner loop.
+    return (weights.size() + packedWeights.size() + packedHeadWeights.size() + history.size()
+            + headHistory.size() + primedHistory.size() + primedHeadHistory.size() + trunk.size()
+            + headAccumulator.size() + activation.size())
            * sizeof(float) + layers.size() * sizeof(Layer);
 }
 } // namespace nts::ml

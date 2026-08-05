@@ -47,7 +47,25 @@ private:
     std::array<float, maximumChannels> damped {};
     std::array<SmoothedParameter, maximumChannels> delaySamples;
     float dampingCoefficient {};
+    /// The cutoff dampingCoefficient was derived from, so the exp is not repeated per block.
+    float dampingCoefficientHz { -1.0f };
+    bool engaged { true };
+    bool needsReset {};
 };
+
+/** Mix level at which a send stops being worth computing, with hysteresis so a control resting
+    on the boundary cannot oscillate.
+
+    At zero mix the wet signal is multiplied away, and for the reverb that is four comb filters
+    and two all-passes per channel computed for nothing. Skipping leaves the delay lines holding
+    whatever was in them, so re-engaging clears them first and lets the tail build from silence
+    -- which is continuous by construction, and is also what a listener expects when they bring a
+    send up. The alternative, replaying however many seconds of frozen audio the line happened to
+    be holding, is what the reverb did before.
+*/
+inline constexpr float sendEngageThreshold = 0.002f;
+inline constexpr float sendDisengageThreshold = 0.001f;
+void updateSendEngagement(bool& engaged, bool& needsReset, float mix) noexcept;
 
 struct ReverbParameters
 {
@@ -99,5 +117,9 @@ private:
     std::vector<float> wetBuffer;
     float feedback {};
     float damping {};
+    bool engaged { true };
+    bool needsReset {};
+    /// The cutoff the lowCut coefficients were derived from, so the design is not repeated.
+    float lowCutCoefficientHz { -1.0f };
 };
 } // namespace nts::dsp

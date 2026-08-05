@@ -11,9 +11,11 @@ namespace tf::ui
 enum class Glyph
 {
     amplifier,
+    pedalboard,
     toneShaping,
     cabinet,
     neuralCapture,
+    captures,
     toneAssistant,
     profileLibrary,
     circuit,

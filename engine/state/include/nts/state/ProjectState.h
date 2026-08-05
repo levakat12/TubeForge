@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -8,8 +9,15 @@
 
 namespace nts::state
 {
-inline constexpr int currentSchemaVersion = 3;
+inline constexpr int currentSchemaVersion = 4;
 inline constexpr std::string_view currentApplicationVersion = "0.10.0";
+/** Slots the pedalboard has.
+
+    Duplicates `nts::pedals::slotCount` deliberately: this library is the project format and
+    does not depend on the audio engine. A static assertion in the processor holds the two
+    together, so they cannot drift without the build failing.
+*/
+inline constexpr std::size_t maximumPedalSlots = 4;
 
 struct EngineState
 {
@@ -65,6 +73,39 @@ struct AssetState
     bool operator==(const AssetState&) const = default;
 };
 
+/** One pedal slot, as saved.
+
+    A block of its own rather than more entries in `EngineState::ampControls`, for two
+    reasons: a slot carries a file path as well as numbers, and the flat control vector is
+    capped at 64 entries by validation -- four slots would have taken it past that and turned
+    a schema addition into a change to a limit that exists for a different reason.
+
+    `kind` is the PedalKind enumerator. It is held as an int so this header does not have to
+    depend on the pedal engine, and it is range-checked on the way in.
+*/
+struct PedalSlotState
+{
+    int kind {};
+    bool bypassed {};
+    float drive { 5.0f };
+    float tone { 5.0f };
+    float levelDb {};
+    float mix { 100.0f };
+    /// The artifact directory staged into this slot, empty when there is no capture.
+    std::string modelPath;
+
+    bool operator==(const PedalSlotState&) const = default;
+};
+
+struct PedalboardState
+{
+    /// Empty means no board at all, which is what a project written before schema 4 has and
+    /// what a rig of amplifier and cabinet alone still writes.
+    std::vector<PedalSlotState> slots;
+
+    bool operator==(const PedalboardState&) const = default;
+};
+
 struct ProjectState
 {
     int schemaVersion { currentSchemaVersion };
@@ -74,6 +115,7 @@ struct ProjectState
     GraphState graph;
     UiState ui;
     AssetState assets;
+    PedalboardState pedalboard;
 
     bool operator==(const ProjectState&) const = default;
 };

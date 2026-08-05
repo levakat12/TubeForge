@@ -4,6 +4,7 @@
 #include <nts/ml/NeuralModel.h>
 #include <nts/ml/PackedTanhModel.h>
 #include <nts/ml/PackedWaveNetModel.h>
+#include <nts/dsp/Nonlinear.h>
 
 #include <algorithm>
 #include <atomic>
@@ -217,5 +218,120 @@ int main()
     countAllocations = false;
     tests.expectEqual(allocationCount.load(std::memory_order_relaxed), std::size_t { 0 },
                       "WaveNet audio processing performs no heap allocation");
+
+    // The approximate activations, and the bound that makes them defensible. An approximation
+    // without an asserted error is a guess, and this one is opt-in precisely because it is not
+    // bit-exact -- so the size of "not bit-exact" has to be a number.
+    {
+        auto worstTanh = 0.0f, worstSigmoid = 0.0f;
+        for (int step = -12000; step <= 12000; ++step)
+        {
+            const auto x = static_cast<float>(step) * 0.001f;
+            worstTanh = std::max(worstTanh, std::abs(nts::dsp::fastTanh(x) - std::tanh(x)));
+            const auto exactSigmoid = 1.0f / (1.0f + std::exp(-x));
+            worstSigmoid = std::max(worstSigmoid, std::abs(nts::dsp::fastSigmoid(x) - exactSigmoid));
+        }
+        tests.expect(worstTanh < 1.0e-4f, "fastTanh stays within 1e-4 of std::tanh over +/-12");
+        tests.expect(worstSigmoid < 1.0e-4f, "fastSigmoid stays within 1e-4 of the exact logistic");
+        tests.expectNear(nts::dsp::fastTanh(0.0f), 0.0, 1.0e-9, "fastTanh is exactly odd at zero");
+        tests.expectNear(nts::dsp::fastSigmoid(0.0f), 0.5, 1.0e-9, "fastSigmoid is exactly a half at zero");
+
+        // And the model has to agree with itself: the same input through the exact and the
+        // approximate path must differ by far less than the signal, or the approximation is
+        // compounding through the recurrence rather than staying bounded.
+        // An LSTM, not the simpler fixture: the approximation is deliberately declined for
+        // tanhRnn, so comparing the two paths there would compare a model against itself and
+        // assert nothing at all.
+        const auto lstmBytes = nts::test::lstmFixture(32);
+        nts::ml::PackedTanhModel exact, approximate;
+        tests.expect(exact.load(lstmBytes, error) && approximate.load(lstmBytes, error),
+                     "activation-comparison fixtures load: " + error);
+        approximate.setApproximateActivations(true);
+        tests.expect(approximate.approximatesActivations() && ! exact.approximatesActivations(),
+                     "the approximate path is opt-in and reported");
+
+        // And the architecture-aware decline itself, which is what makes the comparison above
+        // meaningful rather than accidental.
+        nts::ml::PackedTanhModel declined;
+        tests.expect(declined.load(bytes, error), "tanhRnn fixture loads: " + error);
+        declined.setApproximateActivations(true);
+        tests.expect(! declined.approximatesActivations(),
+                     "tanhRnn declines the approximation, which measured slower than exact");
+        std::vector<float> drive(4096), exactOut(4096), approximateOut(4096);
+        for (std::size_t index = 0; index < drive.size(); ++index)
+            drive[index] = 0.4f * std::sin(0.05f * static_cast<float>(index))
+                         + 0.2f * std::sin(0.31f * static_cast<float>(index));
+        exact.reset(); approximate.reset();
+        exact.process(drive, exactOut);
+        approximate.process(drive, approximateOut);
+        auto worstModel = 0.0f;
+        for (std::size_t index = 0; index < drive.size(); ++index)
+            worstModel = std::max(worstModel, std::abs(exactOut[index] - approximateOut[index]));
+        tests.expect(worstModel < 1.0e-3f,
+                     "approximate activations do not accumulate through the recurrence");
+    }
+
+    // Mono collapse. A duplicated stereo input must produce exactly what a genuine mono
+    // instance produces -- if it did not, the optimisation would be changing the sound rather
+    // than saving the work -- and returning to real stereo must not step.
+    {
+        nts::ml::NeuralAmpProcessor stereo, mono;
+        stereo.prepare(48000.0, 64, 2);
+        mono.prepare(48000.0, 64, 1);
+        tests.expect(stereo.stageModel(bytes, input, expected, 1.0e-6f, -21.0f, error)
+                     && mono.stageModel(bytes, input, expected, 1.0e-6f, -21.0f, error),
+                     "mono-collapse fixtures stage: " + error);
+
+        std::array<float, 64> stereoLeft {}, stereoRight {}, monoBlock {};
+        float* stereoChannels[] { stereoLeft.data(), stereoRight.data() };
+        float* monoChannel[] { monoBlock.data() };
+
+        auto worstAgainstMono = 0.0f;
+        for (int callback = 0; callback < 12; ++callback)
+        {
+            for (std::size_t index = 0; index < stereoLeft.size(); ++index)
+            {
+                const auto value = 0.15f * std::sin(0.11f * static_cast<float>(callback * 64 + index));
+                stereoLeft[index] = stereoRight[index] = monoBlock[index] = value;
+            }
+            stereo.process(stereoChannels, 2, stereoLeft.size());
+            mono.process(monoChannel, 1, monoBlock.size());
+            for (std::size_t index = 0; index < stereoLeft.size(); ++index)
+            {
+                worstAgainstMono = std::max(worstAgainstMono, std::abs(stereoLeft[index] - monoBlock[index]));
+                worstAgainstMono = std::max(worstAgainstMono, std::abs(stereoRight[index] - monoBlock[index]));
+            }
+        }
+        tests.expect(worstAgainstMono < 1.0e-6f,
+                     "collapsed stereo output matches a genuine mono instance exactly");
+
+        // Now break the duplication. The second instance has been idle, so this is the
+        // transition its restore fade exists for.
+        auto previousRight = stereoRight.back();
+        auto largestStep = 0.0f;
+        for (int callback = 0; callback < 16; ++callback)
+        {
+            for (std::size_t index = 0; index < stereoLeft.size(); ++index)
+            {
+                const auto phase = 0.11f * static_cast<float>((callback + 12) * 64 + index);
+                stereoLeft[index] = 0.15f * std::sin(phase);
+                stereoRight[index] = 0.15f * std::sin(phase * 1.37f);
+            }
+            stereo.process(stereoChannels, 2, stereoLeft.size());
+            for (const auto value : stereoRight)
+            {
+                largestStep = std::max(largestStep, std::abs(value - previousRight));
+                previousRight = value;
+            }
+        }
+        tests.expect(std::isfinite(largestStep) && largestStep < 0.08f,
+                     "returning to genuine stereo fades the second instance in rather than stepping");
+
+        allocationCount.store(0, std::memory_order_relaxed); countAllocations = true;
+        stereo.process(stereoChannels, 2, stereoLeft.size());
+        countAllocations = false;
+        tests.expectEqual(allocationCount.load(std::memory_order_relaxed), std::size_t { 0 },
+                          "mono-collapse detection allocates nothing on the audio path");
+    }
     return tests.result();
 }

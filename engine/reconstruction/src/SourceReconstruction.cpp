@@ -294,8 +294,54 @@ struct CandidatePoint
     float gain {};
     float brightness {};
     float tightness {};
+    /** How open the rig's response to a pick should be. 1 is fast and uncompressed.
+
+        Unlike the axes above it starts from a direct measurement -- crest factor and attack
+        time -- rather than from a descriptor whose mapping onto amplifier controls is a guess,
+        so the coarse grid does not perturb it and the refinement pass does. Seeded by
+        `dynamicsSeed`, consumed by `setCandidateParameters` for attack reduction, pick
+        emphasis and part of the supply sag.
+    */
+    float dynamics { 0.5f };
     float driveOffset {};
 };
+
+/** Where the dynamics axis starts, from the two features the transient score is built on.
+
+    Normalised against the same references `ToneSimilarity::compare` uses -- 18 dB of crest
+    factor and 40 ms of attack -- so a point that scores well on the transient term and a point
+    that sits at the measured seed mean the same thing rather than two different things.
+
+    Both halves point the same way: high crest factor and a short attack are the open, dynamic
+    end, and the amplifier parameters this drives all read 1 as "get out of the way".
+
+    `doubleTrackingLikelihood` corrects for the reference being two performances rather than one,
+    which is the normal case for a hard-panned rhythm guitar. Both measurements are corrupted in
+    the same direction by that, and neither is a property of the amplifier:
+
+      - two takes sum with their peaks landing at different moments, so the crest factor of the
+        sum is lower than either take's;
+      - two pick attacks tens of milliseconds apart read as one attack lasting the gap between
+        them, so the measured attack time is longer than either take's.
+
+    Uncorrected, a double-tracked reference therefore fits a rig with more attack softening, less
+    pick emphasis and more supply sag than the amplifier in the recording had -- the analyser
+    would be measuring the arrangement. The corrections are the size of the effect in typical
+    double-tracked material, not derived quantities: about 3 dB of crest factor and about 12 ms of
+    apparent attack at full likelihood. Better still is to analyse one side alone, which
+    `recommendStereoMode` now steers towards; this is the fallback for when the reference is
+    genuinely a summed pair.
+*/
+float dynamicsSeed(const nts::tone::DynamicFeatures& dynamic,
+                   float doubleTrackingLikelihood) noexcept
+{
+    const auto layered = clamp01(doubleTrackingLikelihood);
+    const auto crestDb = dynamic.crestFactorDb + 3.0f * layered;
+    const auto attackMs = std::max(0.0f, dynamic.attackMilliseconds - 12.0f * layered);
+    const auto crest = clamp01(crestDb / 18.0f);
+    const auto attack = clamp01(1.0f - attackMs / 40.0f);
+    return clamp01(0.5f * (crest + attack));
+}
 
 /** Centres a search axis so a whole grid of steps stays inside 0..1.
 
@@ -312,24 +358,49 @@ float gridCentre(float base, float span) noexcept
     return std::clamp(base, span, 1.0f - span);
 }
 
+/** Steps ordered centre-first, so a pool smaller than the whole grid stays unbiased.
+
+    The arithmetic form these replace -- `(variant / radix) % 3 - 1` -- put -1 at index 0.
+    Callers ask for `poolSize` *consecutive* variants and `poolSize` is 12 by default, so the
+    two slowest digits never advanced: every candidate rendered one step below the measured
+    tightness, and ten of twelve below the measured brightness. Brightness drives the pre-EQ
+    high cut, the treble control, presence and the post high shelf, so the whole pool came out
+    darker than the reference in four places at once and none of it brighter. Centre-first
+    ordering means index 0 is the measured value whatever the pool size is.
+*/
+constexpr std::array<int, 3> centredSteps { 0, -1, 1 };
+constexpr std::array<int, 5> centredGainSteps { 0, -1, 1, -2, 2 };
+
 /** Maps a coarse variant index onto a point.
 
-    Topology varies fastest so both voicings are covered within a small pool, then
-    gain, then brightness and tightness. A single scalar offset taken as
-    `variant % 5` gave only five distinct rigs, so a pool of twelve rendered seven
-    exact duplicates; this mixed radix gives 2 x 5 x 3 x 3 = 90 unique points.
+    Digits are ordered by how much a small pool gains from sampling them, because a caller asks
+    for `poolSize` *consecutive* variants and the slow digits then never advance. Gain is
+    fastest: it has five steps, it is the axis a listener reads as "is this the right amount of
+    amplifier", and at the default pool of twelve `variant % 5` covers all five. Brightness
+    follows and gets all three. Tightness and topology sit behind them and stay at their centres
+    for a default pool -- which is the measured value, so the pool is unbiased even where it is
+    unexplored, and the refinement pass steps tightness while the post-refinement re-check
+    covers topology.
+
+    An earlier ordering here put brightness fastest and gain on `variant / 9`, which fixed the
+    dullness bias but cut gain from five sampled steps to two. Both mattered; this ordering gets
+    both. The mixed radix gives 5 x 3 x 3 x `topologyCount` unique points.
+
+    Dynamics is deliberately absent: it is seeded from a direct measurement rather than a
+    guessed mapping, so its centre is already the best coarse answer and perturbing it here
+    would cost pool slots that gain and brightness use better. Refinement explores it.
 */
-CandidatePoint coarsePoint(const nts::tone::ToneReport& report, std::size_t variant)
+CandidatePoint coarsePoint(const nts::tone::ToneReport& report, float dynamics, std::size_t variant)
 {
-    const auto topologyStep = variant % 2;
-    const auto gainStep = static_cast<int>((variant / 2) % 5) - 2;
-    const auto brightnessStep = static_cast<int>((variant / 10) % 3) - 1;
-    const auto tightnessStep = static_cast<int>((variant / 30) % 3) - 1;
+    const auto gainStep = centredGainSteps[variant % 5];
+    const auto brightnessStep = centredSteps[(variant / 5) % 3];
+    const auto tightnessStep = centredSteps[(variant / 15) % 3];
+    const auto topologyStep = (variant / 45) % nts::amp::topologyCount;
     const auto offset = static_cast<float>(gainStep) * 0.06f;
 
     CandidatePoint point;
-    point.topology = topologyStep == 0 ? nts::amp::Topology::tightModern
-                                       : nts::amp::Topology::vintageBloom;
+    point.dynamics = dynamics;
+    point.topology = static_cast<nts::amp::Topology>(topologyStep);
     point.gain = clamp01(gridCentre(report.gain.value, 0.12f) + offset);
     point.brightness = clamp01(gridCentre(report.brightness.value, 0.12f) - offset * 0.5f
                                + static_cast<float>(brightnessStep) * 0.06f);
@@ -346,14 +417,36 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
     const auto gain = point.gain;
     const auto brightness = point.brightness;
     const auto tightness = point.tightness;
+    const auto dynamics = point.dynamics;
     const auto offset = point.driveOffset;
     p.topology = point.topology;
+    // Off for the same reason the stages below are oversampled: the analyser has to see the
+    // amplifier and not the output stage. The matcher normalises output RMS back to the dry
+    // input's with a ~104 ms time constant, which is a slow compressor sitting on the render --
+    // and `ToneSimilarity::compare` scores that render on crest factor, loudness range,
+    // compression amount and attack time. Left on, the dynamics and transient terms measure the
+    // matcher rather than the rig, so a candidate could not be ranked on how it responds to a
+    // pick.
+    //
+    // This preset is also what the user auditions, so the setting ships with the match rather
+    // than applying to the render alone. That is deliberate: a rig chosen for its dynamics
+    // should not have them flattened on playback by the stage that was excluded from choosing
+    // it. Hand-built presets keep the matcher's `true` default.
+    p.loudnessMatch = false;
     p.stageCount = gain < 0.2f ? 2 : gain < 0.65f ? 3 : 4;
     for (std::size_t stage = 0; stage < p.stages.size(); ++stage)
     {
         p.stages[stage].driveDb = 2.0f + gain * 28.0f + static_cast<float>(stage) * 2.0f + offset * 20.0f;
         p.stages[stage].bias = (0.5f - report.tightness.value) * 0.45f + offset;
         p.stages[stage].asymmetry = gain * 0.35f;
+        /* Attack softening, from the dynamics axis.
+
+           `transientGain = 1 / (1 + 22 * attackReduction * attack)` in the preamp stage, so this
+           is literally how much the amplifier rounds off a pick. It was never fitted -- every
+           candidate carried whatever `makeOriginalPreset` left -- which is why two references
+           with very different attack profiles produced rigs that felt the same. High dynamics
+           means a fast, uncompressed reference and therefore little softening. */
+        p.stages[stage].attackReduction = clamp01(0.55f - dynamics * 0.45f);
         // Candidates were rendered at 1x, so the tone analyser measured the
         // aliasing of the render rather than the amplifier. Fold-back adds
         // inharmonic high-frequency energy that scales with drive, so high-gain
@@ -366,12 +459,21 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
         ? 28.0f + tightness * 45.0f : 55.0f + tightness * 95.0f;
     p.preEq.highCutHz = 6500.0f + brightness * 9500.0f;
     p.preEq.tightness = tightness;
+    // A peaking filter at 2800 Hz -- the amplifier's own pick-attack control, and the other
+    // parameter that was never fitted, so it sat at 0 dB for every candidate ever produced.
+    // +-3 dB either side of flat, following the dynamics axis: an open reference gets the peak,
+    // a compressed one gets it taken away.
+    p.preEq.pickEmphasisDb = (dynamics - 0.5f) * 6.0f;
     p.toneStack.bass = clamp01(0.35f + report.cleanLowBlendEstimate.value * 0.35f);
     p.toneStack.mid = clamp01(0.35f + (1.0f - brightness) * 0.35f + offset);
     p.toneStack.treble = clamp01(0.22f + brightness * 0.65f);
     p.powerAmp.masterDb = -12.0f + gain * 10.0f;
     p.powerAmp.saturation = gain;
-    p.powerAmp.sag = clamp01(0.75f - tightness * 0.55f);
+    // Half from tightness, half from dynamics inverted: sag is supply compression, so an open
+    // reference wants less of it. The candidate assembly in `reconstruct` then blends the
+    // measured `compression` descriptor in on top of this, which is the sustained counterpart to
+    // the transient measurement the dynamics axis carries.
+    p.powerAmp.sag = clamp01((0.75f - tightness * 0.55f) * 0.5f + (1.0f - dynamics) * 0.5f);
     p.powerAmp.feedback = clamp01(0.25f + tightness * 0.55f);
     p.powerAmp.presence = brightness;
     p.powerAmp.resonance = report.cleanLowBlendEstimate.value;
@@ -390,7 +492,13 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
 /** Neighbours of a point, one step along each axis. Topology is deliberately not
     perturbed: it is a discrete voicing already covered by the coarse pass, and
     stepping it here would restart the search rather than refine it.
+
+    Dynamics is stepped here and nowhere else. The coarse grid seeds it at the measured value and
+    leaves it alone, so this is the only thing that can move it -- which is the point: descending
+    from a measurement is cheaper and better conditioned than sampling a guess.
 */
+constexpr std::size_t refinementAxes = 4;
+
 std::vector<CandidatePoint> refinementNeighbours(const CandidatePoint& centre, float step)
 {
     std::vector<CandidatePoint> points;
@@ -399,7 +507,9 @@ std::vector<CandidatePoint> refinementNeighbours(const CandidatePoint& centre, f
         auto gainPoint = centre; gainPoint.gain = clamp01(centre.gain + direction * step);
         auto brightPoint = centre; brightPoint.brightness = clamp01(centre.brightness + direction * step);
         auto tightPoint = centre; tightPoint.tightness = clamp01(centre.tightness + direction * step);
-        points.push_back(gainPoint); points.push_back(brightPoint); points.push_back(tightPoint);
+        auto dynamicPoint = centre; dynamicPoint.dynamics = clamp01(centre.dynamics + direction * step);
+        points.push_back(gainPoint); points.push_back(brightPoint);
+        points.push_back(tightPoint); points.push_back(dynamicPoint);
     }
     return points;
 }
@@ -553,6 +663,35 @@ StereoAudio selectStem(const StemSet& stems, TargetInstrument target)
             samples[index] = high[channel] - low[channel];
         }
     return guitar;
+}
+
+StereoMode recommendStereoMode(const StereoAudio& audio, float doubleTrackingLikelihood)
+{
+    // Below this the reference reads as one source and the sum is what the listener hears, so
+    // there is nothing to be gained by throwing half of it away. Set where the analyser's own
+    // estimate becomes confident rather than merely non-zero: doubleTrackingLikelihood is a
+    // product of three clamped terms and drifts off the floor for any wide mono-ish source.
+    constexpr auto layeredThreshold = 0.45f;
+    if (! audio.stereo() || audio.samples() == 0 || doubleTrackingLikelihood < layeredThreshold)
+        return StereoMode::fullStereo;
+
+    // Transient peak energy, not total energy: the first difference emphasises pick attacks over
+    // sustain, and the transient axis is what analysing one side exists to protect. A channel
+    // that is merely louder is not the one that was picked harder.
+    const auto transientEnergy = [](const std::vector<float>& channel)
+    {
+        double energy {};
+        for (std::size_t index = 1; index < channel.size(); ++index)
+        {
+            const auto slope = static_cast<double>(channel[index]) - channel[index - 1];
+            energy += slope * slope;
+        }
+        return energy;
+    };
+    const auto left = transientEnergy(audio.left);
+    const auto right = transientEnergy(audio.right);
+    if (left <= 0.0 && right <= 0.0) return StereoMode::fullStereo;
+    return left >= right ? StereoMode::left : StereoMode::right;
 }
 
 StereoAudio applyStereoMode(const StereoAudio& audio, StereoMode mode)
@@ -791,7 +930,10 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
     std::vector<RigCandidate> pool;
     std::vector<CandidatePoint> evaluatedPoints;
 
-    const auto totalRenders = poolSize + refinementSteps.size() * 6;
+    // Two directions along each refinement axis per round, plus the topology re-check, which
+    // renders the refined point under every voicing the coarse pool did not reach.
+    const auto totalRenders = poolSize + refinementSteps.size() * refinementAxes * 2
+                            + nts::amp::topologyCount - 1;
     std::size_t rendersDone {};
 
     const auto evaluate = [&](const CandidatePoint& point) -> std::optional<RigCandidate>
@@ -809,13 +951,31 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
         candidate.adaptation.inputTrimDb = inputTrim;
         candidate.adaptation.lowShelfDb = (reference.tone.report.cleanLowBlendEstimate.value - 0.5f) * 6.0f;
         candidate.adaptation.midEqDb = (0.5f - reference.tone.report.brightness.value) * 3.0f;
-        candidate.adaptation.highShelfDb = (reference.tone.report.brightness.value - 0.5f) * 5.0f;
+        // Reported from the candidate's own brightness rather than the reference's, because
+        // this is the same decision `setCandidateParameters` already applies as `postHighDb` --
+        // the pre-EQ has no high shelf to put it in. Taken from the unperturbed measurement it
+        // described a shelf half a grid step away from the one the preset actually carries.
+        candidate.adaptation.highShelfDb = (point.brightness - 0.5f) * 5.0f;
         candidate.adaptation.dynamicRangeScale = std::clamp(1.35f - reference.tone.report.compression.value, 0.45f, 1.35f);
         candidate.rigPreset.parameters.manualInputTrimDb = candidate.adaptation.inputTrimDb;
         candidate.rigPreset.parameters.preEq.lowShelfEnabled = true;
         candidate.rigPreset.parameters.preEq.lowShelfDb = candidate.adaptation.lowShelfDb;
         candidate.rigPreset.parameters.preEq.midEmphasisEnabled = true;
         candidate.rigPreset.parameters.preEq.midEmphasisDb = candidate.adaptation.midEqDb;
+        /* Supply sag, half from the search axis and half from the measured compression.
+
+           `dynamicRangeScale` was the only consumer of the `compression` descriptor and had no
+           consumer of its own, so the one measurement describing how compressed the reference
+           is influenced nothing in the render. Sag is the amplifier's own dynamic-range
+           mechanism -- a compressed reference wants more of it, an open one less -- so that is
+           where it belongs.
+
+           Blended rather than substituted: `setCandidateParameters` derives sag from tightness,
+           and taking it over outright would remove sag from the refinement pass, which steps
+           tightness but cannot see this. Half each keeps both able to move it. */
+        const auto sagFromCompression = clamp01((1.35f - candidate.adaptation.dynamicRangeScale) / 0.9f);
+        auto& powerAmp = candidate.rigPreset.parameters.powerAmp;
+        powerAmp.sag = clamp01(powerAmp.sag * 0.5f + sagFromCompression * 0.5f);
         nts::amp::TraditionalAmpProcessor processor;
         processor.prepare({ sampleRate, 512, 1 });
         processor.loadPreset(candidate.rigPreset, 0);
@@ -864,9 +1024,13 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
         return true;
     };
 
-    // Coarse pass: sample the grid, covering both topologies.
+    // Coarse pass: sample the grid. Topology is the slowest digit, so a default pool covers one
+    // voicing here and the other is reached by the re-check after refinement.
+    const auto dynamics = dynamicsSeed(reference.tone.features.dynamic,
+                                       reference.tone.features.spatial.doubleTrackingLikelihood);
     for (std::size_t variant = 0; variant < poolSize; ++variant)
-        if (! record(coarsePoint(reference.tone.report, variant), "rendering and ranking candidate rigs"))
+        if (! record(coarsePoint(reference.tone.report, dynamics, variant),
+                     "rendering and ranking candidate rigs"))
         { result.error = "reconstruction cancelled"; return result; }
 
     if (pool.empty()) { result.error = "candidate rendering did not produce a valid tone"; return result; }
@@ -900,6 +1064,27 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
             // same point cannot either.
             if (! improved) break;
         }
+
+        // Topology re-check. The descent above deliberately leaves topology alone -- stepping a
+        // discrete voicing restarts the search rather than refining it -- but it is the slowest
+        // coarse digit, so a default pool of twelve only ever sampled the first voicing. One
+        // render of the winning point under each of the others is what keeps them reachable at
+        // all, and it is a fairer comparison than the coarse pass gave: every voicing is judged
+        // at the refined position rather than at whichever grid corner it landed on.
+        //
+        // This is the whole reason a voicing added to the enum costs search time: it is
+        // `topologyCount - 1` extra offline renders on every reconstruction, not one. That is
+        // the price of the voicing being findable, and dropping to a sampled subset would mean
+        // some amplifiers could never win a match.
+        for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+        {
+            const auto other = static_cast<nts::amp::Topology>(index);
+            if (other == bestPoint.topology) continue;
+            auto alternative = bestPoint;
+            alternative.topology = other;
+            if (! record(alternative, "comparing the other power-stage voicings"))
+            { result.error = "reconstruction cancelled"; return result; }
+        }
     }
 
     std::sort(pool.begin(), pool.end(), [&](const auto& first, const auto& second)
@@ -910,11 +1095,14 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
     // entries waste its slots. Refinement deliberately produces points close to
     // the winner, so take the best first and then only entries that actually
     // sound like a different rig, falling back to rank order if too few qualify.
+    // Topology is deliberately not one of the tests. It is a discrete flag, so including it
+    // guaranteed that flipping it alone qualified as a different rig, and the shortlist filled
+    // with pairs that differed by little else -- which is why topology read as the axis the
+    // match cared most about. Judge difference on what a listener hears instead.
     const auto audiblyDifferent = [](const nts::amp::AmpParameters& first,
                                      const nts::amp::AmpParameters& second)
     {
-        return first.topology != second.topology
-            || std::abs(first.stages[0].driveDb - second.stages[0].driveDb) > 1.5f
+        return std::abs(first.stages[0].driveDb - second.stages[0].driveDb) > 1.5f
             || std::abs(first.toneStack.treble - second.toneStack.treble) > 0.05f
             || std::abs(first.toneStack.mid - second.toneStack.mid) > 0.05f
             || std::abs(first.preEq.highCutHz - second.preEq.highCutHz) > 400.0f

@@ -163,11 +163,39 @@ SongMatchPage::SongMatchPage(TubeForgeAudioProcessor& processorToUse)
                             "judging the match through a sound it was never compared against. "
                             "Pedal slots keep their settings and their loaded models; the two "
                             "sends have no bypass, so their mix is turned down instead.");
+    autoMatch.setTooltip("Lets the analysis own the amplifier. Applying a candidate then sets "
+                         "every control it fitted -- drive, EQ, presence, resonance and the whole "
+                         "Tone Shaping page -- and keeps them. You can still change any of them; "
+                         "TubeForge asks once, the first time you reach for each one, and then "
+                         "leaves that control to you.");
+    reclaim.setTooltip("Puts the matched values back on the controls you have taken over, and "
+                       "resumes holding them.");
+    tracking.setTooltip("Lets the held rig follow what you are playing: the input trim aims the "
+                        "incoming peak where the preamp expects it, and the gate threshold sits "
+                        "just above the measured noise floor. Both stay within 6 dB of what the "
+                        "match set, and nothing else moves. Useful when you swap to a guitar with "
+                        "hotter pickups; off by default, because a control that moves on its own "
+                        "is alarming until you know why.");
+    restoreWarnings.setTooltip("You asked not to be warned before changing a control the match "
+                               "had set. Click to be asked again.");
+    tf::ui::configureLabel(autoStatus, "", 10.0f, false, theme::textTertiary);
     for (auto* component : std::initializer_list<juce::Component*> { &importSong, &cancel,
              &applyCandidate, &exportCandidate, &target, &stereoMode, &region, &useRegion,
              &candidate, &captions[0], &captions[1], &captions[2], &captions[3], &isolateChain,
-             &view })
+             &autoMatch, &tracking, &autoStatus, &view })
         addAndMakeVisible(*component);
+    addChildComponent(reclaim);
+    addChildComponent(restoreWarnings);
+
+    autoMatch.onClick = [this] { processor.setAutoMatchEnabled(autoMatch.getToggleState()); };
+    reclaim.onClick = [this] { processor.reclaimAllAutoMatchParameters(); };
+    tracking.onClick = [this] { processor.setAutoMatchTracking(tracking.getToggleState()); };
+    restoreWarnings.onClick = [this] { processor.setAutoMatchWarningsSuppressed(false); };
+    // Pushed rather than read back, so an automatic apply does exactly what pressing Apply with
+    // the same switch set would have done. Sent once now for the default and on every change.
+    processor.setAutoMatchIsolatesChain(isolateChain.getToggleState());
+    isolateChain.onClick = [this]
+    { processor.setAutoMatchIsolatesChain(isolateChain.getToggleState()); };
 
     importSong.onClick = [this] { chooseSong(); };
     cancel.onClick = [this] { processor.cancelSongReconstruction(); };
@@ -212,11 +240,41 @@ void SongMatchPage::resized()
     regionRow.removeFromLeft(8);
     exportCandidate.setBounds(regionRow.removeFromLeft(130).withTrimmedTop(13).withHeight(28));
     area.removeFromTop(8);
+
+    // Auto Match gets a row of its own rather than a corner of one of the others: it is the only
+    // control on this page that changes what every *other* page does.
+    auto autoRow = area.removeFromTop(26);
+    autoMatch.setBounds(autoRow.removeFromLeft(214));
+    autoRow.removeFromLeft(6);
+    tracking.setBounds(autoRow.removeFromLeft(168));
+    autoRow.removeFromLeft(8);
+    reclaim.setBounds(autoRow.removeFromLeft(116).reduced(0, 1));
+    autoRow.removeFromLeft(6);
+    restoreWarnings.setBounds(autoRow.removeFromLeft(104).reduced(0, 1));
+    autoRow.removeFromLeft(10);
+    autoStatus.setBounds(autoRow);
+    area.removeFromTop(6);
     view.setBounds(area);
 }
 
 void SongMatchPage::refresh()
 {
+    // The switch is a parameter, so a project recall or a second editor can move it. Learned by
+    // looking rather than assumed, the same way the voicing boxes on the other pages are.
+    const auto autoEnabled = processor.autoMatchEnabled();
+    if (autoMatch.getToggleState() != autoEnabled)
+        autoMatch.setToggleState(autoEnabled, juce::dontSendNotification);
+    const auto trackingEnabled = processor.autoMatchTracking();
+    if (tracking.getToggleState() != trackingEnabled)
+        tracking.setToggleState(trackingEnabled, juce::dontSendNotification);
+    // Tracking without a rig to bound it has nothing to follow, so the control is only offered
+    // once Auto Match itself is on.
+    tracking.setEnabled(autoEnabled);
+    const auto state = processor.autoMatchState();
+    reclaim.setVisible(state == tf::automatch::State::overridden);
+    restoreWarnings.setVisible(processor.autoMatchWarningsSuppressed());
+    autoStatus.setText(processor.autoMatchStatusText(), juce::dontSendNotification);
+
     const auto reconstruction = processor.reconstructionSnapshot();
     const auto playableRegions = processor.reconstructionRegionsSnapshot();
     juce::StringArray regionLabels;

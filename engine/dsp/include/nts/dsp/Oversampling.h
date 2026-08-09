@@ -62,6 +62,40 @@ public:
     [[nodiscard]] double filterMagnitude(double normalizedFrequency) const noexcept;
     [[nodiscard]] bool hasLinearPhaseCoefficients() const noexcept;
 
+    /** As `process`, but the nonlinearity is told which channel it is running on.
+
+        For a *stateful* curve -- antiderivative anti-aliasing keeps one previous sample per
+        channel -- and for nothing else. The plain `process` below traverses channel-major, so a
+        caller could in principle recover the channel by counting calls and dividing by the block
+        length; that works today and breaks silently the moment this loop is restructured or
+        vectorised across channels. Passing the index costs nothing and cannot go quietly wrong.
+
+        `nonlinear` is invoked as `nonlinear(sample, channel)`.
+    */
+    template <typename NonlinearFunction>
+    void processIndexed(float* const* channels, std::size_t channelCount, std::size_t samples,
+                        NonlinearFunction&& nonlinear) noexcept
+    {
+        const auto count = std::min({ channelCount, spec.channels, maximumChannels });
+        if (oversamplingFactor == 1)
+        {
+            for (std::size_t channel = 0; channel < count; ++channel)
+                for (std::size_t sample = 0; sample < samples; ++sample)
+                    channels[channel][sample] = nonlinear(channels[channel][sample], channel);
+            return;
+        }
+
+        const auto highRateSamples = samples * oversamplingFactor;
+        for (std::size_t channel = 0; channel < count; ++channel)
+        {
+            auto* highRate = workBuffer().data() + channel * spec.maximumBlockSize * oversamplingFactor;
+            upsamplePolyphase(channels[channel], samples, highRate, channel);
+            for (std::size_t sample = 0; sample < highRateSamples; ++sample)
+                highRate[sample] = nonlinear(highRate[sample], channel);
+            downsamplePolyphase(highRate, samples, channels[channel], channel);
+        }
+    }
+
     template <typename NonlinearFunction>
     void process(float* const* channels, std::size_t channelCount, std::size_t samples,
                  NonlinearFunction&& nonlinear) noexcept

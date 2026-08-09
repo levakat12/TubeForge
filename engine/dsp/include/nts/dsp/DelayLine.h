@@ -79,4 +79,111 @@ private:
     std::size_t delaySamples {};
     std::size_t writePosition {};
 };
+
+/** A short delay whose length moves under the signal, read with cubic interpolation.
+
+    A separate class from `DelayLine` above rather than an option on it, because the two want
+    opposite things. That one delays by whole samples and steps when the length changes, which
+    is right for latency alignment and wrong for anything that sweeps: a chorus stepping between
+    integer delays produces a click on every sample the length crosses a boundary.
+
+    Four-point Hermite rather than linear. Linear interpolation on a swept delay is a low-pass
+    whose cutoff moves with the sweep, so a chorus audibly dulls at one end of its travel and
+    brightens at the other -- the artefact is the modulation, which is exactly where it is most
+    obvious. Hermite costs three more multiplies and removes it.
+
+    Capacity is claimed in `prepare`, so `processSample` allocates nothing.
+*/
+class ModulatedDelayLine
+{
+public:
+    void prepare(std::size_t maximumDelaySamples, std::size_t channelCount)
+    {
+        // Three samples of margin: the interpolator reads one before and two after the
+        // fractional position, so the deepest legal delay still has neighbours to read.
+        capacity = maximumDelaySamples + 4;
+        channels = std::clamp(channelCount, std::size_t { 1 }, maximumChannels);
+        buffer.assign(capacity * channels, 0.0f);
+        writePosition.fill(0);
+        reset();
+    }
+
+    void reset() noexcept
+    {
+        std::fill(buffer.begin(), buffer.end(), 0.0f);
+        writePosition.fill(0);
+    }
+
+    [[nodiscard]] std::size_t capacitySamples() const noexcept
+    {
+        return capacity < 4 ? 0 : capacity - 4;
+    }
+
+    /** Writes one sample. Call before any `readAt` for that channel and sample.
+
+        Split from reading because a pitch shifter needs several taps into one history: it
+        writes once and reads two or four times at different delays. Rolling them together
+        would mean either writing the same sample repeatedly or keeping a second copy of the
+        line per tap.
+    */
+    void write(float input, std::size_t channel) noexcept
+    {
+        if (capacity == 0 || channel >= channels) return;
+        buffer[channel * capacity + writePosition[channel]] = input;
+    }
+
+    /// Reads `delaySamples` back from the most recent write, interpolated. Const: any number of
+    /// taps may read the same history in any order.
+    [[nodiscard]] float readAt(float delaySamples, std::size_t channel) const noexcept
+    {
+        if (capacity == 0 || channel >= channels) return 0.0f;
+        const auto* ring = buffer.data() + channel * capacity;
+        const auto write = writePosition[channel];
+
+        const auto wanted = std::clamp(delaySamples, 1.0f, static_cast<float>(capacitySamples()));
+        const auto whole = static_cast<std::size_t>(wanted);
+        const auto fraction = wanted - static_cast<float>(whole);
+
+        // Read positions counted back from the write head, wrapped by hand rather than with %
+        // so the arithmetic stays in std::size_t and cannot go negative.
+        const auto at = [&](std::size_t back)
+        {
+            return ring[(write + capacity - back) % capacity];
+        };
+        const auto x0 = at(whole == 0 ? 0 : whole - 1);
+        const auto x1 = at(whole);
+        const auto x2 = at(whole + 1);
+        const auto x3 = at(whole + 2);
+
+        // Four-point, third-order Hermite.
+        const auto c0 = x1;
+        const auto c1 = 0.5f * (x2 - x0);
+        const auto c2 = x0 - 2.5f * x1 + 2.0f * x2 - 0.5f * x3;
+        const auto c3 = 0.5f * (x3 - x0) + 1.5f * (x1 - x2);
+        return ((c3 * fraction + c2) * fraction + c1) * fraction + c0;
+    }
+
+    /// Moves the write head on. Call once per sample per channel, after every `readAt`.
+    void advance(std::size_t channel) noexcept
+    {
+        if (capacity == 0 || channel >= channels) return;
+        writePosition[channel] = (writePosition[channel] + 1) % capacity;
+    }
+
+    /// Write, read one tap, advance. The single-tap case, which is most callers.
+    [[nodiscard]] float processSample(float input, float delaySamples, std::size_t channel) noexcept
+    {
+        if (capacity == 0 || channel >= channels) return input;
+        write(input, channel);
+        const auto output = readAt(delaySamples, channel);
+        advance(channel);
+        return output;
+    }
+
+private:
+    std::vector<float> buffer;
+    std::size_t capacity {};
+    std::size_t channels { maximumChannels };
+    std::array<std::size_t, maximumChannels> writePosition {};
+};
 } // namespace nts::dsp

@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -75,9 +76,28 @@ public:
     */
     [[nodiscard]] bool songMatchInProgress() const noexcept
     { return reconstructionRunning.load(std::memory_order_relaxed); }
+    /** Counts published reconstruction results, so a caller can tell a new one from a re-read.
+
+        Auto Match is the caller: it applies the winning candidate the moment a match completes,
+        and the only way to distinguish "a result exists" from "a result I have not applied yet"
+        is a number that changes. Starts at 0, which no completed run ever has.
+    */
+    [[nodiscard]] std::uint64_t reconstructionGeneration() const noexcept
+    { return reconstructionGenerationValue.load(std::memory_order_acquire); }
     [[nodiscard]] std::optional<nts::reconstruction::ReconstructionResult> reconstructionSnapshot() const;
     [[nodiscard]] std::vector<nts::reconstruction::PlayableRegion> reconstructionRegionsSnapshot() const;
     [[nodiscard]] bool requestReconstructionRegion(std::size_t index);
+    /** Re-runs the last match against the other instrument.
+
+        Not a re-apply of the rig that was found: `searchableTopologies` offers a different set
+        of voicings per instrument -- guitar gets seven, bass gets those plus six designed for
+        it -- so a guitar match carried onto a bass rig holds values the search would never have
+        chosen. The stems are keyed by the song and the target, so switching target re-separates
+        or hits the cache; either way it is worker-thread work and returns immediately.
+
+        False when there is no song to re-run against, or when the target has not changed.
+    */
+    [[nodiscard]] bool requestReconstructionInstrument(nts::reconstruction::TargetInstrument target);
     [[nodiscard]] bool applyReconstructionCandidate(std::size_t index, bool isolateChain);
     [[nodiscard]] juce::Result exportReconstruction(const juce::File& file) const;
 
@@ -88,6 +108,21 @@ public:
         come with the whole result.
     */
     [[nodiscard]] std::optional<nts::tone::ToneAnalysisResult> reconstructionReferenceTone() const;
+
+    /** What the last match was made from, named the way the user would name it.
+
+        The song's file name without its extension, or empty when nothing has been matched.
+        Exists so that Auto Match can say *which* analysis is holding a control -- "the match"
+        is not an answer when the user has run three of them this afternoon.
+    */
+    [[nodiscard]] juce::String reconstructionSourceName() const;
+    /** The reference audio the last match was fitted from, and its rate. Empty when none.
+
+        For the cabinet matcher, which needs the reference itself rather than a description of it.
+        Copied out under the lock; a few seconds of mono at the working rate is a few hundred
+        kilobytes, and the alternative is handing a caller a pointer into state a worker rewrites.
+    */
+    [[nodiscard]] std::vector<float> reconstructionReferenceSamples(double& sampleRate) const;
 
 private:
     void analyzeToneFile(std::stop_token stopToken, juce::File audioFile);
@@ -114,6 +149,15 @@ private:
     nts::reconstruction::RigReconstructor rigReconstructor;
     mutable std::mutex reconstructionMutex;
     std::optional<nts::reconstruction::ReconstructionResult> latestReconstruction;
+    /** The normalised reference audio the last reconstruction was fitted from, mono.
+
+        Retained so the cabinet matcher has something to measure against. Kept here rather than in
+        `ReconstructionResult` deliberately: that structure is serialised into an exported profile,
+        and a few seconds of somebody's copyrighted recording is precisely the thing that must not
+        travel with a shared rig. This copy never leaves the process.
+    */
+    std::vector<float> reconstructionReferenceAudio;
+    double reconstructionReferenceRate { 48000.0 };
     std::vector<nts::reconstruction::PlayableRegion> reconstructionRegions;
     juce::File lastReconstructionSong;
     nts::reconstruction::TargetInstrument lastReconstructionTarget { nts::reconstruction::TargetInstrument::guitar };
@@ -123,5 +167,6 @@ private:
     std::atomic<float> reconstructionProgressValue {};
     /// Set for the lifetime of a reconstructSongFile call; see songMatchInProgress.
     std::atomic<bool> reconstructionRunning {};
+    std::atomic<std::uint64_t> reconstructionGenerationValue {};
     std::jthread reconstructionWorker;
 };

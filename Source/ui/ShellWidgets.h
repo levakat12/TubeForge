@@ -26,7 +26,9 @@ enum class Glyph
     browse,
     previous,
     next,
-    settings
+    settings,
+    /// A circular arrow: put this back to how it started.
+    reset
 };
 
 /// Builds `glyph` as a stroked path fitted to `area`, centred and square.

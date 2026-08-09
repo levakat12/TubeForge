@@ -9,7 +9,7 @@
 
 namespace nts::state
 {
-inline constexpr int currentSchemaVersion = 4;
+inline constexpr int currentSchemaVersion = 6;
 inline constexpr std::string_view currentApplicationVersion = "0.10.0";
 /** Slots the pedalboard has.
 
@@ -18,6 +18,18 @@ inline constexpr std::string_view currentApplicationVersion = "0.10.0";
     together, so they cannot drift without the build failing.
 */
 inline constexpr std::size_t maximumPedalSlots = 4;
+
+/** Ceiling on `EngineState::ampControls`, enforced by `validate`.
+
+    Deliberately loose, and load-bearing in a way that is easy to miss: the plug-in writes one
+    entry per amplifier parameter it saves, so the day that list grows past this bound **every
+    saved project stops loading** -- not a corrupted file and not a warning, but a valid project
+    rejected as "Amp control state is invalid", caused by somebody adding a knob.
+
+    Named here rather than left as a literal in `validate` so the writing side can be checked
+    against it at compile time instead of by whoever next opens an old project.
+*/
+inline constexpr std::size_t maximumAmpControls = 64;
 
 struct EngineState
 {
@@ -69,6 +81,18 @@ struct AssetState
     */
     std::string cabinetIrPathA;
     std::string cabinetIrPathB;
+    /** SHA-256 of each response's bytes, empty when the built-in cabinet is in use. Schema 6.
+
+        A path alone cannot tell "the file has moved" apart from "the file at that path is not the
+        one you saved", and the second is the case that quietly changes somebody's mix: an impulse
+        pack updated in place, or a file whose name was reused. Storing the digest turns that into
+        something the plug-in can say out loud.
+
+        Empty for a project written before schema 6, and empty is not an error -- it means the
+        project cannot answer the question, which is different from answering it wrongly.
+    */
+    std::string cabinetIrHashA;
+    std::string cabinetIrHashB;
 
     bool operator==(const AssetState&) const = default;
 };
@@ -80,8 +104,14 @@ struct AssetState
     capped at 64 entries by validation -- four slots would have taken it past that and turned
     a schema addition into a change to a limit that exists for a different reason.
 
-    `kind` is the PedalKind enumerator. It is held as an int so this header does not have to
-    depend on the pedal engine, and it is range-checked on the way in.
+    `kind` is an index into the pedal engine's model table. It is held as an int so this header
+    does not have to depend on the pedal engine, and it is range-checked on the way in. The
+    first seven indices are the built-in archetypes and never move, so a project saved before
+    the table grew recalls the same board.
+
+    `auxA` and `auxB` are the model-specific voicing controls, and default to the neutral 5 --
+    which is what a project saved before they existed gets, and is exactly what the archetypes
+    that ignore them would have done anyway.
 */
 struct PedalSlotState
 {
@@ -91,6 +121,8 @@ struct PedalSlotState
     float tone { 5.0f };
     float levelDb {};
     float mix { 100.0f };
+    float auxA { 5.0f };
+    float auxB { 5.0f };
     /// The artifact directory staged into this slot, empty when there is no capture.
     std::string modelPath;
 
@@ -106,6 +138,77 @@ struct PedalboardState
     bool operator==(const PedalboardState&) const = default;
 };
 
+/** Ceiling on `AutoMatchState::heldValues`, enforced by `validate`.
+
+    Sized well above the owned set the plug-in actually has (47 at the time of writing) so that a
+    control added to Auto Match is not also a project-format change. It exists to stop a corrupt
+    or hostile file asking for an unbounded allocation, not to encode the current list -- which is
+    why it is deliberately not `maximumAmpControls`, whose bound means something different.
+*/
+inline constexpr std::size_t maximumAutoMatchValues = 128;
+
+/** What the song analyzer was holding when the project was saved.
+
+    Held as an opaque block of numbers rather than as named controls, and the layering is the
+    reason: this library is the project format and knows nothing about the plug-in's parameters.
+    The plug-in writes one value per entry of its own owned table, in that table's order, and
+    reads them back the same way -- so the same append-only rule that governs `ampControls`
+    governs this, and for the same reason.
+
+    `releasedIndices` are positions in that table the user had taken back. Stored as indices
+    rather than as a bit mask because a mask is a number whose meaning is invisible in the file,
+    and this format is meant to be readable.
+
+    Empty is the normal state and is what every project written before schema 5 has: Auto Match
+    off, or on but not holding anything.
+*/
+struct AutoMatchState
+{
+    /// True when a matched rig was being held. False means the values below are meaningless.
+    bool holding {};
+    /** Whether the match also took the effects chain, which decides how much of the table was
+        held rather than merely recorded.
+
+        Saved rather than derived from the values. A pedal bypass reads the same whether the
+        match set it or the player did, so inferring it would sometimes conclude that a matched
+        rig owned a board it never touched.
+    */
+    bool isolatedChain {};
+    /// One value per owned control, in the plug-in's own table order.
+    std::vector<float> heldValues;
+    /// Positions in that table the user had taken back before saving.
+    std::vector<int> releasedIndices;
+
+    bool operator==(const AutoMatchState&) const = default;
+};
+
+/** Ceiling on `CabinetState::controls`, enforced by `validate`.
+
+    A block of its own rather than more room in `maximumAmpControls`, and the difference is the
+    point: that bound is nearly spent, and the cabinet's controls are not amplifier controls. See
+    the note above `cabinetControlIds` in the plug-in. Sized well above the thirteen the cabinet
+    currently has so that adding a control is not also a project-format change.
+*/
+inline constexpr std::size_t maximumCabinetControls = 48;
+
+/** The cabinet stage's controls, added in schema 6.
+
+    Opaque numbers in the plug-in's own list order, exactly like `EngineState::ampControls` and
+    for the same layering reason: this library is the file format and knows nothing about
+    parameters. The same append-only rule governs it.
+
+    **Empty is the normal state for anything written before schema 6**, and it has to restore to
+    the cabinet those projects actually had -- which is why every one of the plug-in's defaults
+    for these controls is the value the field effectively held when it was unreachable. An empty
+    block is therefore not a gap to be guessed at; it is a complete description.
+*/
+struct CabinetState
+{
+    std::vector<float> controls;
+
+    bool operator==(const CabinetState&) const = default;
+};
+
 struct ProjectState
 {
     int schemaVersion { currentSchemaVersion };
@@ -116,6 +219,8 @@ struct ProjectState
     UiState ui;
     AssetState assets;
     PedalboardState pedalboard;
+    AutoMatchState autoMatch;
+    CabinetState cabinet;
 
     bool operator==(const ProjectState&) const = default;
 };

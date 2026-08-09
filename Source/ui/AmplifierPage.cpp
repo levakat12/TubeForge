@@ -35,6 +35,9 @@ AmplifierPage::AmplifierPage(TubeForgeAudioProcessor& processorToUse)
     tf::ui::configureFieldCaption(instrumentCaption, "Instrument");
     tf::ui::populateFromParameter(instrumentSelector, processor.getParameters(), "instrument");
     tf::ui::configureFieldCaption(voicingCaption, "Voicing");
+    tf::ui::configureFieldCaption(panelSwitchCaption, "Panel switch");
+    addAndMakeVisible(panelSwitchCaption);
+    addAndMakeVisible(panelSwitchSelector);
     addAndMakeVisible(instrumentCaption);
     addAndMakeVisible(instrumentSelector);
     addAndMakeVisible(voicingCaption);
@@ -72,6 +75,23 @@ AmplifierPage::AmplifierPage(TubeForgeAudioProcessor& processorToUse)
     for (std::size_t index = 0; index < knobs.size(); ++index)
         knobAttachments.push_back(std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
             processor.getParameters(), knobIds[index], knobs[index]));
+
+    rebuildPanelSwitches();
+    panelSwitchSelector.onChange = [this]
+    {
+        const auto selected = panelSwitchSelector.getSelectedId();
+        if (selected <= 0) return;
+        if (auto* parameter = processor.getParameters().getParameter("panelSwitch"))
+        {
+            const auto normalised = parameter->convertTo0to1(static_cast<float>(selected - 1));
+            if (std::abs(parameter->getValue() - normalised) > 1.0e-6f)
+            {
+                parameter->beginChangeGesture();
+                parameter->setValueNotifyingHost(normalised);
+                parameter->endChangeGesture();
+            }
+        }
+    };
 
     // The art covers as many voicings as the parameter offers choices. If someone adds a
     // topology and stops there, the extra choice silently reuses the first livery, so say so
@@ -123,6 +143,21 @@ tf::ui::GearCatalogue AmplifierPage::buildVoicingCatalogue()
     const auto instrument = choiceIndex("instrument");
     for (std::size_t index = 0; index < tf::ui::faceplateStyleCount(); ++index)
     {
+        /* Bass-native voicings are hidden from a guitarist, and the *view* is what filters.
+
+           The choice parameter still offers all thirteen, unchanged, because filtering the
+           parameter would make a host automation lane's meaning depend on another parameter's
+           value -- which is the one thing the topology enum's own comment forbids. What is safe
+           here is that `GearTile::parameterIndex` carries the value it writes, so skipping a tile
+           moves nothing: the eighth tile still writes 7 whether or not the sixth was drawn.
+
+           They still answer for guitar (`makeOriginalPreset` gives every one of them a guitar
+           reading), so a host or an old project that selects one gets a real amplifier. This only
+           stops them being *offered* to somebody who has no use for them.
+        */
+        if (instrument == 0 && nts::amp::topologyAffinity(static_cast<nts::amp::Topology>(index))
+                                   == nts::amp::TopologyAffinity::bass)
+            continue;
         const auto topology = static_cast<int>(index);
         const auto style = tf::ui::faceplateStyle(topology, instrument);
         catalogue.tiles.push_back(
@@ -133,8 +168,48 @@ tf::ui::GearCatalogue AmplifierPage::buildVoicingCatalogue()
     return catalogue;
 }
 
+void AmplifierPage::rebuildPanelSwitches()
+{
+    const auto topology = choiceIndex("topology");
+    listedTopology = topology;
+    panelSwitchSelector.clear(juce::dontSendNotification);
+    auto offered = 0;
+    for (std::size_t index = 0; index < nts::amp::panelSwitchCount; ++index)
+    {
+        const auto value = static_cast<nts::amp::PanelSwitch>(index);
+        if (! nts::amp::panelSwitchAppliesTo(static_cast<nts::amp::Topology>(topology), value)) continue;
+        // Id is the switch value plus one, because zero means "nothing selected" to a ComboBox.
+        panelSwitchSelector.addItem(juce::String(std::string(nts::amp::panelSwitchName(value))),
+                                    static_cast<int>(index) + 1);
+        ++offered;
+    }
+    /* Hidden entirely on a voicing with no switches, rather than shown holding "Standard".
+
+       Every voicing offers `none`, so the list is never empty -- a box with one inert entry on it
+       would be a control that does nothing on eleven of thirteen amplifiers, which reads as broken
+       rather than as absent. Two is the first count that means anything. */
+    const auto hasSwitches = offered > 1;
+    panelSwitchCaption.setVisible(hasSwitches);
+    panelSwitchSelector.setVisible(hasSwitches);
+    panelSwitchSelector.setSelectedId(choiceIndex("panelSwitch") + 1, juce::dontSendNotification);
+    resized();
+}
+
 void AmplifierPage::refresh()
 {
+    /* Which of these seven the analyzer is still holding.
+
+       Only the released ones are coloured -- see `ModulePage::markAutoMatch`. Re-applied every
+       tick rather than on a change signal because the set moves from three directions at once
+       (this page, the dialog, host automation), and setting a colour a control already has is
+       a comparison rather than a repaint. */
+    for (std::size_t index = 0; index < knobs.size(); ++index)
+        markAutoMatch(knobs[index], processor.autoMatchReleased(knobIds[index]));
+
+    if (choiceIndex("topology") != listedTopology) rebuildPanelSwitches();
+    else if (panelSwitchSelector.getSelectedId() != choiceIndex("panelSwitch") + 1)
+        panelSwitchSelector.setSelectedId(choiceIndex("panelSwitch") + 1, juce::dontSendNotification);
+
     // The voicing can also be changed from the tone page, from a preset recall, from a
     // recovered rig or from host automation, so this one only ever learns about a change by
     // looking. Cheap enough to check every tick.
@@ -152,6 +227,11 @@ void AmplifierPage::resized()
     if (voicing != nullptr)
     {
         tf::ui::layOutField(chip.removeFromLeft(230), voicingCaption, *voicing);
+        chip.removeFromLeft(12);
+    }
+    if (panelSwitchSelector.isVisible())
+    {
+        tf::ui::layOutField(chip.removeFromLeft(160), panelSwitchCaption, panelSwitchSelector);
         chip.removeFromLeft(12);
     }
     cabinetEnabled.setBounds(chip.removeFromLeft(130).withTrimmedTop(13).withHeight(28));

@@ -29,8 +29,15 @@ ProfileLibraryPage::ProfileLibraryPage(TubeForgeAudioProcessor& processorToUse)
              &favoritesOnly, &refreshProfiles, &list, &loadProfile, &favorite, &importProfile })
         browsePanel.addAndMakeVisible(*component);
     detailPanel.addAndMakeVisible(details);
-    for (auto* component : std::initializer_list<juce::Component*> { &rigName, &author, &exportProfile })
+    for (auto* component : std::initializer_list<juce::Component*> { &rigName, &author,
+             &exportProfile, &includeCabinets })
         sharePanel.addAndMakeVisible(*component);
+    includeCabinets.setTooltip("Copies the impulse responses your cabinet slots have loaded into "
+                               "the exported profile, so the rig arrives complete on a machine "
+                               "that has never seen those files. Off by default because most "
+                               "commercial responses are licensed for you to use rather than to "
+                               "pass on -- only switch it on for responses you have the right to "
+                               "share.");
 
     search.onTextChange = [this] { refreshBrowser(); };
     instrument.onChange = [this] { refreshBrowser(); };
@@ -110,6 +117,8 @@ void ProfileLibraryPage::resized()
     author.setBounds(share.removeFromLeft(180).reduced(0, 1));
     share.removeFromLeft(8);
     exportProfile.setBounds(share.removeFromLeft(170).reduced(0, 1));
+    share.removeFromLeft(10);
+    includeCabinets.setBounds(share.removeFromLeft(std::min(share.getWidth(), 230)));
 }
 
 void ProfileLibraryPage::selectRelative(int delta)
@@ -203,7 +212,8 @@ void ProfileLibraryPage::chooseExportDestination()
         {
             if (safeThis == nullptr || chooser.getResult() == juce::File {}) return;
             const auto result = safeThis->processor.exportCurrentTonePackage(
-                chooser.getResult(), safeThis->rigName.getText(), safeThis->author.getText());
+                chooser.getResult(), safeThis->rigName.getText(), safeThis->author.getText(),
+                safeThis->includeCabinets.getToggleState());
             if (result.failed()) juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::WarningIcon, "Export failed", result.getErrorMessage());
         });

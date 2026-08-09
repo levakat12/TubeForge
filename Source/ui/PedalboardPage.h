@@ -25,8 +25,9 @@ public:
     void refresh() override;
 
 private:
-    /// Drive, tone, level and mix -- the four continuous controls every kind shares.
-    static constexpr std::size_t controlCount = 4;
+    /// Drive, tone, level, mix, and two model-specific voicing controls. A model names the ones
+    /// it has; the rest are hidden rather than shown doing nothing.
+    static constexpr std::size_t controlCount = nts::pedals::controlCount;
 
     /// One slot's card. Held by pointer because the panel it is built around needs its
     /// heading at construction, and the heading is the slot number.
@@ -53,8 +54,11 @@ private:
     };
 
     void chooseModel(std::size_t slot);
-    /// The slot's Kind, read back from the parameter that owns it.
-    [[nodiscard]] nts::pedals::PedalKind kindOf(std::size_t slot) const;
+    /// Lays out one card. Split out of `resized` because the visible control set changes with
+    /// the model, so the rows have to re-flow on a refresh and not only on a resize.
+    void layOutSlot(std::size_t slot);
+    /// The slot's model index, read back from the parameter that owns it.
+    [[nodiscard]] int modelOf(std::size_t slot) const;
     /// The kinds as tiles, shelved by what each is for. Shared across all four slots -- the
     /// list is the same everywhere, only the parameter it writes differs.
     [[nodiscard]] tf::ui::GearCatalogue buildPedalCatalogue(std::size_t slot);

@@ -26,11 +26,20 @@ enum class PanelFinish { brushed, painted };
     keyed the same way is a second thing to keep in step.
 
     The order is the order the categories appear, and it is the order a player works through a
-    shop: clean first, then crunch, then the high-gain end.
-*/
-enum class AmpCharacter { clean, crunch, hiGain };
+    shop: clean first, then vintage, then crunch, then the high-gain end.
 
-inline constexpr std::size_t ampCharacterCount = 3;
+    `vintage` was added when the bass-native voicings arrived. Three shelves carried seven tiles
+    comfortably and thirteen badly -- the bass picker shows every voicing, because the seven
+    guitar-derived ones keep their bass readings and saved projects depend on them, so it grew from
+    seven tiles to thirteen while the shelves stayed at three. Four is about three a shelf, which is
+    a shelf worth scrolling to. Splitting further would give shelves of one.
+
+    Safe to reorder because nothing outside the picker reads it: no DSP, no saved state, no preset
+    field. It is a browsing concept and only ever a browsing concept.
+*/
+enum class AmpCharacter { clean, vintage, crunch, hiGain };
+
+inline constexpr std::size_t ampCharacterCount = 4;
 
 /// The rail label for a character. Indexed by `AmpCharacter`.
 [[nodiscard]] juce::String ampCharacterName(AmpCharacter character);

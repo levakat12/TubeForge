@@ -48,6 +48,14 @@ struct TonePackageManifest
     std::vector<int> sampleRates { 44100, 48000, 88200, 96000 };
     std::vector<std::string> modelOperators;
     std::vector<PackageAsset> assets;
+    /** Which cabinet slot each `cabinet-ir` asset belongs to, in the order they were exported.
+
+        Parallel to the cabinet assets rather than folded into their paths, because the exporter
+        names them by index and a package that carries only slot B's response would otherwise be
+        indistinguishable from one carrying only slot A's. Empty for a package that carries no
+        cabinet responses, which is the normal case and every package written before this existed.
+    */
+    std::vector<int> cabinetSlots;
     std::string packageLicense { "unknown" };
     bool sourceAudioIncluded {};
     std::string signerId;

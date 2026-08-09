@@ -48,6 +48,13 @@ private:
     juce::ComboBox list;
     juce::ToggleButton favoritesOnly { "Favorites only" };
     juce::ToggleButton favorite { "Favorite" };
+    /** Whether an exported profile carries the impulse responses the slots have loaded.
+
+        Off by default, and that is a rights decision rather than an oversight -- see
+        `TubeForgeAudioProcessor::exportCurrentTonePackage`. Most impulse responses are commercial
+        and licensed for use rather than redistribution, and the plug-in cannot read a licence.
+    */
+    juce::ToggleButton includeCabinets { "Include my cabinet responses" };
     juce::TextButton importProfile { "Import .ntone" };
     juce::TextButton exportProfile { "Export current rig" };
     juce::TextButton loadProfile { "Load profile" };

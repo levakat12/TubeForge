@@ -11,10 +11,20 @@ namespace theme = tf::theme;
 
 namespace
 {
+/* `circuitCabinetStyle` is deliberately absent.
+
+   The circuit engine used to synthesise a cabinet node of its own, while the impulse-response
+   cabinet lived inside the traditional amplifier -- so the two engines had different speakers and
+   a loaded response did nothing on this one. The cabinet is a stage after all three engines now,
+   and this page offering a second one would be offering two cabinets in series.
+
+   The *parameter* still exists and is still saved: removing it would shift every id after it in
+   `ampControlIds` and silently corrupt every saved project (see the note at that list). What is
+   removed is the control, because a control that does nothing is worse than no control. */
 constexpr std::array selectorIds { "circuitPreampTube", "circuitPowerTube", "circuitPowerTopology",
-                                   "circuitToneStack", "circuitBackend", "circuitCabinetStyle" };
+                                   "circuitToneStack", "circuitBackend" };
 constexpr std::array selectorCaptions { "Preamp tube", "Power tube", "Power topology",
-                                        "Tone stack", "Solver", "Cabinet" };
+                                        "Tone stack", "Solver" };
 } // namespace
 
 void CircuitSchematicView::setSnapshot(std::vector<nts::circuit::NodeTelemetry> telemetry, juce::String status,
@@ -118,7 +128,7 @@ CircuitPage::CircuitPage(TubeForgeAudioProcessor& processorToUse)
     : ModulePage(processorToUse)
 {
     const std::array selectors { &preampTube, &powerTube, &powerTopology,
-                                 &toneStack, &backend, &cabinetStyle };
+                                 &toneStack, &backend };
     for (std::size_t index = 0; index < captions.size(); ++index)
     {
         tf::ui::configureFieldCaption(captions[index], selectorCaptions[index]);
@@ -138,7 +148,7 @@ void CircuitPage::resized()
     auto area = getLocalBounds();
     auto selectorArea = area.removeFromTop(94);
     const std::array selectors { &preampTube, &powerTube, &powerTopology,
-                                 &toneStack, &backend, &cabinetStyle };
+                                 &toneStack, &backend };
     for (std::size_t index = 0; index < selectors.size(); ++index)
     {
         const auto row = static_cast<int>(index / 3);

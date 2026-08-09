@@ -282,9 +282,10 @@ void applyBassCabinet(FaceplateStyle& style)
     Vintage Bloom is oxblood and brass; American Clean is blonde with an oxblood grille;
     British Crunch is black levant under a gold panel; Class-A Chime is fawn and cream;
     Sagging Rectifier is matte black with red bleeding out of it; Studio Direct is not a
-    cabinet at all. They are the voicings, drawn.
+    cabinet at all. Then the bass-native four, which are drawn as bass gear from the start
+    rather than adapted into it. They are the voicings, drawn.
 
-    Two constraints hold across all seven, and both were learned by getting them wrong. The
+    Two constraints hold across every row, and both were learned by getting them wrong. The
     panel stays dark (see `FaceplateStyle`). And the grille stays the darkest large region:
     it is a hole in a box, so it cannot be the brightest thing in the window however light the
     real cloth is -- the wheat basketweave had to come down twice before it stopped dominating
@@ -321,7 +322,7 @@ const std::array<FaceplateStyle, nts::amp::topologyCount>& styleTable()
             juce::Colour { 0xfff2dcae },
             juce::Colour { 0xffff9d30 },
             13.0f,
-            AmpCharacter::crunch,
+            AmpCharacter::vintage,
             "Two stages into a soft, sagging power section. Blooms on sustained notes and gets "
             "looser the harder you hit it."
         },
@@ -376,7 +377,7 @@ const std::array<FaceplateStyle, nts::amp::topologyCount>& styleTable()
             juce::Colour { 0xfff6efe0 },
             juce::Colour { 0xffffd9a0 },
             11.0f,
-            AmpCharacter::crunch,
+            AmpCharacter::vintage,
             "Cathode-biased and running no global feedback worth the name. Bright, chiming, and "
             "it starts compressing early -- the most touch-sensitive of the seven."
         },
@@ -417,6 +418,120 @@ const std::array<FaceplateStyle, nts::amp::topologyCount>& styleTable()
             AmpCharacter::clean,
             "An active front end rather than a valve one, with a flat three-band EQ and almost "
             "no sag. The DI voicing -- start here for bass."
+        },
+        FaceplateStyle {
+            // The bass-native four begin here, and they are drawn to read as bass gear at a
+            // glance: bigger radii, heavier brackets, and grilles coarser than anything above.
+            // Black over silver-blue with a chrome bezel and a blue jewel -- the fridge.
+            "Valve Flagship",
+            juce::Colour { 0xff17171a }, juce::Colour { 0xff232327 }, 0.75f,
+            juce::Colour { 0xffb4b8bd },
+            GrilleWeave::tight,
+            juce::Colour { 0xff101318 }, juce::Colour { 0xff2f3a4a },
+            juce::Colour { 0xffc2c6cc },
+            PanelFinish::brushed,
+            juce::Colour { 0xff1a1c20 }, juce::Colour { 0xff31353c },
+            juce::Colour { 0xffeef0f4 },
+            juce::Colour { 0xff4aa8ff },
+            8.0f,
+            AmpCharacter::crunch,
+            "Three valve stages that keep their bottom octave, into a supply that blooms under a "
+            "chord. The reference big-amp sound."
+        },
+        FaceplateStyle {
+            // Dark blue-grey with an aged cream weave and brass corners. The cloth is lighter
+            // than any other bass face and still darker than its own tolex, which is the rule
+            // the wheat basketweave broke twice before it was written down.
+            "Cathode Vintage",
+            juce::Colour { 0xff2f3540 }, juce::Colour { 0xff414954 }, 0.90f,
+            juce::Colour { 0xffb9a97e },
+            GrilleWeave::basket,
+            juce::Colour { 0xff231f18 }, juce::Colour { 0xff5a5141 },
+            juce::Colour { 0xffcbbb90 },
+            PanelFinish::painted,
+            juce::Colour { 0xff242118 }, juce::Colour { 0xff3b3527 },
+            juce::Colour { 0xfff4ecd8 },
+            juce::Colour { 0xffffc266 },
+            14.0f,
+            AmpCharacter::vintage,
+            "Twenty-five watts, cathode-biased, no top end and no headroom. Compresses the moment "
+            "you dig in -- the sound of a hundred records."
+        },
+        FaceplateStyle {
+            // Milled aluminium on dark steel, punched vent, and a lamp with no colour in it.
+            // The only bass face that is not a cabinet, and the squarest corners in the table.
+            "Hybrid MOSFET",
+            juce::Colour { 0xff26292d }, juce::Colour { 0xff353940 }, 0.20f,
+            juce::Colour { 0xffb0b6bd },
+            GrilleWeave::perforated,
+            juce::Colour { 0xff131518 }, juce::Colour { 0xff3f454d },
+            juce::Colour { 0xff868d96 },
+            PanelFinish::brushed,
+            juce::Colour { 0xff1c1f23 }, juce::Colour { 0xff343a41 },
+            juce::Colour { 0xfff0f3f7 },
+            juce::Colour { 0xffd8e4f0 },
+            3.0f,
+            AmpCharacter::clean,
+            "Three valve stages of warmth in front of a power section that will not distort. "
+            "Hi-fi, fast, and enormous underneath."
+        },
+        FaceplateStyle {
+            // Burnt orange under a pale picture-frame edge. The brightest covering here by hue
+            // and still below American Clean by luminance, so the panel rule holds without
+            // dimming the whole face to protect it.
+            "Short-Path Grind",
+            juce::Colour { 0xff8a3d10 }, juce::Colour { 0xffa8501a }, 0.80f,
+            juce::Colour { 0xffd9d2c4 },
+            GrilleWeave::basket,
+            juce::Colour { 0xff1a1512 }, juce::Colour { 0xff4a3a2c },
+            juce::Colour { 0xffe4dccb },
+            PanelFinish::painted,
+            juce::Colour { 0xff241a12 }, juce::Colour { 0xff3d2c1c },
+            juce::Colour { 0xfff6ece0 },
+            juce::Colour { 0xffff7a2a },
+            10.0f,
+            AmpCharacter::hiGain,
+            "The shortest signal path here. No bottom octave and no restraint -- it fuzzes out "
+            "early and cuts through anything."
+        },
+        FaceplateStyle {
+            // A rack face, not a cabinet: brushed steel, a punched vent where the grille would
+            // be, silver-capped knobs and a red power lamp. The second face in the table with no
+            // speaker behind it, and the only one whose lamp is a warning colour -- this is the
+            // amplifier that hits a wall rather than easing into one.
+            "Solid-State Bi-Amp",
+            juce::Colour { 0xff2a2d31 }, juce::Colour { 0xff3a3e44 }, 0.15f,
+            juce::Colour { 0xffbcc2c9 },
+            GrilleWeave::perforated,
+            juce::Colour { 0xff121417 }, juce::Colour { 0xff444a52 },
+            juce::Colour { 0xff8b929b },
+            PanelFinish::brushed,
+            juce::Colour { 0xff1a1d21 }, juce::Colour { 0xff313740 },
+            juce::Colour { 0xffeff2f6 },
+            juce::Colour { 0xffff4136 },
+            3.0f,
+            AmpCharacter::crunch,
+            "Two power sections either side of a high crossover. The lows stay clean while the "
+            "highs hit the rails and clank."
+        },
+        FaceplateStyle {
+            // Matte anodised aluminium with laser-etched graphics and a cold white indicator.
+            // No grille cloth and no weave to speak of: the flattest, coldest face in the table,
+            // which is the point -- it is the only one that is not pretending to be furniture.
+            "CMOS Modern",
+            juce::Colour { 0xff232529 }, juce::Colour { 0xff2e3136 }, 0.08f,
+            juce::Colour { 0xff9aa0a8 },
+            GrilleWeave::perforated,
+            juce::Colour { 0xff0f1113 }, juce::Colour { 0xff383d44 },
+            juce::Colour { 0xff6f757d },
+            PanelFinish::brushed,
+            juce::Colour { 0xff17191c }, juce::Colour { 0xff2b3037 },
+            juce::Colour { 0xfff4f6f9 },
+            juce::Colour { 0xffe8f4ff },
+            2.0f,
+            AmpCharacter::hiGain,
+            "A high-gain silicon engine on the upper band only, over a fundamental it never "
+            "touches. Tight, metallic, and unforgiving."
         }
     };
     return table;
@@ -427,9 +542,10 @@ juce::String ampCharacterName(AmpCharacter character)
 {
     switch (character)
     {
-        case AmpCharacter::clean:  return "Clean";
-        case AmpCharacter::crunch: return "Crunch";
-        case AmpCharacter::hiGain: return "Hi-gain";
+        case AmpCharacter::clean:   return "Clean";
+        case AmpCharacter::vintage: return "Vintage";
+        case AmpCharacter::crunch:  return "Crunch";
+        case AmpCharacter::hiGain:  return "Hi-gain";
     }
     return {};
 }
@@ -440,7 +556,19 @@ FaceplateStyle faceplateStyle(int topologyIndex, int instrumentIndex)
     const auto index = static_cast<std::size_t>(
         juce::jlimit(0, static_cast<int>(table.size()) - 1, topologyIndex));
     auto style = table[index];
-    if (instrumentIndex == 1) applyBassCabinet(style);
+    /* Only the guitar-derived voicings get the bass treatment.
+
+       `applyBassCabinet` restates a guitar livery as bass gear -- darker covering, perforated
+       grille, desaturated piping, and " Bass" on the badge. That is exactly right for a voicing
+       the *engine* also merely retunes, and exactly wrong for one that was drawn as a bass
+       amplifier already: it would flatten the four bass-native weaves to one, undo their colour,
+       and badge a bass head "Valve Flagship Bass". The affinity the engine publishes is the same
+       distinction, so the art asks it rather than keeping a second list in step.
+    */
+    if (instrumentIndex == 1
+        && nts::amp::topologyAffinity(static_cast<nts::amp::Topology>(index))
+               == nts::amp::TopologyAffinity::either)
+        applyBassCabinet(style);
     return style;
 }
 

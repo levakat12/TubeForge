@@ -192,7 +192,7 @@ void testStateMigrationAndValidation(TestHarness& tests)
                  "validation rejects a pedalboard with more slots than the board has");
 
     nts::state::ProjectState badKind;
-    badKind.pedalboard.slots.push_back({ -1, false, 5.0f, 5.0f, 0.0f, 100.0f, {} });
+    badKind.pedalboard.slots.push_back({ -1, false, 5.0f, 5.0f, 0.0f, 100.0f, 5.0f, 5.0f, {} });
     tests.expect(! nts::state::validate(badKind, error), "validation rejects a negative pedal kind");
 }
 
@@ -207,9 +207,10 @@ void testStateRoundTrip(TestHarness& tests)
     original.assets.relativePaths = { "irs/cab.wav", "models/amp.ntm" };
     original.assets.cabinetIrPathA = "irs/greenback-57.wav";
     original.assets.cabinetIrPathB = "irs/v30-ribbon.wav";
+    // Fields in PedalSlotState order: model, bypassed, drive, tone, level, mix, auxA, auxB, path.
     original.pedalboard.slots = {
-        { 2, false, 7.5f, 3.0f, -2.5f, 80.0f, "" },
-        { 6, true, 5.0f, 9.0f, 1.5f, 100.0f, "C:/captures/ts9-drive-7" },
+        { 2, false, 7.5f, 3.0f, -2.5f, 80.0f, 2.0f, 8.5f, "" },
+        { 6, true, 5.0f, 9.0f, 1.5f, 100.0f, 5.0f, 5.0f, "C:/captures/pedal-drive-7" },
         {},
         {},
     };

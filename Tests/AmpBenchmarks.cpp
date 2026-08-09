@@ -108,6 +108,56 @@ void run(double sampleRate, std::size_t blockSize, int oversampling, std::size_t
               << amp.latencySamples() << ",1.000,"
               << statistics.averageUs * 100.0 / budgetUs << '\n';
 }
+/** The cabinet on its own, which is the number the shared stage made everybody's business.
+
+    While the cabinet lived inside `AmpVoice`, only the traditional engine paid for it. It is a
+    stage after all three engines now, so a neural capture and the physical circuit are buying a
+    convolution they did not buy before -- and there is no honest way to talk about that trade
+    without measuring it. Reported per slot arrangement, because the whole point of the idle-slot
+    skip is that one engaged slot costs about half of two, and of the mute that a slot switched
+    off costs nothing at all.
+*/
+void runCabinet(double sampleRate, std::size_t blockSize, std::size_t irLength,
+                bool bothSlots, bool muted)
+{
+    const nts::dsp::ProcessSpec spec { sampleRate, blockSize, 2 };
+    nts::amp::CabinetSection cabinet;
+    cabinet.prepare(spec);
+    const auto impulse = makeImpulse(irLength);
+    cabinet.loadImpulseA(impulse, {}, {}, 0);
+    cabinet.loadImpulseB(impulse, {}, {}, 0);
+
+    nts::amp::CabinetParameters parameters;
+    // Blend at the centre engages both convolvers; at the rail the idle one is skipped, which is
+    // the saving being measured. Mute is the third case: a slot switched off must cost nothing
+    // even while the blend is still asking for it.
+    parameters.blend = bothSlots ? 0.5f : 0.0f;
+    parameters.slots[1].mute = muted;
+    cabinet.setParameters(parameters, 0);
+    cabinet.reset();
+
+    std::vector<float> left(blockSize), right(blockSize);
+    float* channels[] { left.data(), right.data() };
+    std::size_t phase {};
+    const auto statistics = benchmark([&]
+    {
+        for (std::size_t sample = 0; sample < blockSize; ++sample)
+        {
+            const auto value = 0.25f * std::sin(0.07f * static_cast<float>(phase + sample));
+            left[sample] = right[sample] = value;
+        }
+        phase += blockSize;
+        cabinet.process(channels, 2, blockSize);
+    });
+
+    const auto budgetUs = 1.0e6 * static_cast<double>(blockSize) / sampleRate;
+    std::cout << "cabinet_ir" << irLength
+              << (muted ? "_bmuted" : bothSlots ? "_both" : "_single") << ','
+              << sampleRate << ',' << blockSize << ",2," << std::fixed << std::setprecision(3)
+              << statistics.averageUs << ',' << statistics.p99Us << ",0,"
+              << cabinet.latencySamples() << ",1.000,"
+              << statistics.averageUs * 100.0 / budgetUs << '\n';
+}
 } // namespace
 
 int main()
@@ -119,5 +169,14 @@ int main()
             for (const auto irLength : { std::size_t { 384 }, std::size_t { 4096 } })
                 for (const auto retuning : { false, true })
                     run(48000.0, blockSize, oversampling, irLength, retuning);
+    // The cabinet stage alone, at the three lengths that matter: the built-in model's 512 taps,
+    // the standard tier's 1024 ceiling, and the 4096 a long user response reaches.
+    for (const auto blockSize : { std::size_t { 128 }, std::size_t { 256 } })
+        for (const auto irLength : { std::size_t { 512 }, std::size_t { 1024 }, std::size_t { 4096 } })
+        {
+            runCabinet(48000.0, blockSize, irLength, false, false);
+            runCabinet(48000.0, blockSize, irLength, true, false);
+            runCabinet(48000.0, blockSize, irLength, true, true);
+        }
     return 0;
 }

@@ -17,15 +17,33 @@ namespace tf::ui
     default and the way a slot is emptied, and burying the most-used entry one category deep
     would be a regression over the combo box it replaces.
 */
-enum class PedalCharacter { dynamics, overdrive, distortion, fuzz, capture };
+enum class PedalCharacter { dynamics, overdrive, distortion, fuzz, modulation, crush, timeBased, pitch, bass, capture };
 
-inline constexpr std::size_t pedalCharacterCount = 5;
+inline constexpr std::size_t pedalCharacterCount = 10;
 
 /// The rail label for a character. Indexed by `PedalCharacter`.
 [[nodiscard]] juce::String pedalCharacterName(PedalCharacter character);
 
 /// How the enclosure is finished. Changes the body fill only; the hardware layout is shared.
 enum class PedalFinish { gloss, hammertone, crackle, matte, brushed };
+
+/** The box itself.
+
+    Colour separates one pedal from its neighbour; shape separates one *family* from another. A
+    shelf of fuzzes that are all visibly bigger than the overdrives above them, and a shelf of
+    bass DIs that are visibly wider still, is information a player reads before any text.
+*/
+enum class PedalShape
+{
+    /// The standard cast enclosure, taller than it is wide. Most pedals.
+    compact,
+    /// Larger and squarer. The big-box fuzzes.
+    wide,
+    /// A sloped face, higher at the back. What a heavy-duty distortion tends to come in.
+    wedge,
+    /// Wider than tall, with corner screws. A DI box rather than a stompbox.
+    rack
+};
 
 /** One pedal's appearance.
 
@@ -39,9 +57,13 @@ enum class PedalFinish { gloss, hammertone, crackle, matte, brushed };
 */
 struct PedalFace
 {
-    juce::String name { "Pedal" };
-    /// One line saying what it does. Shown under the name in the picker.
-    juce::String blurb;
+    /** Drawn on the nameplate. Short -- an enclosure has room for a word, not a sentence.
+
+        Deliberately *not* the model's full name and not its description: the engine's model
+        table owns what a pedal is and what it does, and this owns only what it looks like. A
+        second copy of either would be a second chance to disagree.
+    */
+    juce::String plateText { "Pedal" };
 
     PedalFinish finish { PedalFinish::gloss };
     juce::Colour body { 0xff2a2c30 };
@@ -61,6 +83,8 @@ struct PedalFace
     PedalCharacter character { PedalCharacter::overdrive };
     /// -1 pins the tile above the rail. Only the empty slot uses it.
     bool pinned {};
+    /// Last so that every existing row keeps its meaning without being rewritten.
+    PedalShape shape { PedalShape::compact };
 };
 
 /** The face for a pedal kind, indexed by the slot's `kind` choice parameter.

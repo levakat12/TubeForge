@@ -58,6 +58,20 @@ private:
     void applyPerformanceTierVisibility();
     void chooseProjectToSave();
     void chooseProjectToOpen();
+    /** Asks the processor whether a control Auto Match is holding has just been grabbed, and
+        puts the question to the user if so.
+
+        Polled from the same 20 Hz tick as everything else rather than pushed from the guard.
+        The guard runs inside `parameterGestureChanged`, which a host may call on the audio
+        thread, and opening a window from there is not slow -- it is a deadlock. The cost is up
+        to 50 ms between the knob moving and the dialog appearing, which is if anything the
+        better behaviour: a dialog that appears in the same instant as the click reads as a
+        misclick rather than as an answer.
+    */
+    void pollAutoMatchWarning();
+    /// Pushes the Auto Match badge and per-control marking onto the pages that carry held
+    /// controls. Cheap, and pushed to hidden pages too so a page is correct the moment it opens.
+    void refreshAutoMatchMarking();
 
     TubeForgeAudioProcessor& processor;
     TubeForgeLookAndFeel lookAndFeel;
@@ -74,6 +88,7 @@ private:
     tf::ui::IconButton presetPrevious { tf::ui::Glyph::previous, "Previous rig" };
     tf::ui::IconButton presetNext { tf::ui::Glyph::next, "Next rig" };
     tf::ui::IconButton presetBrowse { tf::ui::Glyph::browse, "Browse rigs" };
+    tf::ui::IconButton resetVoicing { tf::ui::Glyph::reset, "Reset amp" };
     tf::ui::IconButton openProject { tf::ui::Glyph::open, "Open project" };
     tf::ui::IconButton saveProject { tf::ui::Glyph::save, "Save project" };
     tf::ui::IconButton audioSettings { tf::ui::Glyph::settings, "Audio settings" };
@@ -116,6 +131,13 @@ private:
     /// Hairlines between the navigation groups and between the rail's control clusters.
     std::array<int, 2> navDividerX {};
     std::array<int, 2> railDividerX {};
+
+    /// True while an Auto Match question is on screen, so a knob that keeps moving under the
+    /// mouse cannot stack a second one behind the first.
+    bool autoMatchDialogOpen {};
+    /// One bit per entry in `tf::automatch::owned`: a control that has already asked its
+    /// question does not ask it again, or a single knob drag would ask it once per pixel.
+    std::uint64_t autoMatchWarnedMask {};
 
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputAttachment;

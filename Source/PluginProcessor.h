@@ -12,6 +12,8 @@
 #include <nts/dsp/PitchDetector.h>
 #include <nts/dsp/Smoothing.h>
 #include <nts/ir/CabinetIrLoader.h>
+#include <nts/ir/CabinetLibrary.h>
+#include <nts/ir/CabinetModel.h>
 #include <nts/diagnostics/LatencyBudget.h>
 #include <nts/diagnostics/StructuredLogger.h>
 #include <nts/ecosystem/TonePackage.h>
@@ -22,6 +24,7 @@
 #include <nts/state/ProjectState.h>
 #include <nts/tone/ToneProfileDatabase.h>
 
+#include "AutoMatch.h"
 #include "StudioServices.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -49,7 +52,9 @@
     X(input) X(output) X(bypass) X(gain) X(bass) X(mid) X(treble) X(presence)             \
     X(resonance) X(master) X(cabinet) X(instrument) X(topology) X(stage1) X(stage2)       \
     X(stage3) X(stage4) X(bias) X(lowCut) X(highCut) X(oversampling) X(sag) X(feedback)   \
-    X(crossover) X(cleanBlend) X(cabinetAlignment) X(tightness) X(pickEmphasis)           \
+    X(crossover) X(cleanBlend) X(dryBlend) X(panelSwitch)                                 \
+    X(lowBandDrive) X(lowBandLevel) X(highBandLevel)                                      \
+    X(cabinetAlignment) X(tightness) X(pickEmphasis)                                      \
     X(engineMode) X(neuralMonitor) X(neuralCompensation) X(circuitPreampTube)             \
     X(circuitPowerTube) X(circuitPowerTopology) X(circuitToneStack) X(circuitBackend)     \
     X(circuitCabinetStyle) X(gateEnabled) X(gateThreshold) X(gateDepth) X(gateAttack)     \
@@ -58,12 +63,36 @@
     X(reverbMix) X(reverbSize) X(reverbDamping) X(cabinetBlend) X(tunerMute)                \
     X(performanceTier)                                                                       \
     X(pedal1Kind) X(pedal1Bypass) X(pedal1Drive) X(pedal1Tone) X(pedal1Level) X(pedal1Mix)   \
+    X(pedal1AuxA) X(pedal1AuxB)   \
     X(pedal2Kind) X(pedal2Bypass) X(pedal2Drive) X(pedal2Tone) X(pedal2Level) X(pedal2Mix)   \
+    X(pedal2AuxA) X(pedal2AuxB)   \
     X(pedal3Kind) X(pedal3Bypass) X(pedal3Drive) X(pedal3Tone) X(pedal3Level) X(pedal3Mix)   \
-    X(pedal4Kind) X(pedal4Bypass) X(pedal4Drive) X(pedal4Tone) X(pedal4Level) X(pedal4Mix)
+    X(pedal3AuxA) X(pedal3AuxB)   \
+    X(pedal4Kind) X(pedal4Bypass) X(pedal4Drive) X(pedal4Tone) X(pedal4Level) X(pedal4Mix)   \
+    X(pedal4AuxA) X(pedal4AuxB)                                                               \
+    /* Not read by the audio path -- Auto Match decides who writes the other parameters, and  \
+       nothing in processBlock cares. It is here because every registered parameter has to be \
+       reachable through this table, which `nts_wrapper_tests` checks, and because reading it \
+       from the guard is then one atomic load instead of a string lookup. */                  \
+    X(autoMatch) X(autoMatchTracking)                                                          \
+    /* The cabinet stage. Read every block by `currentCabinetParameters`, which is why they are \
+       here rather than only in the layout. See ParameterIds for why they are named `cab*` and  \
+       not `cabinet*`. */                                                                       \
+    X(cabLevelA) X(cabLevelB) X(cabPanA) X(cabPanB) X(cabPhaseA) X(cabPhaseB)                   \
+    X(cabDelayA) X(cabMuteA) X(cabMuteB) X(cabLowCut) X(cabHighCut) X(cabDiBlend)               \
+    X(cabOutputTrim)                                                                            \
+    /* The built-in cabinet model. Read from the audio thread only to hash them -- rendering one \
+       is message-thread work; see TubeForgeAudioProcessor::cabinetModelHash. */                \
+    X(cabModelA) X(cabModelB) X(cabMicA) X(cabMicB)                                             \
+    X(cabPositionA) X(cabPositionB) X(cabDistanceA) X(cabDistanceB)                             \
+    /* How a loaded response is prepared. Read on the message thread when one is applied, and   \
+       hashed on the audio thread so a change is noticed -- see cabinetModelHash. */            \
+    X(cabIrLengthA) X(cabIrLengthB) X(cabIrNormA) X(cabIrNormB)                                 \
+    X(cabIrMinPhaseA) X(cabIrMinPhaseB)
 
 class TubeForgeAudioProcessor final : public juce::AudioProcessor,
-                                      private juce::AsyncUpdater
+                                      private juce::AsyncUpdater,
+                                      private juce::AudioProcessorParameter::Listener
 {
 public:
     TubeForgeAudioProcessor();
@@ -102,6 +131,18 @@ public:
         could drift away from the path that actually runs.
     */
     juce::AudioProcessorParameter* getBypassParameter() const override;
+
+    /** Loads the selected voicing's own values into every control that owns one.
+
+        The amplifier's "start from here". Without it a voicing only supplies the parameters no
+        knob owns, so switching to a bass amplifier keeps the previous rig's gain, cuts and
+        tightness -- and `tightness` alone can put a 345 Hz high-pass in front of the distortion.
+
+        Instrument and voicing are kept; everything else goes back to what that amplifier
+        specifies. The pedalboard and the sends are left alone, because they are the player's own
+        work and are not part of what an amplifier is.
+    */
+    void loadVoicingDefaults();
 
     [[nodiscard]] juce::Result saveProject(const juce::File& file) const;
     [[nodiscard]] juce::Result loadProject(const juce::File& file);
@@ -157,8 +198,16 @@ public:
     { return importProgress.load(std::memory_order_relaxed); }
 
     /// The six controls a pedal slot has, in the order PedalParameters declares them.
-    enum class PedalControl : std::size_t { kind, bypass, drive, tone, level, mix };
-    static constexpr std::size_t pedalParameterStride = 6;
+    /** The eight parameters a slot exposes.
+
+        `auxA` and `auxB` are the model-specific voicing controls -- a two-band EQ, a bias, a
+        blend -- and they are named generically on purpose. A `juce::AudioParameterFloat`'s name
+        is fixed at construction, so a per-model name would mean registering every model's
+        controls for every slot. The host therefore sees "Pedal 1 Aux B" while the interface,
+        where the user actually turns the knob, shows what the model calls it.
+    */
+    enum class PedalControl : std::size_t { kind, bypass, drive, tone, level, mix, auxA, auxB };
+    static constexpr std::size_t pedalParameterStride = 8;
     /** The parameter id backing one slot's control.
 
         Shared with the editor page rather than letting it rebuild ids from the naming
@@ -174,6 +223,13 @@ public:
         at its own sample rate so it can be re-prepared if the host changes rate.
     */
     void requestCabinetIrLoad(int slot, const juce::File& irFile);
+    /** As above, checking the loaded file against a digest a project recorded.
+
+        A mismatch does not refuse the file -- it is still the response the user pointed at -- but
+        it is reported in the slot's status line, because a pack updated in place is exactly the
+        kind of thing that silently re-voices a finished mix.
+    */
+    void requestCabinetIrLoad(int slot, const juce::File& irFile, const std::string& expectedDigest);
     /** Puts the built-in response back in one slot. */
     void clearCabinetIr(int slot);
     [[nodiscard]] juce::String cabinetIrStatusText(int slot) const;
@@ -185,8 +241,137 @@ public:
         reports what the loaded responses actually do rather than what the settings imply.
     */
     [[nodiscard]] float cabinetMonoFoldDb() const noexcept
-    { return traditionalAmp.cabinetMonoCompatibility(); }
+    { return cabinetStage.monoCompatibility(); }
     [[nodiscard]] juce::File cabinetIrFile(int slot) const;
+    /// The response currently sounding in a slot, for the page's own display.
+    [[nodiscard]] const nts::amp::CabinetMetadata& cabinetMetadata(int slot) const noexcept
+    { return slot == 0 ? cabinetStage.metadataA() : cabinetStage.metadataB(); }
+
+    /** The delay that best lines slot B up behind slot A, in samples.
+
+        Cross-correlates the two loaded responses and returns the lag of the strongest positive
+        peak, which is the measurement the alignment control has never had behind it. Two
+        microphones at different distances from a speaker are at different times, and a few
+        samples of that difference is the whole tonal difference between a blend that sounds like
+        one cabinet and one that sounds hollow -- but nothing in the plug-in could tell the user
+        what the number was, so the control was a slider to be waggled.
+
+        Negative lags are not reachable: only slot B carries the section's alignment, so a pair
+        where A is the *late* one needs slot A's own delay instead. Returns 0 for that case, and
+        `alignmentPutsSlotAfirst` says which of the two the caller should be writing.
+
+        Message thread only. Reads the decoded responses under `cabinetIrMutex`, and synthesises
+        the built-in ones, so it never touches what the audio thread is convolving.
+    */
+    struct CabinetAlignment
+    {
+        /// Samples to delay the later slot by. Zero when the two already line up.
+        int delaySamples {};
+        /// True when it is slot **A** that arrives early and so wants the delay.
+        bool delaySlotA {};
+        /// Peak correlation, 0 to 1. Low means the two responses have little in common and the
+        /// suggested lag is not worth much -- which the interface says rather than hiding.
+        float confidence {};
+    };
+    [[nodiscard]] CabinetAlignment suggestedCabinetAlignment() const;
+
+    /** The cabinet's magnitude response, for the page to draw.
+
+        Log-spaced from 40 Hz to 16 kHz, in dB, and **cached rather than computed on demand**: a
+        slot holding a user impulse response needs a transform of it, which is not something to do
+        twenty times a second behind a repaint. Recomputed when a response is loaded or cleared and
+        when the built-in model moves, which is exactly when it can change.
+
+        Why this matters more than it sounds: every other control on the Cabinet page changes a
+        filter, and until now the only way to find out what any of them did was to play through
+        them. Two microphone positions that look like "0.25" and "0.65" are a 6 dB difference at
+        3 kHz, and that is the sort of thing a picture says in one glance.
+    */
+    static constexpr std::size_t cabinetResponsePoints = 192;
+    [[nodiscard]] static float cabinetResponseFrequency(std::size_t index) noexcept;
+    // ---- Cabinet Match ----------------------------------------------------------------
+    //
+    // Fitting the cabinet to the song the rig was matched from. See docs/cabinet-plan.md, Track F,
+    // and nts/ir/CabinetMatch.h for why this is a filter fit rather than a search.
+
+    struct CabinetMatchOutcome
+    {
+        bool applied {};
+        /// What the fit is worth, 0 to 1. See `nts::ir::CabinetMatchResult::confidence`.
+        float confidence {};
+        /// The closest built-in cabinet to the correction, for the interface to name.
+        juce::String nearestCabinet;
+        /// Empty on success; otherwise why nothing was applied.
+        juce::String error;
+    };
+
+    /** Fits a cabinet to the last reconstruction's reference and loads it into slot A.
+
+        **What this actually produces, stated plainly because the interface has to repeat it.**
+        The reconstruction has no separate DI -- it renders the reference through each candidate
+        and scores the result, and says so in its own warnings. So the residual measured here is
+        the difference between *this rig playing that reference* and *the reference itself*, and a
+        cabinet built from it therefore absorbs the amplifier's difference, the microphone, the
+        room and the mastering EQ along with the speaker. That is a corrective filter for this rig
+        against that record, which is a genuinely useful thing and is not the same claim as "this
+        is the cabinet on the record".
+
+        `depth` scales the correction from 0 to 1. Message thread: it renders offline and runs
+        transforms.
+    */
+    [[nodiscard]] CabinetMatchOutcome matchCabinetToReference(float depth);
+    /// True when a reconstruction has left a reference for `matchCabinetToReference` to fit to.
+    [[nodiscard]] bool cabinetMatchAvailable() const;
+
+    /** Where a matched cabinet stands with respect to Auto Match.
+
+        The cabinet is the one thing a match produces that is **not a parameter**, and ownership of
+        a parameter is the only kind the guard understands: it watches for change gestures on
+        registered controls, and an impulse response has none. So this is the asset half of the
+        same idea, and it has exactly one rule -- anything that replaces what is in slot A releases
+        it. That is enough, because there is no partial state: the matched response is either still
+        the one sounding or it is not.
+
+        Deliberately **not saved with the project**. A matched cabinet is generated rather than
+        loaded, so a reopened project has nothing to restore it from, and coming back claiming to
+        hold a response that is no longer there would be a worse lie than coming back holding
+        nothing. A recall clears the hold anyway; this clears with it.
+    */
+    enum class CabinetHold
+    {
+        /// Auto Match has not put a cabinet in slot A, or it has stopped holding the rig.
+        none,
+        /// The matched cabinet is what slot A is sounding.
+        held,
+        /// It was replaced -- a file loaded, the slot cleared, or the model changed under it.
+        released
+    };
+    [[nodiscard]] CabinetHold cabinetHoldState() const noexcept
+    { return cabinetHold.load(std::memory_order_acquire); }
+
+    /** The user's folder of impulse responses, as a browsable list.
+
+        Handed out directly rather than wrapped: reading and filtering it is message-thread work
+        that only the picker does, and every path that reaches audio goes through
+        `requestCabinetIrLoad` exactly as a file dialog's result does.
+    */
+    [[nodiscard]] nts::ir::CabinetLibrary& cabinetLibrary() noexcept { return cabinets; }
+
+    /** Writes one slot's response to a 24-bit WAV at the session rate.
+
+        The reason this exists is Cabinet Match: a fitted cabinet is *generated*, so without an
+        export it lives only inside one project and cannot be taken to another track, another
+        plug-in or another machine. It also covers the ordinary case of wanting to know what a
+        slot is actually convolving — a model rendered at a chosen length is a perfectly good
+        impulse response, and there is no reason to keep it locked in here.
+    */
+    [[nodiscard]] juce::Result exportCabinetResponse(int slot, const juce::File& destination) const;
+
+    /// One slot's own response, before the blend, the levels and the section's two cuts.
+    [[nodiscard]] std::vector<float> cabinetResponseCurve(int slot) const;
+    /// What the section as a whole does: both slots at their levels, blended, through the cuts.
+    /// This is the curve that corresponds to what is heard.
+    [[nodiscard]] std::vector<float> cabinetSumResponseCurve() const;
 
     /** What the tuner display should show right now.
 
@@ -266,6 +451,101 @@ public:
     */
     [[nodiscard]] juce::StringArray reconstructionApplyWarnings() const;
     [[nodiscard]] juce::Result exportReconstruction(const juce::File& file) const;
+
+    // ---- Auto Match -------------------------------------------------------------------
+    //
+    // The analyzer holds the rig. See docs/auto-match-plan.md for the design, and
+    // Source/AutoMatch.h for the set of controls a matched rig owns.
+
+    void setAutoMatchEnabled(bool enabled);
+    [[nodiscard]] bool autoMatchEnabled() const noexcept;
+    [[nodiscard]] tf::automatch::State autoMatchState() const noexcept;
+    /// True while this control is being written and held by a matched rig.
+    [[nodiscard]] bool autoMatchOwns(std::string_view parameterId) const noexcept;
+    /// True for an owned control the user -- or the host -- has taken back.
+    [[nodiscard]] bool autoMatchReleased(std::string_view parameterId) const noexcept;
+    /// What the match put on a control, for the "keep the matched value" answer and for the
+    /// dialog's own text. Empty when nothing is held.
+    [[nodiscard]] std::optional<float> autoMatchValueOf(std::string_view parameterId) const noexcept;
+    /// Hands one control back to the user. Its current value is left exactly as it is.
+    void releaseAutoMatchParameter(std::string_view parameterId);
+    /// Puts the matched value back on one control and resumes holding it.
+    void restoreAutoMatchParameter(std::string_view parameterId);
+    /// Puts the whole matched rig back and clears every release.
+    void reclaimAllAutoMatchParameters();
+    /// How many owned controls have been taken back, for the interface's status line.
+    [[nodiscard]] int autoMatchReleasedCount() const noexcept;
+    [[nodiscard]] juce::String autoMatchStatusText() const;
+    /// The song the held rig was matched from, or empty. For the dialog's own wording.
+    [[nodiscard]] juce::String autoMatchSourceName() const;
+
+    /** The next control a user gesture has touched while Auto Match was holding it, or -1.
+
+        Polled from the editor's timer, and clears itself: this is a *request for a dialog*, and
+        the request has to be consumed exactly once whether or not a dialog ends up being shown.
+        Deliberately a poll rather than a callback, because it is raised from
+        `parameterGestureChanged` -- which a host can call on the audio thread, where opening a
+        window is not merely slow but a deadlock.
+    */
+    [[nodiscard]] int takeAutoMatchWarning() noexcept;
+    /// Index into `tf::automatch::owned` -> the parameter's display name, for that dialog.
+    [[nodiscard]] juce::String autoMatchParameterName(int ownedIndex) const;
+    /// The matched value, formatted the way the panel shows it.
+    [[nodiscard]] juce::String autoMatchValueText(int ownedIndex) const;
+    /// Controls released by something other than the user -- host automation, a program change.
+    /// Cleared when the interface has reported them.
+    [[nodiscard]] juce::StringArray takeAutoMatchExternalReleases();
+
+    /** Applies a finished match, if Auto Match is on and one has arrived since the last look.
+
+        This is what makes the mode automatic rather than merely sticky: with the switch on, a
+        completed search puts its winning candidate on the amplifier without the user pressing
+        Apply. Called from the editor's tick beside `refreshAssistant`, because writing host
+        parameters is message-thread work and a search can only be started from an open editor
+        anyway.
+
+        Controls the user has taken back are carried across a re-derivation rather than being
+        reclaimed by it -- a match re-running because a region changed must not quietly undo the
+        override the user set two minutes ago.
+    */
+    void refreshAutoMatch();
+    /// Tells Auto Match whether a re-derivation should also isolate the chain. Pushed from the
+    /// Song Match page's own switch so the automatic apply matches what pressing Apply would do.
+    void setAutoMatchIsolatesChain(bool isolate) noexcept { autoMatchIsolatePreference = isolate; }
+
+    /** Puts a rig on the amplifier the way a re-derivation does, keeping the user's overrides.
+
+        The difference from `applyRecoveredRig` is exactly one thing, and it is the thing that
+        makes a re-run tolerable: a control the user has taken back keeps the value they gave it
+        and stays taken back. Pressing Apply goes through `applyRecoveredRig` instead, because
+        choosing a different candidate by hand *is* a new rig and the old overrides were about a
+        different one.
+    */
+    void applyAutoMatchRig(const nts::amp::AmpParameters& rig, bool isolateChain);
+
+    [[nodiscard]] bool autoMatchTracking() const noexcept;
+    void setAutoMatchTracking(bool enabled);
+
+    /** Whether the user has asked not to be warned again, across sessions.
+
+        Stored beside the other TubeForge preferences rather than in the project: it is an answer
+        about how much explaining they want, not about a rig. Suppressing the question never
+        suppresses the *change* -- a control the user moves is still handed back to them.
+    */
+    [[nodiscard]] bool autoMatchWarningsSuppressed() const noexcept
+    { return autoMatchSuppressWarnings; }
+    void setAutoMatchWarningsSuppressed(bool suppressed);
+
+    /** Puts a recovered amplifier on the host parameters and starts holding it.
+
+        Public because it is the operation "make this rig the one that is playing", which the
+        studio reaches through a callback and the test suite has to be able to reach directly:
+        every guarantee this makes -- that the Gain macro is neutralised, that a leftover panel
+        switch cannot re-voice the result, that what was written is recorded -- is only checkable
+        by calling it. It is not a shortcut around `applyReconstructionCandidate`, which does the
+        candidate bookkeeping this deliberately knows nothing about.
+    */
+    void applyRecoveredRig(const nts::amp::AmpParameters& rig, bool isolateChain);
     void refreshAssistant();
     void setAssistantGoal(nts::assistant::Goal goal);
     [[nodiscard]] std::vector<nts::assistant::Recommendation> assistantRecommendations() const;
@@ -282,9 +562,22 @@ public:
         const nts::ecosystem::ProfileQuery& query) const;
     [[nodiscard]] juce::Result refreshTonePackages();
     [[nodiscard]] juce::Result importTonePackage(const juce::File& packageDirectory);
+    /** Writes the current rig as a shareable `.ntone` package.
+
+        `includeCabinets` copies any impulse response the two slots have loaded **into** the
+        package, so the rig arrives complete on a machine that has never seen those files.
+
+        **Off by default, and that is a rights decision rather than a default nobody thought
+        about.** Most impulse responses people load are commercial, and their licences generally
+        permit use rather than redistribution -- so embedding one in a profile the user then shares
+        is a redistribution they may have no right to make. The plug-in cannot read a licence and
+        will not guess at one, so it asks, and the answer it assumes when nobody has answered is
+        the one that cannot get anybody into trouble.
+    */
     [[nodiscard]] juce::Result exportCurrentTonePackage(const juce::File& destination,
                                                         const juce::String& name,
-                                                        const juce::String& author) const;
+                                                        const juce::String& author,
+                                                        bool includeCabinets = false) const;
     [[nodiscard]] juce::Result applyTonePackage(const juce::String& packageId);
     [[nodiscard]] juce::Result setTonePackageFavorite(const juce::String& packageId, bool favorite);
     void setStandaloneApplicationMode(bool shouldBeStandalone) noexcept
@@ -346,21 +639,33 @@ public:
         bool forceNeuralMonoCollapse {};
         /// Feed the assistant's per-block measurement at all.
         bool assistantMetering {};
+        /** What the pedalboard is meant to carry, as a sum of model tiers.
+
+            Advisory, not enforced. A user who deliberately puts four expensive pedals in front
+            of the amplifier gets told the tier is not meant to carry it, and then gets what
+            they asked for -- silently degrading a pedal somebody chose is the worse failure,
+            and the one a load-watching heuristic makes on its own.
+        */
+        int pedalCostBudget {};
     };
 
     [[nodiscard]] static constexpr TierLimits limitsFor(PerformanceTier tier) noexcept
     {
         switch (tier)
         {
-            case PerformanceTier::eco:      return { 1, 256,  true,  true,  true,  false };
-            case PerformanceTier::studio:   return { 8, 4096, false, false, false, true };
+            case PerformanceTier::eco:      return { 1, 256,  true,  true,  true,  false, 6 };
+            case PerformanceTier::studio:   return { 8, 4096, false, false, false, true, 20 };
             case PerformanceTier::standard:
-            default:                        return { 2, 1024, false, true,  false, true };
+            default:                        return { 2, 1024, false, true,  false, true, 12 };
         }
     }
 
     [[nodiscard]] PerformanceTier performanceTier() const noexcept;
     [[nodiscard]] TierLimits tierLimits() const noexcept { return limitsFor(performanceTier()); }
+
+    /// What the board currently costs against `TierLimits::pedalCostBudget`. Both are advisory;
+    /// see that field. Read from the editor to say so, never to change what is played.
+    [[nodiscard]] int pedalboardCost() const noexcept;
 
 
 private:
@@ -379,6 +684,23 @@ private:
     [[nodiscard]] int automaticOversamplingFactor(
         const nts::amp::AmpParameters& parameters) const noexcept;
     [[nodiscard]] nts::amp::AmpParameters currentAmpParameters() const noexcept;
+    /** `currentAmpParameters` with the amplifier's own cabinet switched out.
+
+        The cabinet is a stage of its own now (`cabinetStage`), sitting after whichever engine is
+        selected, so the copy inside `AmpVoice` must not also run or the traditional path would be
+        convolved twice. Kept as a separate accessor rather than folded into
+        `currentAmpParameters` because that function answers "what does this rig say", which every
+        other caller -- the assistant, preset export, the reconstruction warnings -- still needs to
+        include a cabinet.
+    */
+    [[nodiscard]] nts::amp::AmpParameters liveAmpParameters() const noexcept;
+    /** What the cabinet stage should be doing, read from the host parameters.
+
+        The four controls that predate the stage (`cabinet`, `cabinetBlend`, `cabinetWidth`,
+        `cabinetAlignment`) plus the thirteen in `cabinetControlIds`. Allocation-free; called once
+        per block from the audio thread.
+    */
+    [[nodiscard]] nts::amp::CabinetParameters currentCabinetParameters() const noexcept;
     /** One pedal slot's settings, read from the six parameters that back it.
 
         The six are laid out contiguously per slot so the slot index can walk them, which is
@@ -430,6 +752,20 @@ private:
         the detector and the attenuation have to be on opposite sides of the amplifier.
     */
     std::vector<float> gateSidechain;
+    /** The speaker, after whichever engine is selected and shared by all three.
+
+        **This is a stage, not a member of the amplifier, and the difference is audible.** While
+        the cabinet lived inside `AmpVoice` only the traditional engine had one: a Neural Amp
+        Modeler capture of a preamp or a pedal -- which is most of what people share -- played
+        into the output with no speaker in front of it, and no control in the plug-in could put
+        one there. The physical circuit engine had a *different* cabinet, a graph node, so a
+        loaded impulse response did nothing on it at all.
+
+        `AmpVoice` keeps its own instance for offline rendering, where the reconstruction needs a
+        cabinet in the render and cannot be handed a live audio object; on the live path that
+        copy is bypassed by `liveAmpParameters`.
+    */
+    nts::amp::CabinetSection cabinetStage;
     /// Delay then reverb, after the amplifier and shared by every engine: effects belong to
     /// the rig, not to one of the three ways of making the distortion.
     nts::dsp::Delay delayEffect;
@@ -511,9 +847,114 @@ private:
         juce::File file;
         nts::dsp::ImpulseResponse decoded;
         std::string status { "Built-in cabinet response" };
+        /** SHA-256 of the file as it was read, so a project can say whether the response on disk
+            is still the one it was saved with. Computed once at load; see `makeProjectState`. */
+        std::string digest;
+        /// True when this project recorded a different digest for the same path.
+        bool changedSinceSaved {};
     };
 
-    void applyRecoveredRig(const nts::amp::AmpParameters& rig, bool isolateChain);
+    // ---- Auto Match internals ---------------------------------------------------------
+
+    /** Marks a stretch of parameter writes as *not the user*.
+
+        `setParameterValue` issues real begin/end change gestures, exactly as a knob drag does,
+        so without this the guard cannot tell a matched rig being applied from a player reaching
+        for a control -- and Auto Match would raise a warning dialog about its own writes. Every
+        programmatic bulk write is wrapped: applying a rig, recalling a project or a preset,
+        accepting an assistant action, and a MIDI program change.
+
+        A counter rather than a flag because those paths nest: applying a tone package recalls a
+        project state, which writes the same parameters again.
+    */
+    class AutoWriteScope
+    {
+    public:
+        explicit AutoWriteScope(TubeForgeAudioProcessor& owner) noexcept : processor(owner)
+        { processor.autoWriteDepth.fetch_add(1, std::memory_order_acq_rel); }
+        ~AutoWriteScope() { processor.autoWriteDepth.fetch_sub(1, std::memory_order_acq_rel); }
+        AutoWriteScope(const AutoWriteScope&) = delete;
+        AutoWriteScope& operator=(const AutoWriteScope&) = delete;
+    private:
+        TubeForgeAudioProcessor& processor;
+    };
+
+    /// Resolves the owned table against the real parameters and starts listening. Called from
+    /// the constructor; the guard runs whether or not an editor is open, because a host writing
+    /// an automation lane has to release the control it wrote even with the window closed.
+    void attachAutoMatchGuard();
+    void detachAutoMatchGuard();
+    void parameterValueChanged(int parameterIndex, float newValue) override;
+    void parameterGestureChanged(int parameterIndex, bool gestureIsStarting) override;
+    /// Position in `tf::automatch::owned` of a host parameter index, or -1. Allocation-free and
+    /// lock-free: both listener callbacks can arrive on the audio thread.
+    [[nodiscard]] int autoOwnedIndexOf(int parameterIndex) const noexcept;
+    /// True when this owned control is currently being held and so may be warned about.
+    [[nodiscard]] bool autoMatchGuarding(int ownedIndex) const noexcept;
+    /// Records what a matched rig just put on every owned control. Called from
+    /// `applyRecoveredRig` once the writes are done.
+    void captureAutoMatchSnapshot(bool isolatedChain);
+    /** Stops holding, without touching a single parameter value.
+
+        Called wherever something replaces the whole rig -- a project, a profile, a program
+        change. The switch stays on and the state falls back to `armed`, because what those
+        paths invalidate is the *match*, not the user's wish to have one: the snapshot no longer
+        describes what is playing, so continuing to guard against it would be guarding a rig
+        that is not there.
+    */
+    void clearAutoMatchHold() noexcept;
+    /// What is being held, for the project file. Empty `heldValues` when nothing is.
+    [[nodiscard]] nts::state::AutoMatchState autoMatchProjectState() const;
+    /** Puts a saved hold back.
+
+        Values only -- the parameters themselves have already been restored from `ampControls` by
+        the time this runs, so re-writing them would be redundant and would fight a project whose
+        controls were edited after the match. What this restores is the *knowledge* of which
+        values the analyzer put there and which controls the user had taken back.
+
+        A saved rig from a build with a different owned set is refused rather than mapped: the
+        values are positional, so a shorter or longer list means the table moved and applying it
+        would guard the wrong controls with the wrong numbers.
+    */
+    void restoreAutoMatchProjectState(const nts::state::AutoMatchState& saved);
+
+    /// Host parameter index of each entry in `tf::automatch::owned`, resolved once at
+    /// construction. -1 would mean an id in that table names no real parameter, which the
+    /// constructor asserts on rather than leaving as a control that is silently never guarded.
+    std::array<int, tf::automatch::ownedCount> autoOwnedParameterIndices {};
+    std::array<float, tf::automatch::ownedCount> autoMatchValues {};
+    std::atomic<int> autoWriteDepth {};
+    /// Which owned controls a matched rig is currently holding. Zero means nothing is held,
+    /// which is what distinguishes `armed` from `holding`.
+    std::atomic<std::uint64_t> autoHeldMask {};
+    std::atomic<std::uint64_t> autoReleasedMask {};
+    /// Which owned controls have an open change gesture. A value change with no gesture behind
+    /// it did not come from a person, so it releases silently instead of raising a dialog.
+    std::atomic<std::uint64_t> autoGestureMask {};
+    std::atomic<std::uint64_t> autoExternalReleaseMask {};
+    std::atomic<int> autoWarningRequest { -1 };
+    /** A pending "the instrument changed, re-run the match" request: the new instrument index,
+        or -1. Latched by the guard and acted on from `handleAsyncUpdate`, because the guard can
+        be running on the audio thread and starting a worker there is not allowed.
+    */
+    std::atomic<int> autoMatchInstrumentRequest { -1 };
+    /// The reconstruction generation Auto Match has already applied. See `refreshAutoMatch`.
+    std::uint64_t autoMatchAppliedGeneration {};
+    /// Whether the last auto-applied candidate took the effects chain with it. Follows the Song
+    /// Match page's own switch, which is pushed in rather than read out of the interface.
+    bool autoMatchIsolatePreference { true };
+    /// Loaded once at construction and written when it changes; see autoMatchWarningsSuppressed.
+    bool autoMatchSuppressWarnings {};
+    /// Rate limit for live tracking. A trim that moves at the tick rate would fill a host's
+    /// automation lane with gestures and would read as a knob with a fault.
+    std::chrono::steady_clock::time_point lastAutoMatchTracking {};
+    /// Follows the live signal within the bounds the match set. See `updateAutoMatchTracking`.
+    void updateAutoMatchTracking();
+    void loadAutoMatchPreferences();
+    mutable std::mutex autoMatchMutex;
+    std::string autoMatchSource;
+    bool autoMatchIsolatedChain {};
+
     /** The rig a Song Match candidate last put on the amplifier.
 
         Kept so the chain warnings can be answered against live parameter values whenever
@@ -523,8 +964,48 @@ private:
     std::optional<nts::amp::AmpParameters> appliedRecoveredRig;
     void refreshEffectParameters() noexcept;
     void applyCabinetIr(int slot);
-    void restoreCabinetIrPaths(const std::string& pathA, const std::string& pathB);
+    /// Puts the built-in response back in one slot of the cabinet stage: the model rendered from
+    /// that slot's own controls, or the original samples when the model is set to Legacy.
+    void restoreBuiltInCabinet(int slot);
+    /** What the built-in model is being asked for in one slot, read from the host parameters. */
+    [[nodiscard]] nts::ir::CabinetModelSettings currentCabinetModel(int slot) const noexcept;
+    /** Re-derives what both cabinet slots are sounding: the built-in model, or a re-prepared
+        user response for a slot that holds one.
+
+        Message-thread work: it runs transforms and allocates. Reached from `handleAsyncUpdate`
+        when the audio thread notices any of those controls have moved, which is the same route
+        the physical circuit's recompile takes and for the same reason.
+    */
+    void refreshCabinetResponses();
+    /** Hash of every control that decides what the two slots sound like -- the built-in model and
+        the preparation of a loaded response -- so the audio thread can notice a change without
+        doing anything about it. Mirrors `physicalCircuitControlHash`. */
+    [[nodiscard]] std::uint64_t cabinetModelHash() const noexcept;
+    std::atomic<std::uint64_t> renderedCabinetModelHash {};
+    /// See `cabinetHoldState`. Written from the message thread, read from the editor's tick.
+    std::atomic<CabinetHold> cabinetHold { CabinetHold::none };
+    /** Marks slot A's matched cabinet as replaced, if one was being held.
+
+        Called from every path that writes slot A other than the match itself. A no-op unless
+        something was held, so callers do not have to know whether it was.
+    */
+    void releaseCabinetHold() noexcept;
+    /// Recomputes `cabinetCurves` for one slot from whatever it is now sounding.
+    void refreshCabinetResponseCurve(int slot);
+    /// Guarded by `cabinetIrMutex`, which already guards the responses these are derived from.
+    std::array<std::vector<float>, 2> cabinetCurves;
+    /** Puts saved responses back, and says so when what is on disk has changed underneath.
+
+        `hashA`/`hashB` are the digests recorded when the project was saved, empty for a project
+        written before schema 6. A mismatch is not an error and does not refuse the file -- it is
+        still the response the user pointed at -- but it is said out loud, because an impulse pack
+        updated in place is exactly the kind of thing that silently re-voices a finished mix.
+    */
+    void restoreCabinetIrPaths(const std::string& pathA, const std::string& pathB,
+                               const std::string& hashA = {}, const std::string& hashB = {});
     nts::ir::CabinetIrLoader cabinetIrLoader;
+    /// See cabinetLibrary(). Scanned from a folder the user chooses, never copied.
+    nts::ir::CabinetLibrary cabinets;
     mutable std::mutex cabinetIrMutex;
     std::array<CabinetIrSlot, 2> cabinetIrSlots;
 
@@ -581,6 +1062,23 @@ private:
     mutable std::mutex importStatusMutex;
     std::string importStatus { "No captures imported yet" };
 
+    /** A loaded capture that already contains a speaker, waiting to switch the cabinet off.
+
+        The cabinet became a stage shared by all three engines, which is what makes a preamp-only
+        or pedal capture usable -- and which would put a second speaker in front of a **full-rig**
+        capture, that being a capture of an amplifier *and* its cabinet. Two cabinets in series is
+        not a subtle error; it is the dull, honking sound people describe when they double up.
+
+        So a capture whose author labelled it `fullRig` switches the cabinet off as it loads, and
+        says so on the page. Only that direction is automatic: switching the cabinet back *on* for
+        an amp capture would overrule a user who turned it off deliberately, and being wrong in
+        that direction is worse than leaving a control where they put it.
+
+        Latched here because `loadNeuralArtifact` runs on a worker and writing a host parameter is
+        message-thread work; consumed in `handleAsyncUpdate`, which is the route the MIDI program
+        change already takes for the same reason.
+    */
+    std::atomic<bool> pendingFullRigCabinetBypass {};
     std::atomic<nts::diagnostics::AssetLoadStatus> neuralLoadStatus { nts::diagnostics::AssetLoadStatus::idle };
     mutable std::mutex neuralStatusMutex;
     std::string neuralStatusDetail { "No neural model loaded" };

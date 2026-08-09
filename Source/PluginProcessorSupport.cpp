@@ -9,6 +9,9 @@ TubeForgeAudioProcessor::~TubeForgeAudioProcessor()
     // engine and so cannot move out of the processor.
     if (neuralLoader.joinable()) neuralLoader.request_stop();
     if (circuitCompiler.joinable()) circuitCompiler.request_stop();
+    // Before the value tree state goes: a parameter outliving a listener that points at a
+    // half-destroyed processor is the shape of crash that only shows up in a host.
+    detachAutoMatchGuard();
 }
 
 TubeForgeAudioProcessor::TubeForgeAudioProcessor()
@@ -18,6 +21,7 @@ TubeForgeAudioProcessor::TubeForgeAudioProcessor()
       parameterState(*this, nullptr, "TubeForgeParameters", createParameterLayout()),
       engine(runtimeParameters, meters),
       logger(logPath(), &diagnostics),
+      cabinets(cabinetLibraryPreferencesPath()),
       captures(captureLibraryPath()),
       studio([this](const nts::amp::AmpParameters& rig, bool isolateChain)
              { applyRecoveredRig(rig, isolateChain); }),
@@ -32,6 +36,12 @@ TubeForgeAudioProcessor::TubeForgeAudioProcessor()
         parameterPointers[index] = parameterState.getRawParameterValue(parameterIdList[index]);
         jassert(parameterPointers[index] != nullptr);
     }
+
+    // Resolves Source/AutoMatch.h against the real parameters and starts watching them. Done
+    // here rather than when an editor opens, because a host writing an automation lane has to
+    // release the control it wrote whether or not anyone has the window open.
+    attachAutoMatchGuard();
+    loadAutoMatchPreferences();
 
     for (int instrument = 0; instrument < 2; ++instrument)
         for (std::size_t topology = 0; topology < nts::amp::topologyCount; ++topology)
@@ -108,8 +118,16 @@ std::vector<nts::assistant::ParameterValue> TubeForgeAudioProcessor::assistantPa
 void TubeForgeAudioProcessor::applyAssistantParameterValues(
     std::span<const nts::assistant::ParameterValue> values)
 {
+    /* An accepted assistant action is the user's decision, arriving through a button rather than
+       a knob -- so it must not raise the Auto Match dialog, and it must not be silently undone by
+       Auto Match either. Suppressed on the way in, and every parameter it moves is handed back:
+       from here on the analyzer stops holding those controls and the assistant's value stands. */
+    const AutoWriteScope autoWrite(*this);
     for (const auto& value : values)
+    {
         setParameterValue(parameterState, value.id.c_str(), value.value);
+        releaseAutoMatchParameter(value.id);
+    }
 }
 
 void TubeForgeAudioProcessor::refreshAssistant()

@@ -11,12 +11,14 @@ namespace
 constexpr std::array controlIds { "stage1", "stage2", "stage3", "stage4", "bias", "lowCut", "highCut",
                                   "sag", "feedback", "crossover", "cleanBlend", "cabinetAlignment",
                                   "tightness", "pickEmphasis",
-                                  "gateThreshold", "gateDepth", "gateAttack", "gateHold", "gateRelease" };
+                                  "gateThreshold", "gateDepth", "gateAttack", "gateHold", "gateRelease",
+                                  "dryBlend", "lowBandDrive", "lowBandLevel", "highBandLevel" };
 constexpr std::array controlNames { "Stage 1 gain", "Stage 2 gain", "Stage 3 gain", "Stage 4 gain",
                                     "Bias", "Pre low cut", "Pre high cut", "Sag", "Feedback",
                                     "Bass crossover", "Clean blend", "Cab alignment", "Tightness",
                                     "Pick emphasis",
-                                    "Threshold", "Depth", "Attack", "Hold", "Release" };
+                                    "Threshold", "Depth", "Attack", "Hold", "Release",
+                                    "Dry blend", "Low drive", "Low level", "High level" };
 /** What each control does, in the order above.
 
     Written to say what moving it changes and when you would reach for it, rather than restating the
@@ -61,7 +63,15 @@ constexpr std::array controlHints {
     "How long the gate stays open after the signal drops. Longer hold stops it chattering on decaying "
     "notes.",
     "How quickly the gate closes once hold expires. Longer sounds natural on ringing chords; shorter "
-    "is tighter between staccato riffs."
+    "is tighter between staccato riffs.",
+    "Untouched input summed back over the whole amplifier. Not the same as Clean blend, which only "
+    "returns the low band -- this keeps the fundamental at full weight while the top is destroyed.",
+    "Drive into the clean low band. Left alone the bottom stays clean; raised, the low side saturates "
+    "on its own terms rather than borrowing the driven band's.",
+    "Level of the low band in the mix. With a high crossover this is the whole body of the note, so "
+    "it is the balance between weight and attack.",
+    "Level of the driven high band. Lower it to sit the clank under the note; raise it for more "
+    "attack and string noise."
 };
 static_assert(controlNames.size() == controlHints.size(),
               "every control needs a hint describing what it does");
@@ -70,10 +80,18 @@ static_assert(controlIds.size() == ToneShapingPage::controlCount,
 static_assert(controlIds.size() == controlNames.size(),
               "each control needs a matching display name");
 
-/// Which controls belong to which card. -1 pads a group shorter than the longest.
-constexpr std::array<std::array<int, 5>, 4> groupMembers { { { 0, 1, 2, 3, 4 },
+/* Which controls belong to which card. -1 pads a group shorter than the longest.
+
+   Five cards rather than four: the bi-amp controls earned their own.
+
+   Crossover and Clean blend used to sit under "Power & cabinet" because there were only two of
+   them and nowhere better. With Low drive, Low level and High level beside them they are a
+   section of their own, and grouping them says what they are -- two power sections either side
+   of a split -- in a way that scattering them among the power controls does not. */
+constexpr std::array<std::array<int, 5>, 5> groupMembers { { { 0, 1, 2, 3, 4 },
                                                              { 5, 6, 12, 13, -1 },
-                                                             { 7, 8, 9, 10, 11 },
+                                                             { 7, 8, 11, 19, -1 },
+                                                             { 9, 10, 20, 21, 22 },
                                                              { 14, 15, 16, 17, 18 } } };
 } // namespace
 
@@ -82,7 +100,6 @@ ToneShapingPage::ToneShapingPage(TubeForgeAudioProcessor& processorToUse)
 {
     tf::ui::configureFieldCaption(topologyCaption, "Topology");
     tf::ui::configureFieldCaption(oversamplingCaption, "Oversampling");
-    tf::ui::populateFromParameter(topologySelector, processor.getParameters(), "topology");
     tf::ui::populateFromParameter(oversamplingSelector, processor.getParameters(), "oversampling");
     for (auto* component : std::initializer_list<juce::Component*> { &topologyCaption,
              &oversamplingCaption, &topologySelector, &oversamplingSelector, &gateEnabled,
@@ -109,8 +126,27 @@ ToneShapingPage::ToneShapingPage(TubeForgeAudioProcessor& processorToUse)
         }
     }
 
-    topologyAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
-        processor.getParameters(), "topology", topologySelector);
+    // Hand-driven; see the note on `rebuildTopologyList` in the header for why this one cannot
+    // take a ComboBoxAttachment.
+    rebuildTopologyList();
+    topologySelector.onChange = [this]
+    {
+        const auto selected = topologySelector.getSelectedId();
+        if (selected <= 0) return;
+        if (auto* parameter = processor.getParameters().getParameter("topology"))
+        {
+            const auto value = static_cast<float>(selected - 1);
+            // Through the normalised setter so the host sees a proper gesture, exactly as an
+            // attachment would have done.
+            const auto normalised = parameter->convertTo0to1(value);
+            if (std::abs(parameter->getValue() - normalised) > 1.0e-6f)
+            {
+                parameter->beginChangeGesture();
+                parameter->setValueNotifyingHost(normalised);
+                parameter->endChangeGesture();
+            }
+        }
+    };
     oversamplingAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor.getParameters(), "oversampling", oversamplingSelector);
     gateAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
@@ -136,6 +172,60 @@ void ToneShapingPage::setPerformanceLimits(int maximumOversamplingFactor, bool)
                                 juce::dontSendNotification);
 }
 
+void ToneShapingPage::rebuildTopologyList()
+{
+    const auto* instrumentValue = processor.getParameters().getRawParameterValue("instrument");
+    const auto instrument = instrumentValue == nullptr
+        ? 0 : static_cast<int>(std::lround(instrumentValue->load(std::memory_order_relaxed)));
+    listedInstrument = instrument;
+
+    const auto* choice = dynamic_cast<const juce::AudioParameterChoice*>(
+        processor.getParameters().getParameter("topology"));
+    if (choice == nullptr) return;
+
+    // Cleared and refilled rather than hidden or disabled: an entry a guitarist can see but not
+    // choose is a question they have to answer every time they open the list.
+    topologySelector.clear(juce::dontSendNotification);
+    for (int index = 0; index < choice->choices.size(); ++index)
+    {
+        if (instrument == 0
+            && nts::amp::topologyAffinity(static_cast<nts::amp::Topology>(index))
+                   == nts::amp::TopologyAffinity::bass)
+            continue;
+        // Id is the topology index plus one, because zero means "nothing selected" to a ComboBox.
+        // This is the whole reason the box can be filtered at all -- see the header.
+        topologySelector.addItem(choice->choices[index], index + 1);
+    }
+
+    const auto current = static_cast<int>(std::lround(
+        processor.getParameters().getRawParameterValue("topology")->load(std::memory_order_relaxed)));
+    // A guitar rig sitting on a bass-native voicing -- reachable from a preset, a project or host
+    // automation -- shows nothing selected rather than snapping to a voicing nobody asked for.
+    // Silently rewriting the parameter to make the list look tidy would change the sound.
+    topologySelector.setSelectedId(current + 1, juce::dontSendNotification);
+}
+
+void ToneShapingPage::refresh()
+{
+    // See the same loop on the Amplifier page for why this is per-tick and why only the
+    // released controls are coloured.
+    for (std::size_t index = 0; index < sliders.size(); ++index)
+        markAutoMatch(sliders[index], processor.autoMatchReleased(controlIds[index]));
+
+    const auto* instrumentValue = processor.getParameters().getRawParameterValue("instrument");
+    const auto instrument = instrumentValue == nullptr
+        ? 0 : static_cast<int>(std::lround(instrumentValue->load(std::memory_order_relaxed)));
+    if (instrument != listedInstrument) { rebuildTopologyList(); return; }
+
+    // The voicing moves from the amplifier page, from presets, from recovered rigs and from host
+    // automation, so this box only ever learns by looking.
+    const auto* topologyValue = processor.getParameters().getRawParameterValue("topology");
+    if (topologyValue == nullptr) return;
+    const auto current = static_cast<int>(std::lround(topologyValue->load(std::memory_order_relaxed)));
+    if (topologySelector.getSelectedId() != current + 1)
+        topologySelector.setSelectedId(current + 1, juce::dontSendNotification);
+}
+
 void ToneShapingPage::resized()
 {
     auto area = getLocalBounds();
@@ -148,8 +238,11 @@ void ToneShapingPage::resized()
     loudnessMatch.setBounds(top.removeFromLeft(150).withTrimmedTop(13).withHeight(28));
     area.removeFromTop(10);
 
+    // Rows derived from the card count rather than fixed at two: adding the bi-amp card made a
+    // hardcoded two-row grid draw the fifth one off the bottom of the page.
+    const auto groupRows = static_cast<int>((groups.size() + 1) / 2);
     const auto groupWidth = area.getWidth() / 2;
-    const auto groupHeight = area.getHeight() / 2;
+    const auto groupHeight = area.getHeight() / groupRows;
     for (std::size_t group = 0; group < groups.size(); ++group)
     {
         const auto column = static_cast<int>(group % 2);

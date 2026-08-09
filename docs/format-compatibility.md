@@ -32,13 +32,32 @@ Versions evolve independently. Application SemVer changes do not imply a package
 | Format | Current writer | Accepted readers | Compatibility rule |
 |---|---:|---:|---|
 | Application | 0.10.0 | n/a | SemVer; project declares minimum runtime |
-| `.tforge` project schema | 4 | 0–4 | Each older version migrates forward in turn; newer versions rejected |
+| `.tforge` project schema | 6 | 0–6 | Each older version migrates forward in turn; newer versions rejected |
 | `.ntone` package | 1 | 1 | Unknown package versions rejected before asset reads |
 | Packed neural model | 2 | 1–2 | Architecture/version pair, dimensions, size and test vector must validate |
 | Circuit graph | 1 | 0–1 | v0 migrates to v1; newer versions rejected |
 | Dataset session | 1 | 1 | Exact schema plus provenance/rights validation |
 | Tone analysis / embedding | 1 | 1 | Version participates in comparison and persistence |
 | Source separation | 1 | 1 | Backend identity/version recorded with cache results |
+
+A `.ntone` package may now carry the cabinet responses a rig uses, as `cabinet-ir` assets with a
+`cabinetSlots` array in the manifest saying which slot each belongs to. The mapping is separate from the asset
+paths because the exporter names those by index, so a package carrying only slot B's response would otherwise
+be indistinguishable from one carrying only slot A's. An absent `cabinetSlots` means the package carries no
+cabinet responses, which is what every package written before this has and remains the default: embedding is
+opt-in, because most impulse responses are licensed for use rather than redistribution.
+
+Schema 6 also records a SHA-256 of each loaded cabinet response's bytes beside its path. A path alone cannot
+tell "the file moved" apart from "the file at that path is not the one you saved", and the second silently
+re-voices a mix. An empty digest — which is what every earlier project has — means the question cannot be
+answered, which the plug-in treats differently from answering it wrongly.
+
+Schema 6 adds the cabinet stage's own controls in a `cabinet` block of their own, rather than
+extending `engine.ampControls`. That list is nearly at the 64-entry ceiling `validate` enforces, and
+overrunning it does not truncate a save — it makes every saved project fail to load. A project
+written before schema 6 carries no cabinet block, and that is a complete description rather than a
+gap: the defaults for those controls are the values the fields held while they were unreachable, so
+an older project restores the cabinet it actually described.
 
 `.ntone` manifest `minimumRuntime` is checked independently of `packageFormat`. A profile may therefore use
 format 1 but require a later 0.x runtime because of a new rig control or model architecture. The browser shows

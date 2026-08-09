@@ -958,6 +958,86 @@ void testTimeBasedEffects(TestHarness& tests)
                  "both effects report a tail for the host");
 }
 
+/** Integrating the clipping curve folds back measurably less than sampling it.
+
+    The claim ADAA exists to make, tested the way aliasing is actually audible: drive a high
+    sine hard enough that the clipper's odd harmonics run past Nyquist, then measure how much
+    energy lands at frequencies that are *not* multiples of the input. A clipper's own harmonics
+    are integer multiples of the fundamental; everything that folded back is not.
+
+    The fundamental is deliberately *not* a submultiple of the sample rate. At exactly 4 kHz in
+    48 kHz every harmonic folds back onto another multiple of 4 kHz -- the aliases land exactly
+    on top of the real harmonics and the measurement reads zero however bad the aliasing is.
+    4100 Hz has no such relationship, so the folded partials land between the harmonics where
+    they can be seen. This is the whole reason the first version of this test passed nothing.
+
+    Both sides run the *same curve at the same gain*, which is the only comparison that means
+    anything. A first attempt at this compared a hard-clipped model against a soft-clipped one
+    and was measuring the difference between the two curves, not the difference the integration
+    makes.
+*/
+void testAntiderivativeAntiAliasing(TestHarness& tests)
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr double fundamental = 4100.0;
+    constexpr std::size_t length = 4096;
+    constexpr float drive = 8.0f;
+    constexpr auto shape = nts::dsp::Waveshape::hardClip;
+
+    std::vector<float> input(length);
+    for (std::size_t n = 0; n < length; ++n)
+        input[n] = 0.9f * static_cast<float>(
+            std::sin(2.0 * std::numbers::pi * fundamental * static_cast<double>(n) / sampleRate));
+
+    std::vector<float> sampled(length), integrated(length);
+    nts::dsp::AntialiasedWaveshaper shaper;
+    for (std::size_t n = 0; n < length; ++n)
+    {
+        sampled[n] = nts::dsp::shapeSample(input[n], shape, drive);
+        integrated[n] = shaper.process(input[n], shape, drive, 0);
+    }
+
+    // Energy at every 100 Hz bin that is not within 5% of a harmonic of the fundamental.
+    const auto aliasEnergy = [&](const std::vector<float>& signal)
+    {
+        auto total = 0.0;
+        for (auto frequency = 300.0; frequency < 20000.0; frequency += 100.0)
+        {
+            const auto ratio = frequency / fundamental;
+            if (std::abs(ratio - std::round(ratio)) < 0.05) continue;
+            double real {}, imaginary {};
+            for (std::size_t n = 0; n < signal.size(); ++n)
+            {
+                const auto phase = 2.0 * std::numbers::pi * frequency
+                                 * static_cast<double>(n) / sampleRate;
+                real += signal[n] * std::cos(phase);
+                imaginary += signal[n] * std::sin(phase);
+            }
+            total += real * real + imaginary * imaginary;
+        }
+        return total;
+    };
+
+    const auto plain = aliasEnergy(sampled);
+    const auto adaa = aliasEnergy(integrated);
+    tests.expect(plain > 0.0, "the sampled clipper produces measurable foldback to compare against");
+    tests.expect(adaa < plain * 0.5,
+                 "integrating the clipping curve halves the aliasing at worst");
+
+    // And it is still a clipper: the point is less foldback, not a different effect.
+    auto bounded = true;
+    for (const auto value : integrated) bounded = bounded && std::isfinite(value) && std::abs(value) <= 1.001f;
+    tests.expect(bounded, "the integrated clipper stays bounded by the curve it integrates");
+
+    // The singular case. Held DC has a zero denominator at every sample, and must produce the
+    // curve's value rather than a division by zero.
+    nts::dsp::AntialiasedWaveshaper held;
+    auto finiteOnDc = true;
+    for (int n = 0; n < 64; ++n)
+        finiteOnDc = finiteOnDc && std::isfinite(held.process(0.3f, shape, drive, 0));
+    tests.expect(finiteOnDc, "a held input does not divide by zero");
+}
+
 void testNoRuntimeAllocations(TestHarness& tests)
 {
     nts::dsp::Biquad filter; filter.prepare(stereoSpec); filter.setCoefficients(nts::dsp::BiquadCoefficients::make(nts::dsp::FilterType::lowPass, sampleRate, 2000.0));
@@ -995,6 +1075,7 @@ int main()
     testNonlinearAndOversampling(tests); testDynamics(tests); testModeSwitchAndSimd(tests); testConvolutionAndIr(tests);
     testAnalysisAndMetering(tests); testRegressionSystem(tests); testDelayLine(tests); testPitchDetection(tests);
     testTimeBasedEffects(tests);
+    testAntiderivativeAntiAliasing(tests);
     testNoRuntimeAllocations(tests);
     return tests.result();
 }

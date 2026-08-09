@@ -1,6 +1,7 @@
 ﻿#include <nts/reconstruction/SourceReconstruction.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -8,7 +9,9 @@
 #include <limits>
 #include <numbers>
 #include <numeric>
+#include <span>
 #include <sstream>
+#include <vector>
 
 namespace nts::reconstruction
 {
@@ -384,23 +387,24 @@ constexpr std::array<int, 5> centredGainSteps { 0, -1, 1, -2, 2 };
 
     An earlier ordering here put brightness fastest and gain on `variant / 9`, which fixed the
     dullness bias but cut gain from five sampled steps to two. Both mattered; this ordering gets
-    both. The mixed radix gives 5 x 3 x 3 x `topologyCount` unique points.
+    both. The mixed radix gives 5 x 3 x 3 x however many voicings the instrument can use.
 
     Dynamics is deliberately absent: it is seeded from a direct measurement rather than a
     guessed mapping, so its centre is already the best coarse answer and perturbing it here
     would cost pool slots that gain and brightness use better. Refinement explores it.
 */
-CandidatePoint coarsePoint(const nts::tone::ToneReport& report, float dynamics, std::size_t variant)
+CandidatePoint coarsePoint(const nts::tone::ToneReport& report, float dynamics, std::size_t variant,
+                           std::span<const nts::amp::Topology> eligible)
 {
     const auto gainStep = centredGainSteps[variant % 5];
     const auto brightnessStep = centredSteps[(variant / 5) % 3];
     const auto tightnessStep = centredSteps[(variant / 15) % 3];
-    const auto topologyStep = (variant / 45) % nts::amp::topologyCount;
+    const auto topologyStep = eligible.empty() ? std::size_t {} : (variant / 45) % eligible.size();
     const auto offset = static_cast<float>(gainStep) * 0.06f;
 
     CandidatePoint point;
     point.dynamics = dynamics;
-    point.topology = static_cast<nts::amp::Topology>(topologyStep);
+    point.topology = eligible.empty() ? nts::amp::Topology::tightModern : eligible[topologyStep];
     point.gain = clamp01(gridCentre(report.gain.value, 0.12f) + offset);
     point.brightness = clamp01(gridCentre(report.brightness.value, 0.12f) - offset * 0.5f
                                + static_cast<float>(brightnessStep) * 0.06f);
@@ -414,6 +418,18 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
                             const CandidatePoint& point)
 {
     auto& p = preset.parameters;
+    /* What the voicing itself asked for, captured before anything below overwrites it.
+
+       `p` aliases `preset.parameters`, so a fit that wants to scale a voicing's own value rather
+       than replace it has to read it first or it reads its own output. Taken here rather than at
+       each use so that reordering the assignments below cannot silently turn one of them into a
+       self-reference.
+    */
+    const auto voicingCrossoverHz = p.bass.crossoverHz;
+    std::array<int, 4> voicingOversampling {};
+    for (std::size_t stage = 0; stage < voicingOversampling.size(); ++stage)
+        voicingOversampling[stage] = p.stages[stage].oversamplingFactor;
+
     const auto gain = point.gain;
     const auto brightness = point.brightness;
     const auto tightness = point.tightness;
@@ -453,7 +469,12 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
         // candidates were scored against a spectrum the amp does not actually
         // produce, and the preset handed back sounded unlike the thing that won.
         // Matching playback here is what makes the score mean something.
-        p.stages[stage].oversamplingFactor = 4;
+        //
+        // Which is why it is a floor rather than a value. A hard-clipping voicing asks for 8x
+        // because a clamped curve folds far harder than a valve one; pinning it to 4 would score
+        // exactly the aliasing this line exists to stop measuring, and would do it worst on the
+        // candidates most sensitive to it.
+        p.stages[stage].oversamplingFactor = std::max(4, voicingOversampling[stage]);
     }
     p.preEq.lowCutHz = p.instrument == nts::amp::Instrument::bass
         ? 28.0f + tightness * 45.0f : 55.0f + tightness * 95.0f;
@@ -482,11 +503,25 @@ void setCandidateParameters(nts::amp::AmpPreset& preset, const nts::tone::ToneRe
     p.postLowDb = (report.cleanLowBlendEstimate.value - 0.5f) * 5.0f;
     p.postMidDb = (0.5f - brightness) * 3.0f;
     p.postHighDb = (brightness - 0.5f) * 5.0f;
-    p.bass.crossoverHz = 90.0f + tightness * 180.0f;
+    /* Fitted *around* the voicing's own crossover rather than replacing it.
+
+       This used to be `90 + tightness * 180`, an absolute 90-270 Hz for every candidate. That is
+       a reasonable fit while every voicing splits at 120-220 Hz to keep a low B out of the
+       distortion -- and it destroys the one voicing whose split is its identity. Solid-State
+       Bi-Amp divides at 500 Hz so that the whole body of a note passes clean and only the attack
+       is driven; forced down to 270 it is not a bi-amp being fitted, it is a different amplifier
+       wearing the name, and it would lose matches it should win while sounding like nothing in
+       particular.
+
+       Scaling by 0.5x to 1.5x of the preset's own value keeps tightness meaningful on every
+       voicing and lands within a few Hz of the old range for the ones that used to define it:
+       the shared 170 Hz default now sweeps 85-255 against the previous 90-270.
+    */
+    p.bass.crossoverHz = voicingCrossoverHz * (0.5f + tightness);
     p.bass.cleanBlend = report.cleanLowBlendEstimate.value;
     p.outputGainDb = -9.0f;
     preset.name = "Plausible " + std::string(nts::tone::toString(report.context.gainCategory))
-        + (point.topology == nts::amp::Topology::tightModern ? " tight" : " bloom") + " candidate";
+        + " " + std::string(nts::amp::topologyName(point.topology)) + " candidate";
 }
 
 /** Neighbours of a point, one step along each axis. Topology is deliberately not
@@ -514,6 +549,23 @@ std::vector<CandidatePoint> refinementNeighbours(const CandidatePoint& centre, f
     return points;
 }
 } // namespace
+
+std::vector<nts::amp::Topology> searchableTopologies(nts::amp::Instrument instrument)
+{
+    std::vector<nts::amp::Topology> eligible;
+    eligible.reserve(nts::amp::topologyCount);
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+    {
+        const auto topology = static_cast<nts::amp::Topology>(index);
+        // A bass-native voicing still answers for guitar -- `makeOriginalPreset` gives every one a
+        // guitar reading -- so this decides what is *searched*, not what exists.
+        if (instrument == nts::amp::Instrument::guitar
+            && nts::amp::topologyAffinity(topology) == nts::amp::TopologyAffinity::bass)
+            continue;
+        eligible.push_back(topology);
+    }
+    return eligible;
+}
 
 std::string StemSeparator::deterministicCacheKey(const StereoAudio& mixture,
                                                  const SeparationOptions& options)
@@ -930,10 +982,17 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
     std::vector<RigCandidate> pool;
     std::vector<CandidatePoint> evaluatedPoints;
 
+    // Only the voicings this instrument can actually use. Guitar searches seven and bass
+    // thirteen, so a guitar reconstruction costs what it did before the bass voicings landed
+    // rather than paying six extra renders for amplifiers it will never offer.
+    const auto searchable = searchableTopologies(
+        reference.target == TargetInstrument::bass ? nts::amp::Instrument::bass
+                                                   : nts::amp::Instrument::guitar);
+
     // Two directions along each refinement axis per round, plus the topology re-check, which
     // renders the refined point under every voicing the coarse pool did not reach.
     const auto totalRenders = poolSize + refinementSteps.size() * refinementAxes * 2
-                            + nts::amp::topologyCount - 1;
+                            + searchable.size() - 1;
     std::size_t rendersDone {};
 
     const auto evaluate = [&](const CandidatePoint& point) -> std::optional<RigCandidate>
@@ -1024,12 +1083,12 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
         return true;
     };
 
-    // Coarse pass: sample the grid. Topology is the slowest digit, so a default pool covers one
-    // voicing here and the other is reached by the re-check after refinement.
+    // Coarse pass: sample the grid. Topology is the slowest digit, so a default pool covers the
+    // first voicing here and the rest are reached by the re-check after refinement.
     const auto dynamics = dynamicsSeed(reference.tone.features.dynamic,
                                        reference.tone.features.spatial.doubleTrackingLikelihood);
     for (std::size_t variant = 0; variant < poolSize; ++variant)
-        if (! record(coarsePoint(reference.tone.report, dynamics, variant),
+        if (! record(coarsePoint(reference.tone.report, dynamics, variant, searchable),
                      "rendering and ranking candidate rigs"))
         { result.error = "reconstruction cancelled"; return result; }
 
@@ -1076,9 +1135,8 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
         // `topologyCount - 1` extra offline renders on every reconstruction, not one. That is
         // the price of the voicing being findable, and dropping to a sampled subset would mean
         // some amplifiers could never win a match.
-        for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+        for (const auto other : searchable)
         {
-            const auto other = static_cast<nts::amp::Topology>(index);
             if (other == bestPoint.topology) continue;
             auto alternative = bestPoint;
             alternative.topology = other;

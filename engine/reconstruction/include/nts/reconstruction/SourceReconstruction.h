@@ -189,6 +189,19 @@ struct ReconstructionResult
     std::vector<std::string> warnings;
 };
 
+/** The amplifier voicings a reconstruction will consider for an instrument, in enum order.
+
+    Guitar gets the seven that suit both instruments; bass gets those plus the six that were
+    designed for it. `nts::amp::topologyAffinity` is the source of that split.
+
+    Published rather than kept private because the count is a *cost*: the search renders the
+    refined winning point under every voicing it did not already reach, so this list's length sets
+    how long a reconstruction takes and is worth being able to ask about -- and worth being able
+    to test, since a voicing wrongly included does not fail, it quietly takes a shortlist slot
+    from an amplifier the player might actually have used.
+*/
+[[nodiscard]] std::vector<nts::amp::Topology> searchableTopologies(nts::amp::Instrument instrument);
+
 class RigReconstructor
 {
 public:

@@ -88,6 +88,7 @@ juce::var manifestVar(const TonePackageManifest& manifest, bool includeSignature
     root->setProperty("tags", stringsVar(manifest.tags));
     root->setProperty("sampleRates", intsVar(manifest.sampleRates));
     root->setProperty("modelOperators", stringsVar(manifest.modelOperators));
+    root->setProperty("cabinetSlots", intsVar(manifest.cabinetSlots));
     root->setProperty("packageLicense", juce::String(manifest.packageLicense));
     root->setProperty("sourceAudioIncluded", manifest.sourceAudioIncluded);
     juce::Array<juce::var> assets;
@@ -296,6 +297,23 @@ std::optional<TonePackageManifest> parsePackageManifest(std::string_view json, s
     { error = "Package manifest contains an invalid metadata array"; return std::nullopt; }
     if (result.tags.size() > 32 || result.sampleRates.empty() || result.modelOperators.size() > 16)
     { error = "Package manifest metadata limits were exceeded"; return std::nullopt; }
+    /* Cabinet slot mapping. Absent in every package written before it existed, which is why a
+       missing key is accepted and an ill-formed one is not: the first means "this package carries
+       no cabinet responses", the second means the file is wrong about itself. */
+    if (const auto slots = object->getProperty("cabinetSlots"); ! slots.isVoid())
+    {
+        const auto* array = slots.getArray();
+        if (array == nullptr) { error = "Package manifest cabinet slot mapping is invalid"; return std::nullopt; }
+        for (const auto& item : *array)
+        {
+            const auto slot = static_cast<int>(item);
+            if (slot < 0 || slot > 1)
+            { error = "Package manifest names a cabinet slot that does not exist"; return std::nullopt; }
+            result.cabinetSlots.push_back(slot);
+        }
+        if (result.cabinetSlots.size() > 2)
+        { error = "Package manifest declares more cabinet responses than there are slots"; return std::nullopt; }
+    }
     const auto* assets = object->getProperty("assets").getArray();
     if (assets == nullptr || assets->isEmpty()) { error = "Package manifest must declare assets"; return std::nullopt; }
     std::set<std::string> paths;

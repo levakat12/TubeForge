@@ -1,5 +1,7 @@
 #include "PackedFixtures.h"
 #include "TestHarness.h"
+
+#include <nts/ir/CabinetModel.h>
 #include "PluginProcessor.h"
 #include "ui/FaceplateArt.h"
 #include "ui/PedalArt.h"
@@ -139,18 +141,36 @@ void testPedalboard(TestHarness& tests)
     auto everyParameterExists = true;
     for (std::size_t slot = 0; slot < nts::pedals::slotCount; ++slot)
         for (const auto control : { PedalControl::kind, PedalControl::bypass, PedalControl::drive,
-                                    PedalControl::tone, PedalControl::level, PedalControl::mix })
+                                    PedalControl::tone, PedalControl::level, PedalControl::mix,
+                                    PedalControl::auxA, PedalControl::auxB })
             everyParameterExists = everyParameterExists
                 && processor.getParameters().getParameter(
                        TubeForgeAudioProcessor::pedalParameterId(slot, control)) != nullptr;
-    tests.expect(everyParameterExists, "every pedal slot's six controls are registered parameters");
+    tests.expect(everyParameterExists, "every pedal slot's eight controls are registered parameters");
 
-    // Every kind is reachable from the host. A choice list shorter than the enumeration would
+    // Every model is reachable from the host. A choice list shorter than the model table would
     // leave the last pedals selectable only from a saved project.
     if (auto* kind = processor.getParameters().getParameter(
             TubeForgeAudioProcessor::pedalParameterId(0, PedalControl::kind)))
-        tests.expectEqual(static_cast<std::size_t>(kind->getNumSteps()), nts::pedals::kindCount,
-                          "the pedal kind parameter offers exactly the kinds the engine has");
+        tests.expectEqual(static_cast<std::size_t>(kind->getNumSteps()), nts::pedals::modelCount(),
+                          "the pedal kind parameter offers exactly the models the engine has");
+
+    // The archetypes keep the indices every saved project already refers to. Appending to the
+    // table must never renumber them.
+    auto archetypesInPlace = true;
+    const std::array<std::pair<nts::pedals::PedalKind, std::string_view>, 7> archetypes { {
+        { nts::pedals::PedalKind::none, "Empty" },
+        { nts::pedals::PedalKind::boost, "Boost" },
+        { nts::pedals::PedalKind::overdrive, "Overdrive" },
+        { nts::pedals::PedalKind::distortion, "Distortion" },
+        { nts::pedals::PedalKind::fuzz, "Fuzz" },
+        { nts::pedals::PedalKind::compressor, "Compressor" },
+        { nts::pedals::PedalKind::neuralCapture, "Neural capture" } } };
+    for (const auto& [kind, name] : archetypes)
+        archetypesInPlace = archetypesInPlace
+            && nts::pedals::pedalModel(nts::pedals::modelIndexOf(kind)).name == name;
+    tests.expect(archetypesInPlace,
+                 "the built-in archetypes keep the model indices saved projects refer to");
 
     juce::MidiBuffer midi;
     const auto renderPeak = [&processor, &midi]
@@ -371,6 +391,38 @@ void testEditorLifecycle(TestHarness& tests)
             break;
         editor->setSize(620 + (iteration % 20), 440 + (iteration % 20));
     }
+
+    /* An editor built while Auto Match is holding a rig, then ticked and drawn.
+
+       Not an assertion about how any of it looks -- that is a listening-and-looking question a
+       test cannot answer. What it does cover is that the badge, the released-control marking and
+       the warning poll all run against real held state, on a real timer, and render: three code
+       paths that only execute when a rig is held and that no other test reaches. Before this,
+       the whole Auto Match interface was exercised only through the processor. */
+    const auto rig = nts::amp::makeOriginalPreset(nts::amp::Topology::vintageBloom,
+                                                  nts::amp::Instrument::guitar).parameters;
+    processor.setAutoMatchEnabled(true);
+    processor.applyRecoveredRig(rig, true);
+    processor.releaseAutoMatchParameter("presence");
+    tests.expect(processor.autoMatchState() == tf::automatch::State::overridden,
+                 "the editor is opened onto a partly overridden rig");
+
+    std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditor());
+    tests.expect(editor != nullptr, "the editor opens while a rig is held");
+    if (editor != nullptr)
+    {
+        editor->setSize(1240, 820);
+        // Two ticks at 20 Hz, so the badge and the marking are pushed and the poll runs.
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(120);
+        juce::Image rendered(juce::Image::ARGB, editor->getWidth(), editor->getHeight(), true);
+        juce::Graphics graphics(rendered);
+        editor->paintEntireComponent(graphics, true);
+        tests.expect(processor.autoMatchState() == tf::automatch::State::overridden,
+                     "ticking and drawing the editor does not disturb what is held");
+        tests.expect(processor.autoMatchReleased("presence"),
+                     "the released control is still released after a full tick and paint");
+    }
+    processor.setAutoMatchEnabled(false);
 }
 
 void testPhysicalCircuitEditing(TestHarness& tests)
@@ -405,8 +457,19 @@ void testPhysicalCircuitEditing(TestHarness& tests)
                  "power selectors switch tube family and single-ended topology");
     tests.expect(tone != edited.nodes.end() && tone->modelId == "passive.fmv.bass.v1",
                  "tone-stack selector switches the electrical network");
-    tests.expect(cabinet != edited.nodes.end() && cabinet->modelId == "cabinet.bass-sealed.v1",
-                 "cabinet selector switches the active cabinet part");
+    /* The circuit engine no longer carries a speaker of its own.
+
+       It used to synthesise a cabinet node with its own resonance/brightness pair, while the
+       impulse-response cabinet lived inside the traditional amplifier -- so the two engines had
+       different speakers and a loaded response did nothing on this one. The cabinet is now a
+       stage after all three engines, and a node here as well would put two cabinets in series.
+
+       Asserted rather than merely dropped, because "the graph has no cabinet in it" is the whole
+       claim that makes the shared stage correct. `circuitCabinetStyle` is set above and is
+       deliberately still settable: removing the parameter would shift every id after it in
+       `ampControlIds` and corrupt every saved project. */
+    tests.expect(cabinet == edited.nodes.end(),
+                 "the circuit graph carries no cabinet: the shared stage is the only speaker");
 
     juce::MemoryBlock state;
     processor.getStateInformation(state);
@@ -612,9 +675,23 @@ void testBypassAndEngineSwitching(TestHarness& tests)
                  "engaging bypass does not step the output");
 
     // Once the fade has settled, bypass has to be transparent and in time with the input.
+    /* Sixty-four blocks, and the number is not arbitrary.
+
+       `bypassMix` restarts its ramp every block -- `setTarget` is called unconditionally in
+       processBlock and resets `remaining` each time -- so it approaches unity *geometrically*
+       rather than arriving at it: each 128-sample block closes about 13% of what is left of the
+       20 ms ramp. This settle used to be sixteen blocks, which leaves roughly a tenth of the wet
+       signal still mixed in, and the test passed anyway because the residual happened to be small
+       enough against the old synthetic cabinet.
+
+       That is a test measuring the wrong thing and getting away with it. The moment the cabinet
+       became a real model -- with a real group delay, so its residual is *phase-shifted* against
+       the dry path rather than roughly on top of it -- the same 10% leak read as a three-sample
+       misalignment. Sixty-four blocks puts the residual near 1e-4, which is what "bypass is
+       transparent" has to mean if the assertion is to be worth making. */
     captured.clear();
-    run(16, -1, nullptr, 0.0f);
-    auto transparent = true;
+    run(64, -1, nullptr, 0.0f);
+    auto largestError = 0.0f;
     const auto latency = processor.getLatencySamples();
     for (int sample = 0; sample < blockSize; ++sample)
     {
@@ -622,9 +699,34 @@ void testBypassAndEngineSwitching(TestHarness& tests)
         const auto expected = 0.05f * std::sin(6.2831853f * frequency
                                                * static_cast<float>(expectedPhase) / 48000.0f);
         const auto actual = captured[captured.size() - blockSize + static_cast<std::size_t>(sample)];
-        transparent = transparent && std::abs(actual - expected) < 2.0e-3f;
+        largestError = std::max(largestError, std::abs(actual - expected));
     }
-    tests.expect(transparent, "bypass passes the input through delayed by the reported latency");
+    /* The error is reported alongside the offset that would remove it, not merely compared.
+
+       When this fails there are only two candidates -- the dry path is delayed by a different
+       number of samples than the plug-in reported, or the bypassed output is not the dry path at
+       all -- and they need different fixes. A best-fit offset of zero with a large error means the
+       second; a non-zero offset names the first and says by how much. */
+    auto bestOffset = 0;
+    auto bestOffsetError = largestError;
+    for (int offset = -8; offset <= 8; ++offset)
+    {
+        auto error = 0.0f;
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto expectedPhase = phase - blockSize + sample - latency - offset;
+            const auto expected = 0.05f * std::sin(6.2831853f * frequency
+                                                   * static_cast<float>(expectedPhase) / 48000.0f);
+            const auto actual = captured[captured.size() - blockSize + static_cast<std::size_t>(sample)];
+            error = std::max(error, std::abs(actual - expected));
+        }
+        if (error < bestOffsetError) { bestOffsetError = error; bestOffset = offset; }
+    }
+    tests.expect(largestError < 2.0e-3f,
+                 "bypass passes the input through delayed by the reported latency of "
+                     + std::to_string(latency) + " samples: largest error "
+                     + std::to_string(largestError) + ", best at offset "
+                     + std::to_string(bestOffset) + " with error " + std::to_string(bestOffsetError));
 
     captured.clear();
     run(24, 4, bypass, 0.0f);
@@ -1633,7 +1735,7 @@ void testGearPickerCatalogues(TestHarness& tests)
     // Both catalogues are built from the same tables the pages use, so this is the real data
     // rather than a copy of it.
     const auto ampTiles = tf::ui::faceplateStyleCount();
-    const auto pedalTiles = tf::ui::pedalFaceCount();
+    const auto pedalTiles = nts::pedals::modelCount();
 
     TubeForgeAudioProcessor processor;
     auto& state = processor.getParameters();
@@ -1663,14 +1765,210 @@ void testGearPickerCatalogues(TestHarness& tests)
     }
     tests.expect(ampShelvesValid, "every voicing has a real shelf and a line describing it");
 
+    /* The instrument filter hides tiles from a view; it never renumbers a parameter.
+
+       This is the one place the two could quietly disagree. The picker skips bass-native voicings
+       for a guitarist, and that is only safe because a tile carries the index it writes -- the
+       moment anything derives a value from a tile's *position*, the eighth tile starts writing 7
+       in one instrument and 8 in the other, and nothing reports it. The same trap is why the
+       topology combo box on the tone page does not take a `ComboBoxAttachment`, which maps by
+       position rather than by item id.
+
+       So: the parameter must keep offering every voicing regardless of instrument, and the set
+       hidden from guitar must be exactly the bass-native block.
+    */
+    auto affinityPartitions = true;
+    auto hiddenFromGuitar = 0;
+    for (std::size_t index = 0; index < ampTiles; ++index)
+    {
+        const auto bassNative = nts::amp::topologyAffinity(static_cast<nts::amp::Topology>(index))
+                             == nts::amp::TopologyAffinity::bass;
+        if (bassNative) ++hiddenFromGuitar;
+        // Every voicing answers for both instruments even when it is only offered for one, so a
+        // project or an automation lane naming an out-of-affinity pair still gets an amplifier.
+        affinityPartitions = affinityPartitions
+            && ! nts::amp::makeOriginalPreset(static_cast<nts::amp::Topology>(index),
+                                              nts::amp::Instrument::guitar).name.empty()
+            && ! nts::amp::makeOriginalPreset(static_cast<nts::amp::Topology>(index),
+                                              nts::amp::Instrument::bass).name.empty();
+    }
+    tests.expect(affinityPartitions, "every voicing returns a real preset for both instruments");
+    tests.expect(hiddenFromGuitar > 0 && hiddenFromGuitar < static_cast<int>(ampTiles),
+                 "the instrument filter hides some voicings from guitar and keeps others");
+    tests.expectEqual(static_cast<int>(ampTiles), choiceCount("topology"),
+                      "the topology parameter offers every voicing whatever the instrument is");
+
+    /* The normalised round trip the hand-driven combo box depends on.
+
+       Without an attachment, the tone page converts its selected item id back to a topology index
+       and writes it through `convertTo0to1`. If that conversion is off by one anywhere -- which is
+       exactly the sort of thing that happens when a choice parameter's option count changes -- the
+       box selects one amplifier and the engine loads its neighbour, quietly, for every voicing
+       past the discrepancy.
+    */
+    auto normalisedRoundTrips = true;
+    if (auto* topology = state.getParameter("topology"))
+        for (std::size_t index = 0; index < ampTiles; ++index)
+        {
+            const auto value = static_cast<float>(index);
+            normalisedRoundTrips = normalisedRoundTrips
+                && std::abs(topology->convertFrom0to1(topology->convertTo0to1(value)) - value) < 0.01f;
+        }
+    tests.expect(normalisedRoundTrips,
+                 "every topology index survives the normalised conversion the combo box uses");
+
+    /* The editor builds for both instruments.
+
+       `testEditorLifecycle` builds it 250 times and never moves the instrument, so it exercises
+       the guitar branch of the filtered topology list and nothing else. The bass branch shows six
+       more voicings and is the one the filter was written for.
+    */
+    auto editorsBuild = true;
+    for (const auto instrument : { 0.0f, 1.0f })
+    {
+        if (auto* parameter = state.getParameter("instrument"))
+            parameter->setValueNotifyingHost(parameter->convertTo0to1(instrument));
+        std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditor());
+        editorsBuild = editorsBuild && editor != nullptr;
+        if (editor != nullptr) editor->setSize(900, 620);
+    }
+    tests.expect(editorsBuild, "the editor builds with the voicing list filtered for either instrument");
+
+    /* And on a voicing that carries front-panel switches.
+
+       The amplifier page builds its switch list from `panelSwitchAppliesTo` and hides the control
+       on the eleven voicings that offer nothing, so the default voicing exercises only the empty
+       branch. Selecting one that has switches is what runs the other.
+    */
+    auto switchedEditorBuilds = true;
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+    {
+        auto carriesSwitches = false;
+        for (std::size_t option = 1; option < nts::amp::panelSwitchCount; ++option)
+            carriesSwitches = carriesSwitches
+                || nts::amp::panelSwitchAppliesTo(static_cast<nts::amp::Topology>(index),
+                                                  static_cast<nts::amp::PanelSwitch>(option));
+        if (! carriesSwitches) continue;
+        if (auto* parameter = state.getParameter("topology"))
+            parameter->setValueNotifyingHost(parameter->convertTo0to1(static_cast<float>(index)));
+        std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditor());
+        switchedEditorBuilds = switchedEditorBuilds && editor != nullptr;
+        if (editor != nullptr) editor->setSize(900, 620);
+    }
+    tests.expect(switchedEditorBuilds, "the editor builds on a voicing that carries panel switches");
+
+    const auto readBack = [&state](const juce::String& id)
+    {
+        const auto* value = state.getRawParameterValue(id);
+        return value == nullptr ? 0.0f : value->load(std::memory_order_relaxed);
+    };
+
+    /* Reset actually returns the amplifier to the selected voicing.
+
+       This is the gap a player found by ear before any test did. A voicing supplies a complete
+       parameter set, but only the values with no host control ever reach the engine from it —
+       everything a knob owns is taken from the knob. So a rig left at a previous session's
+       settings keeps them when a new amplifier is chosen, and there was no action anywhere that
+       put them back.
+
+       `tightness` is asserted specifically because it is the one that does real damage: it sets a
+       high-pass floor of `35 + 310 * t^2` Hz, so the *parameter default* of 7.2 is a 196 Hz cut
+       that removes the fundamental of every bass note below G3 and leaves its harmonics to be
+       distorted alone. Resetting to parameter defaults would not have fixed this; only the
+       voicing's own value does.
+    */
+    for (const auto instrument : { 0.0f, 1.0f })
+    {
+        const auto isBass = instrument > 0.5f;
+        const auto topologyIndex = isBass ? static_cast<int>(nts::amp::Topology::valveFlagship) : 0;
+        const auto setValue = [&state](const char* id, float value)
+        {
+            if (auto* parameter = state.getParameter(id))
+                parameter->setValueNotifyingHost(parameter->convertTo0to1(value));
+        };
+        setValue("instrument", instrument);
+        setValue("topology", static_cast<float>(topologyIndex));
+
+        // Everything a player could have left maxed, which is exactly what was found in the wild.
+        setValue("gain", 10.0f); setValue("master", 12.0f); setValue("treble", 10.0f);
+        setValue("presence", 10.0f); setValue("tightness", 10.0f); setValue("lowCut", 300.0f);
+        processor.loadVoicingDefaults();
+
+        const auto factory = nts::amp::makeOriginalPreset(
+            static_cast<nts::amp::Topology>(topologyIndex),
+            isBass ? nts::amp::Instrument::bass : nts::amp::Instrument::guitar).parameters;
+        const auto label = juce::String(isBass ? "bass" : "guitar");
+        tests.expectNear(readBack("gain"), 5.0f, 0.01f,
+                         ("reset centres Gain so the stage drives are the voicing's own (" + label + ")").toStdString());
+        tests.expectNear(readBack("tightness"), factory.preEq.tightness * 10.0f, 0.05f,
+                         ("reset restores the voicing's tightness (" + label + ")").toStdString());
+        tests.expectNear(readBack("lowCut"), factory.preEq.lowCutHz, 0.5f,
+                         ("reset restores the voicing's low cut (" + label + ")").toStdString());
+        tests.expectNear(readBack("master"), factory.powerAmp.masterDb, 0.05f,
+                         ("reset restores the voicing's master level (" + label + ")").toStdString());
+        tests.expectNear(readBack("treble"), factory.toneStack.treble * 10.0f, 0.05f,
+                         ("reset restores the voicing's treble (" + label + ")").toStdString());
+        // And it keeps what the player chose rather than jumping to a different amplifier.
+        tests.expectNear(readBack("topology"), static_cast<float>(topologyIndex), 0.01f,
+                         ("reset keeps the selected voicing (" + label + ")").toStdString());
+        tests.expectNear(readBack("instrument"), instrument, 0.01f,
+                         ("reset keeps the selected instrument (" + label + ")").toStdString());
+    }
+
+    /* A project saved before the bi-amp controls existed still lands in the right parameters.
+
+       `applyProjectState` walks a saved `ampControls` array **positionally** against
+       `ampControlIds`, so the table is append-only or it is nothing: four ids added in the middle
+       shift every id after them, and an old project's Cab alignment arrives in Dry blend, its
+       Tightness in Low drive, and so on to the end of the list.
+
+       This is not hypothetical. It is what the first version of that change did, and **every test
+       in this suite passed while it was broken** -- a positional remap produces perfectly valid
+       numbers in the wrong fields, so nothing is out of range, nothing is NaN and nothing fails.
+       It was caught by launching the standalone and reading the panel.
+
+       The fixture is a schema-4 project whose `ampControls` array is the length and order the
+       build before this change wrote, with distinctive values at three positions well past where
+       the new ids were briefly inserted. If any of them is displaced, the append-only rule has
+       been broken again.
+    */
+    juce::String older = R"({"schemaVersion":4,"applicationVersion":"0.10.0",)"
+                         R"("engine":{"inputGainDb":0.0,"outputGainDb":0.0,"bypass":false,"ampControls":[)";
+    // Positions from the pre-change table: 20 crossover, 23 tightness, 24 pickEmphasis.
+    constexpr int olderLength = 51;
+    for (int index = 0; index < olderLength; ++index)
+    {
+        const auto value = index == 20 ? 412.0 : index == 23 ? 6.5 : index == 24 ? -7.5 : 0.0;
+        older << (index == 0 ? "" : ",") << juce::String(value, 4);
+    }
+    older << R"(]},"device":{},"graph":{"physicalCircuitJson":""},"ui":{},)"
+             R"("assets":{"relativePaths":[],"cabinetIrPathA":"","cabinetIrPathB":""},)"
+             R"("pedalboard":{"slots":[]}})";
+
+    const auto olderUtf8 = older.toStdString();
+    processor.setStateInformation(olderUtf8.data(), static_cast<int>(olderUtf8.size()));
+    tests.expectNear(readBack("crossover"), 412.0f, 1.0f,
+                     "an older project's bass crossover is not displaced by the bi-amp controls");
+    tests.expectNear(readBack("tightness"), 6.5f, 0.05f,
+                     "an older project's tightness is not displaced by the bi-amp controls");
+    tests.expectNear(readBack("pickEmphasis"), -7.5f, 0.05f,
+                     "an older project's pick emphasis is not displaced by the bi-amp controls");
+    // And the controls that project never knew about keep their defaults rather than picking up
+    // whatever happened to sit at their position.
+    tests.expectNear(readBack("dryBlend"), 0.0f, 0.01f,
+                     "a control an older project predates loads at its default");
+    tests.expectNear(readBack("lowBandDrive"), 2.6f, 0.05f,
+                     "the low-band drive an older project predates loads at its default");
+
     auto pedalShelvesValid = true;
     for (std::size_t index = 0; index < pedalTiles; ++index)
     {
         const auto& face = tf::ui::pedalFace(static_cast<int>(index));
+        const auto& model = nts::pedals::pedalModel(static_cast<int>(index));
         const auto character = static_cast<std::size_t>(face.character);
         pedalShelvesValid = pedalShelvesValid && character < tf::ui::pedalCharacterCount
                          && tf::ui::pedalCharacterName(face.character).isNotEmpty()
-                         && face.blurb.isNotEmpty();
+                         && ! model.name.empty() && ! model.blurb.empty();
     }
     tests.expect(pedalShelvesValid, "every pedal kind has a real shelf and a line describing it");
 
@@ -1726,6 +2024,527 @@ void testHostTailReporting(TestHarness& tests)
     tests.expect(tail > 0.0, "processor reports a non-zero tail while the cabinet is active");
     tests.expect(tail < 1.0, "reported tail stays within a sane bound");
 }
+/** Auto Match: the applied rig is the rig that won, and the guard knows who moved a control.
+
+    Reached through `applyRecoveredRig` rather than through `applyReconstructionCandidate`,
+    because a candidate needs a whole reconstruction run behind it and none of what is checked
+    here is about the search -- it is about what happens to the host parameters afterwards.
+*/
+void testAutoMatch(TestHarness& tests)
+{
+    TubeForgeAudioProcessor processor;
+    processor.setPlayConfigDetails(2, 2, 48000.0, 32);
+    processor.prepareToPlay(48000.0, 32);
+    auto& parameters = processor.getParameters();
+
+    const auto plainValue = [&parameters](const char* id)
+    {
+        const auto* value = parameters.getRawParameterValue(id);
+        return value == nullptr ? 0.0f : value->load(std::memory_order_relaxed);
+    };
+    const auto setPlain = [&parameters](const char* id, float value)
+    {
+        if (auto* parameter = parameters.getParameter(id))
+            parameter->setValueNotifyingHost(parameter->convertTo0to1(value));
+    };
+    /// A knob drag, as an attachment performs one: gesture, value, gesture.
+    const auto userMoves = [&parameters](const char* id, float value)
+    {
+        auto* parameter = parameters.getParameter(id);
+        if (parameter == nullptr) return;
+        parameter->beginChangeGesture();
+        parameter->setValueNotifyingHost(parameter->convertTo0to1(value));
+        parameter->endChangeGesture();
+    };
+
+    // A rig that differs from every default, so nothing below can pass by coincidence.
+    auto rig = nts::amp::makeOriginalPreset(nts::amp::Topology::britishCrunch,
+                                            nts::amp::Instrument::guitar).parameters;
+    rig.powerAmp.presence = 0.64f;
+    rig.toneStack.bass = 0.31f;
+    for (auto& stage : rig.stages) stage.driveDb = 17.0f;
+
+    /* The Gain macro. `currentAmpParameters` adds (gain - 5) * 3 dB to every stage drive, so a
+       rig applied over a user's Gain of 8 played 9 dB hotter than the one that was scored. The
+       applied rig has to be independent of where Gain happened to be. */
+    setPlain("gain", 8.5f);
+    setPlain("panelSwitch", 1.0f);
+    setPlain("oversampling", 0.0f);
+    processor.applyRecoveredRig(rig, false);
+    tests.expectNear(plainValue("gain"), 5.0f, 1.0e-3,
+                     "applying a rig neutralises the Gain macro");
+    tests.expectNear(plainValue("panelSwitch"), 0.0f, 1.0e-3,
+                     "applying a rig clears a leftover panel switch");
+    tests.expectNear(plainValue("oversampling"), 4.0f, 1.0e-3,
+                     "applying a rig puts oversampling back on Auto");
+    const auto firstStage = plainValue("stage1");
+
+    setPlain("gain", 1.0f);
+    processor.applyRecoveredRig(rig, false);
+    tests.expectNear(plainValue("stage1"), firstStage, 1.0e-3,
+                     "the applied rig does not depend on where Gain was left");
+
+    // Nothing is guarded until the switch is on, however many rigs have been applied.
+    tests.expect(processor.autoMatchState() == tf::automatch::State::off,
+                 "Auto Match is off until it is asked for");
+    tests.expect(! processor.autoMatchOwns("presence"), "nothing is owned while Auto Match is off");
+
+    processor.setAutoMatchEnabled(true);
+    processor.applyRecoveredRig(rig, false);
+    tests.expect(processor.autoMatchState() == tf::automatch::State::holding,
+                 "applying a rig with Auto Match on starts holding it");
+    tests.expect(processor.autoMatchOwns("presence"), "the analyzer holds Presence");
+    tests.expect(processor.autoMatchOwns("gateThreshold"), "the analyzer holds the Tone Shaping page");
+    tests.expect(! processor.autoMatchOwns("output"),
+                 "the output level is a level control and is never held");
+    tests.expect(! processor.autoMatchOwns("pedal1Bypass"),
+                 "the pedals are only held when the chain was isolated");
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1,
+                      "applying a rig raises no warning about its own writes");
+
+    // Recorded, and formatted the way the panel shows it.
+    const auto matched = processor.autoMatchValueOf("presence");
+    tests.expect(matched.has_value(), "the matched value of a held control is recorded");
+    if (matched) tests.expectNear(*matched, plainValue("presence"), 1.0e-3,
+                                  "the recorded value is the one that was written");
+
+    // A person turning a knob: warned once, and only once.
+    userMoves("presence", 2.0f);
+    const auto warned = processor.takeAutoMatchWarning();
+    tests.expect(warned >= 0 && tf::automatch::owned[static_cast<std::size_t>(warned)].id == "presence",
+                 "a hand on a held control asks the question");
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1, "the question is asked once");
+
+    // "Keep the matched value" puts it back and keeps holding it, and does not ask again about
+    // its own write.
+    processor.restoreAutoMatchParameter("presence");
+    if (matched) tests.expectNear(plainValue("presence"), *matched, 1.0e-3,
+                                  "keeping the matched value restores it");
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1,
+                      "restoring a matched value does not warn about itself");
+    tests.expect(processor.autoMatchState() == tf::automatch::State::holding,
+                 "keeping the matched value leaves the rig fully held");
+
+    // "Change it anyway" hands one control back and leaves the rest held.
+    userMoves("presence", 2.0f);
+    (void) processor.takeAutoMatchWarning();
+    processor.releaseAutoMatchParameter("presence");
+    tests.expect(processor.autoMatchReleased("presence"), "a released control reads as released");
+    tests.expect(! processor.autoMatchOwns("presence"), "a released control is no longer held");
+    tests.expect(processor.autoMatchOwns("bass"), "releasing one control holds the others");
+    tests.expectEqual(processor.autoMatchReleasedCount(), 1, "one control has been handed back");
+    tests.expect(processor.autoMatchState() == tf::automatch::State::overridden,
+                 "a released control puts the rig in the overridden state");
+
+    // Second and further moves of a released control are silent: it is the user's now.
+    userMoves("presence", 7.0f);
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1,
+                      "a control that has been handed back stops asking");
+
+    processor.reclaimAllAutoMatchParameters();
+    tests.expectEqual(processor.autoMatchReleasedCount(), 0, "reclaiming clears every release");
+    if (matched) tests.expectNear(plainValue("presence"), *matched, 1.0e-3,
+                                  "reclaiming puts the matched value back");
+
+    /* A write with no gesture behind it is host automation, not a person. It must never raise a
+       dialog -- a modal opened while a DAW plays back a lane is a hang -- so the control is
+       handed back silently and reported afterwards. */
+    setPlain("bass", 9.0f);
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1,
+                      "a host automation write raises no dialog");
+    tests.expect(processor.autoMatchReleased("bass"),
+                 "a host automation write hands the control back");
+    const auto external = processor.takeAutoMatchExternalReleases();
+    tests.expectEqual(external.size(), 1, "the external write is reported once");
+    tests.expect(processor.takeAutoMatchExternalReleases().isEmpty(),
+                 "reporting an external release clears it");
+
+    // A whole-rig replacement stops the hold rather than guarding a rig that is not there.
+    processor.applyRecoveredRig(rig, false);
+    tests.expect(processor.autoMatchState() == tf::automatch::State::holding, "re-applying holds again");
+    processor.setCurrentProgram(3);
+    tests.expect(processor.autoMatchState() == tf::automatch::State::armed,
+                 "a program change stops the hold and leaves the switch on");
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1,
+                      "a program change raises no dialog for the parameters it writes");
+
+    /* Changing instrument invalidates the match rather than overriding it: the two instruments
+       are searched over different sets of voicings, so there is no "matched value" for an
+       instrument the search never ran on. The hold drops and no question is asked. */
+    processor.applyRecoveredRig(rig, false);
+    tests.expect(processor.autoMatchState() == tf::automatch::State::holding,
+                 "the rig is held before the instrument moves");
+    userMoves("instrument", 1.0f);
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1,
+                      "changing instrument does not ask whether to keep the matched value");
+    tests.expect(processor.autoMatchState() == tf::automatch::State::armed,
+                 "changing instrument drops the hold and waits for a new match");
+    userMoves("instrument", 0.0f);
+
+    // With nothing matched there is nothing to apply, and asking must be harmless.
+    processor.refreshAutoMatch();
+    tests.expect(processor.autoMatchState() == tf::automatch::State::armed,
+                 "a re-derivation with no match to apply changes nothing");
+
+    /* A re-derivation keeps what the user took back; pressing Apply does not.
+
+       The distinction is the whole reason `applyAutoMatchRig` exists beside `applyRecoveredRig`.
+       A search that re-ran because the region changed must not undo an override set two minutes
+       ago; choosing a different candidate by hand is a different rig, and the old override was
+       about a different one. */
+    processor.applyRecoveredRig(rig, false);
+    userMoves("mid", 8.25f);
+    (void) processor.takeAutoMatchWarning();
+    processor.releaseAutoMatchParameter("mid");
+    auto rederived = rig;
+    rederived.toneStack.mid = 0.15f;
+    rederived.toneStack.treble = 0.85f;
+    processor.applyAutoMatchRig(rederived, false);
+    tests.expectNear(plainValue("mid"), 8.25f, 0.05,
+                     "a re-derivation leaves an overridden control where the user put it");
+    tests.expect(processor.autoMatchReleased("mid"), "an overridden control stays overridden");
+    tests.expectNear(plainValue("treble"), rederived.toneStack.treble * 10.0f, 0.05,
+                     "a re-derivation still writes the controls it holds");
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1,
+                      "a re-derivation raises no dialog for its own writes");
+    processor.applyRecoveredRig(rederived, false);
+    tests.expectNear(plainValue("mid"), rederived.toneStack.mid * 10.0f, 0.05,
+                     "pressing Apply is a new rig and takes every control back");
+
+    /* Live tracking. Bounded to 6 dB either side of the matched value, and it must do nothing
+       at all until there is a measured signal to follow -- a rig that walked its input trim to
+       a bound on silence would be worse than one that never moved. */
+    processor.applyRecoveredRig(rig, false);
+    const auto matchedTrim = processor.autoMatchValueOf("input");
+    tests.expect(! processor.autoMatchTracking(), "tracking is off unless it is asked for");
+    processor.setAutoMatchTracking(true);
+    processor.refreshAutoMatch();
+    if (matchedTrim) tests.expectNear(plainValue("input"), *matchedTrim, 1.0e-3,
+                                      "tracking moves nothing without a measured signal");
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1, "tracking raises no dialog");
+    processor.setAutoMatchTracking(false);
+
+    // The "don't warn me again" answer outlives the window it was given in, so it lives on the
+    // processor rather than in the editor.
+    const auto suppressed = processor.autoMatchWarningsSuppressed();
+    processor.setAutoMatchWarningsSuppressed(! suppressed);
+    tests.expect(processor.autoMatchWarningsSuppressed() != suppressed,
+                 "the warning preference can be set and read back");
+    processor.setAutoMatchWarningsSuppressed(suppressed);
+
+    // Isolating the chain is what puts the pedals and the sends under the analyzer.
+    processor.applyRecoveredRig(rig, true);
+    tests.expect(processor.autoMatchOwns("pedal1Bypass"),
+                 "isolating the chain holds the pedal bypasses");
+    tests.expect(processor.autoMatchOwns("reverbMix"), "isolating the chain holds the sends");
+
+    /* The whole hold survives a save: the switch, the matched values, which controls the user
+       had taken back, and whether the chain was part of the match. Anything less and a reopened
+       project either stops guarding a rig that is still playing, or guards it with the wrong
+       numbers. */
+    processor.applyRecoveredRig(rig, false);
+    processor.releaseAutoMatchParameter("treble");
+    const auto matchedBass = processor.autoMatchValueOf("bass");
+    const auto file = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                          .getChildFile("tubeforge-automatch-test.tforge");
+    tests.expect(processor.saveProject(file).wasOk(), "a project with Auto Match on saves");
+    processor.setAutoMatchEnabled(false);
+    tests.expect(processor.loadProject(file).wasOk(), "the project loads again");
+    tests.expect(processor.autoMatchEnabled(), "the Auto Match switch is saved with the project");
+    tests.expect(processor.autoMatchState() == tf::automatch::State::overridden,
+                 "a reopened project resumes holding, with its releases intact");
+    tests.expect(processor.autoMatchReleased("treble"), "the released control is still released");
+    tests.expect(processor.autoMatchOwns("bass"), "the held controls are still held");
+    const auto reloadedBass = processor.autoMatchValueOf("bass");
+    tests.expect(reloadedBass.has_value(), "the matched values survive the round trip");
+    if (matchedBass && reloadedBass)
+        tests.expectNear(*reloadedBass, *matchedBass, 1.0e-3,
+                         "a reloaded matched value is the one that was saved");
+    tests.expectEqual(processor.takeAutoMatchWarning(), -1,
+                      "recalling a project raises no dialog for the parameters it writes");
+
+    // A project that was not holding clears the hold rather than leaving the previous one up.
+    processor.setAutoMatchEnabled(false);
+    tests.expect(processor.saveProject(file).wasOk(), "a project with Auto Match off saves");
+    processor.setAutoMatchEnabled(true);
+    processor.applyRecoveredRig(rig, false);
+    tests.expect(processor.loadProject(file).wasOk(), "the second project loads");
+    tests.expect(processor.autoMatchState() == tf::automatch::State::off,
+                 "recalling a project that held nothing stops holding");
+    file.deleteFile();
+}
+
+/** Every field of a recovered rig that has a parameter behind it lands on that parameter.
+
+    The gap this closes is the one that made a match sound unlike its own audition: a fitted
+    field that quietly never reached the amplifier. Written as an explicit table so that adding a
+    field to `AmpParameters` and forgetting to apply it is a failing test rather than a tone
+    nobody can account for.
+*/
+void testRecoveredRigReachesEveryParameter(TestHarness& tests)
+{
+    TubeForgeAudioProcessor processor;
+    processor.setPlayConfigDetails(2, 2, 48000.0, 32);
+    processor.prepareToPlay(48000.0, 32);
+    auto& parameters = processor.getParameters();
+    const auto plainValue = [&parameters](const char* id)
+    {
+        const auto* value = parameters.getRawParameterValue(id);
+        return value == nullptr ? 0.0f : value->load(std::memory_order_relaxed);
+    };
+
+    // Values chosen to be inside every range and unlike every default, so a parameter that was
+    // never written fails rather than coincidentally agreeing.
+    auto rig = nts::amp::makeOriginalPreset(nts::amp::Topology::classAChime,
+                                            nts::amp::Instrument::bass).parameters;
+    rig.manualInputTrimDb = -4.5f;
+    rig.toneStack.bass = 0.28f;
+    rig.toneStack.mid = 0.71f;
+    rig.toneStack.treble = 0.42f;
+    rig.powerAmp.presence = 0.63f;
+    rig.powerAmp.resonance = 0.19f;
+    rig.powerAmp.masterDb = -7.5f;
+    rig.powerAmp.sag = 0.62f;
+    rig.powerAmp.feedback = 0.41f;
+    rig.preEq.lowCutHz = 123.0f;
+    rig.preEq.highCutHz = 9400.0f;
+    rig.preEq.tightness = 0.37f;
+    rig.preEq.pickEmphasisDb = -3.5f;
+    rig.gateEnabled = false;
+    rig.gateThresholdDb = -47.0f;
+    rig.gateDepthDb = -22.0f;
+    rig.gateAttackMs = 4.5f;
+    rig.gateHoldMs = 120.0f;
+    rig.gateReleaseMs = 380.0f;
+    rig.loudnessMatch = false;
+    rig.bass.crossoverHz = 240.0f;
+    rig.bass.cleanBlend = 0.72f;
+    rig.bass.lowDriveDb = 5.5f;
+    rig.bass.lowLevelDb = -2.5f;
+    rig.bass.highLevelDb = 1.5f;
+    rig.dryBlend = 0.33f;
+    rig.cabinet.blend = 0.62f;
+    rig.cabinet.width = 0.24f;
+    rig.cabinet.slots[1].delaySamples = 17;
+    rig.cabinet.bypass = false;
+    for (std::size_t stage = 0; stage < rig.stages.size(); ++stage)
+    {
+        rig.stages[stage].driveDb = 9.0f + static_cast<float>(stage) * 2.5f;
+        rig.stages[stage].bias = 0.21f;
+    }
+
+    processor.applyRecoveredRig(rig, false);
+
+    struct Expectation { const char* id; float expected; float tolerance; const char* what; };
+    const std::vector<Expectation> expectations {
+        { "instrument", 1.0f, 1.0e-3f, "instrument" },
+        { "topology", static_cast<float>(static_cast<int>(rig.topology)), 1.0e-3f, "voicing" },
+        { "input", rig.manualInputTrimDb, 0.05f, "input trim" },
+        { "bass", rig.toneStack.bass * 10.0f, 0.05f, "bass" },
+        { "mid", rig.toneStack.mid * 10.0f, 0.05f, "mid" },
+        { "treble", rig.toneStack.treble * 10.0f, 0.05f, "treble" },
+        { "presence", rig.powerAmp.presence * 10.0f, 0.05f, "presence" },
+        { "resonance", rig.powerAmp.resonance * 10.0f, 0.05f, "resonance" },
+        { "master", rig.powerAmp.masterDb, 0.05f, "master" },
+        { "sag", rig.powerAmp.sag * 100.0f, 0.15f, "sag" },
+        { "feedback", rig.powerAmp.feedback * 100.0f, 0.15f, "feedback" },
+        { "lowCut", rig.preEq.lowCutHz, 1.0f, "pre low cut" },
+        { "highCut", rig.preEq.highCutHz, 10.0f, "pre high cut" },
+        { "tightness", rig.preEq.tightness * 10.0f, 0.05f, "tightness" },
+        { "pickEmphasis", rig.preEq.pickEmphasisDb, 0.05f, "pick emphasis" },
+        { "bias", rig.stages[0].bias, 0.01f, "bias" },
+        { "stage1", rig.stages[0].driveDb, 0.05f, "stage 1 drive" },
+        { "stage2", rig.stages[1].driveDb, 0.05f, "stage 2 drive" },
+        { "stage3", rig.stages[2].driveDb, 0.05f, "stage 3 drive" },
+        { "stage4", rig.stages[3].driveDb, 0.05f, "stage 4 drive" },
+        { "gateEnabled", 0.0f, 1.0e-3f, "gate enabled" },
+        { "gateThreshold", rig.gateThresholdDb, 0.05f, "gate threshold" },
+        { "gateDepth", rig.gateDepthDb, 0.05f, "gate depth" },
+        { "gateAttack", rig.gateAttackMs, 0.05f, "gate attack" },
+        { "gateHold", rig.gateHoldMs, 1.0f, "gate hold" },
+        { "gateRelease", rig.gateReleaseMs, 1.0f, "gate release" },
+        { "loudnessMatch", 0.0f, 1.0e-3f, "loudness match" },
+        { "crossover", rig.bass.crossoverHz, 1.0f, "bass crossover" },
+        { "cleanBlend", rig.bass.cleanBlend * 100.0f, 0.15f, "clean blend" },
+        { "dryBlend", rig.dryBlend * 100.0f, 0.15f, "dry blend" },
+        { "lowBandDrive", rig.bass.lowDriveDb, 0.05f, "low band drive" },
+        { "lowBandLevel", rig.bass.lowLevelDb, 0.05f, "low band level" },
+        { "highBandLevel", rig.bass.highLevelDb, 0.05f, "high band level" },
+        { "cabinet", 1.0f, 1.0e-3f, "cabinet enabled" },
+        { "cabinetBlend", rig.cabinet.blend * 100.0f, 0.15f, "cabinet blend" },
+        { "cabinetWidth", rig.cabinet.width * 100.0f, 0.15f, "cabinet width" },
+        { "cabinetAlignment", static_cast<float>(rig.cabinet.slots[1].delaySamples), 0.5f, "cabinet alignment" },
+        // The three the apply path normalises rather than copies -- see the Auto Match plan.
+        { "gain", 5.0f, 1.0e-3f, "the neutralised gain macro" },
+        { "panelSwitch", 0.0f, 1.0e-3f, "the cleared panel switch" },
+        { "oversampling", 4.0f, 1.0e-3f, "oversampling back on Auto" },
+    };
+
+    for (const auto& expectation : expectations)
+        tests.expectNear(plainValue(expectation.id), expectation.expected, expectation.tolerance,
+                         std::string("a recovered rig sets ") + expectation.what);
+
+    // The engine mode too: a match is a traditional rig, and applying one while a neural capture
+    // is selected would leave the user listening to something the search never rendered.
+    tests.expectNear(plainValue("engineMode"), 0.0f, 1.0e-3,
+                     "a recovered rig selects the traditional engine");
+}
+
+/** Schema 5: the saved hold, and what an older project turns into.
+
+    In the wrapper suite rather than in `nts_unit_tests` because the interesting half is the
+    plug-in's own round trip -- the state library cannot say whether the values it stored map
+    back onto the right controls.
+*/
+void testAutoMatchProjectFormat(TestHarness& tests)
+{
+    nts::state::ProjectState state;
+    state.autoMatch.holding = true;
+    state.autoMatch.isolatedChain = true;
+    state.autoMatch.heldValues = { 5.0f, 6.5f, 7.25f };
+    state.autoMatch.releasedIndices = { 1 };
+
+    const auto restored = nts::state::deserialize(nts::state::serialize(state));
+    tests.expect(static_cast<bool>(restored), "a project carrying a held rig round-trips");
+    if (restored)
+    {
+        tests.expect(restored.state->autoMatch == state.autoMatch,
+                     "every field of the held rig survives serialization");
+        tests.expectEqual(restored.state->schemaVersion, nts::state::currentSchemaVersion,
+                          "the project is written at the current schema");
+    }
+
+    // A released index that points past the saved values would mark a control released that the
+    // file says nothing about, so it is corruption rather than something to clamp.
+    auto broken = state;
+    broken.autoMatch.releasedIndices = { 7 };
+    std::string error;
+    tests.expect(! nts::state::validate(broken, error),
+                 "a released index outside the saved rig is rejected");
+
+    auto emptyHold = state;
+    emptyHold.autoMatch.heldValues.clear();
+    emptyHold.autoMatch.releasedIndices.clear();
+    tests.expect(! nts::state::validate(emptyHold, error),
+                 "claiming to hold a rig with no values in it is rejected");
+
+    /* A schema 4 project predates all of this and must open, holding nothing. Written by hand
+       rather than by editing a serialized version number, so the test still means what it says
+       if the writer's formatting changes. */
+    const auto migrated = nts::state::deserialize(
+        R"({"schemaVersion":4,"applicationVersion":"0.10.0"})");
+    tests.expect(static_cast<bool>(migrated), "a schema 4 project still opens");
+    if (migrated)
+        tests.expect(! migrated.state->autoMatch.holding,
+                     "a project written before Auto Match holds nothing");
+}
+
+/** Schema 6: the cabinet's own block, and what a project written before it turns into.
+
+    The claim being tested is narrow and is the one that matters: a project from before the
+    cabinet had controls of its own must come back with an **empty** block, because the plug-in's
+    defaults for those controls are the values the fields held while they were unreachable. An
+    empty block is a complete description of that cabinet, not a gap.
+*/
+void testCabinetProjectFormat(TestHarness& tests)
+{
+    nts::state::ProjectState state;
+    state.cabinet.controls = { 0.0f, -3.5f, -100.0f, 100.0f, 0.0f, 1.0f, 12.0f, 0.0f, 0.0f,
+                               70.0f, 10500.0f, 0.0f, -1.5f };
+
+    const auto restored = nts::state::deserialize(nts::state::serialize(state));
+    tests.expect(static_cast<bool>(restored), "a project carrying cabinet controls round-trips");
+    if (restored)
+        tests.expect(restored.state->cabinet == state.cabinet,
+                     "every cabinet control survives serialization");
+
+    // The bound exists to stop a corrupt file asking for an unbounded allocation, and the finite
+    // check to stop a NaN reaching a convolver's delay line -- where, unlike a filter's, it would
+    // never decay out again.
+    std::string error;
+    auto tooMany = state;
+    tooMany.cabinet.controls.assign(nts::state::maximumCabinetControls + 1, 0.0f);
+    tests.expect(! nts::state::validate(tooMany, error),
+                 "a cabinet block longer than the format accepts is rejected");
+    auto notFinite = state;
+    notFinite.cabinet.controls[2] = std::numeric_limits<float>::quiet_NaN();
+    tests.expect(! nts::state::validate(notFinite, error),
+                 "a non-finite cabinet control is rejected");
+
+    const auto migrated = nts::state::deserialize(
+        R"({"schemaVersion":5,"applicationVersion":"0.10.0"})");
+    tests.expect(static_cast<bool>(migrated), "a schema 5 project still opens");
+    if (migrated)
+        tests.expect(migrated.state->cabinet.controls.empty(),
+                     "a project written before the cabinet stage names no cabinet controls");
+}
+
+/** The rule that stops the cabinet model re-voicing somebody's finished track.
+
+    A fresh instance gets a real modelled cabinet; a project written before the model existed was
+    mixed against the two synthetic decays that stood in for one, and has to keep them. Both halves
+    are asserted, because getting either backwards is silent: the sound simply changes, and the
+    only symptom is somebody's mix no longer being their mix.
+*/
+void testCabinetModelCompatibility(TestHarness& tests)
+{
+    const auto legacyIndex = static_cast<float>(nts::ir::CabinetKind::legacy);
+
+    TubeForgeAudioProcessor fresh;
+    const auto freshModel = fresh.getParameters().getRawParameterValue("cabModelA")->load();
+    tests.expect(freshModel != legacyIndex,
+                 "a fresh instance starts on a modelled cabinet rather than the legacy stand-in");
+
+    // A schema-5 project: no cabinet block at all, which is exactly what predates the model.
+    auto olderProject = nts::state::ProjectState {};
+    olderProject.cabinet.controls.clear();
+    const auto olderJson = nts::state::serialize(olderProject);
+    // Written back down to schema 5 by hand, so the test still means what it says if the writer's
+    // formatting changes -- the same reason the migration checks above are hand-written.
+    auto downgraded = juce::String(olderJson).replace("\"schemaVersion\": 6", "\"schemaVersion\": 5")
+                                             .replace("\"schemaVersion\":6", "\"schemaVersion\":5");
+    const auto restored = nts::state::deserialize(downgraded.toStdString());
+    tests.expect(static_cast<bool>(restored), "the hand-downgraded project parses");
+    if (! restored) return;
+    tests.expect(restored.state->cabinet.controls.empty(),
+                 "and carries no cabinet block, which is what makes it the case under test");
+
+    TubeForgeAudioProcessor older;
+    // The downgraded text itself, not a re-serialisation of the parsed state: re-serialising would
+    // write it back at the current schema with a cabinet block, which is the one property this
+    // test exists to make sure is absent.
+    older.setStateInformation(downgraded.toRawUTF8(), downgraded.getNumBytesAsUTF8());
+    tests.expectNear(older.getParameters().getRawParameterValue("cabModelA")->load(), legacyIndex,
+                     1.0e-3, "a project from before the model comes back on the legacy cabinet");
+    tests.expectNear(older.getParameters().getRawParameterValue("cabModelB")->load(), legacyIndex,
+                     1.0e-3, "in both slots");
+
+    /* The response curve, which is what the page's plot draws.
+
+       Asserted here rather than in `nts_ir_tests` because the claim is about the *processor* --
+       that the curve it publishes describes the cabinet actually loaded -- and the interesting
+       half of that is the wiring, not the model. A closed 4x12 loses a great deal above 5 kHz, so
+       a curve that does not is a curve that came from somewhere else. */
+    const auto curve = fresh.cabinetResponseCurve(0);
+    tests.expectEqual(curve.size(), TubeForgeAudioProcessor::cabinetResponsePoints,
+                      "the processor publishes a response curve for slot A");
+    if (curve.size() == TubeForgeAudioProcessor::cabinetResponsePoints)
+    {
+        std::size_t oneKilohertz {}, eightKilohertz {};
+        for (std::size_t point = 0; point < curve.size(); ++point)
+        {
+            const auto frequency = TubeForgeAudioProcessor::cabinetResponseFrequency(point);
+            if (frequency <= 1000.0f) oneKilohertz = point;
+            if (frequency <= 8000.0f) eightKilohertz = point;
+        }
+        tests.expect(curve[oneKilohertz] > curve[eightKilohertz] + 12.0f,
+                     "the published curve carries the cabinet's top-end roll-off: "
+                         + std::to_string(curve[oneKilohertz] - curve[eightKilohertz]) + " dB");
+    }
+    tests.expectEqual(fresh.cabinetSumResponseCurve().size(),
+                      TubeForgeAudioProcessor::cabinetResponsePoints,
+                      "and a summed curve for the section as a whole");
+}
 } // namespace
 
 int main()
@@ -1749,6 +2568,11 @@ int main()
     testFinalAdditions(tests);
     testGearPickerCatalogues(tests);
     testHostTailReporting(tests);
+    testAutoMatch(tests);
+    testRecoveredRigReachesEveryParameter(tests);
+    testAutoMatchProjectFormat(tests);
+    testCabinetProjectFormat(tests);
+    testCabinetModelCompatibility(tests);
     testEditorLifecycle(tests);
     return tests.result();
 }

@@ -128,6 +128,33 @@ juce::var migrateV3ToV4(const juce::var& source)
     return migrated;
 }
 
+juce::var migrateV4ToV5(const juce::var& source)
+{
+    /* A version 4 project predates Auto Match, so nothing was being held. An absent block reads
+       back as `holding = false` with no values, which is exactly that rig: the analyzer is not
+       holding anything, and the `autoMatch` switch itself travels in `ampControls` like every
+       other saved control. */
+    auto migrated = source.clone();
+    auto* root = migrated.getDynamicObject();
+    root->setProperty("schemaVersion", 5);
+    root->setProperty("autoMatch", juce::var(new juce::DynamicObject()));
+    return migrated;
+}
+
+juce::var migrateV5ToV6(const juce::var& source)
+{
+    /* A version 5 project predates the cabinet stage's own controls, so it names none of them.
+       An absent block reads back as an empty control list, and the plug-in's defaults for those
+       controls are deliberately the values the fields held while they were unreachable -- unity
+       level, unmuted, in phase, no delay on A, the historical hard left/right split. So the
+       cabinet an old project describes is restored exactly, and there is nothing to move here. */
+    auto migrated = source.clone();
+    auto* root = migrated.getDynamicObject();
+    root->setProperty("schemaVersion", 6);
+    root->setProperty("cabinet", juce::var(new juce::DynamicObject()));
+    return migrated;
+}
+
 juce::var toVar(const ProjectState& state)
 {
     auto* root = new juce::DynamicObject();
@@ -165,6 +192,8 @@ juce::var toVar(const ProjectState& state)
 
     auto* assets = new juce::DynamicObject();
     assets->setProperty("relativePaths", stringArray(state.assets.relativePaths));
+    assets->setProperty("cabinetIrHashA", juce::String::fromUTF8(state.assets.cabinetIrHashA.c_str()));
+    assets->setProperty("cabinetIrHashB", juce::String::fromUTF8(state.assets.cabinetIrHashB.c_str()));
     assets->setProperty("cabinetIrPathA", juce::String::fromUTF8(state.assets.cabinetIrPathA.c_str()));
     assets->setProperty("cabinetIrPathB", juce::String::fromUTF8(state.assets.cabinetIrPathB.c_str()));
     root->setProperty("assets", juce::var(assets));
@@ -180,11 +209,24 @@ juce::var toVar(const ProjectState& state)
         entry->setProperty("tone", slot.tone);
         entry->setProperty("levelDb", slot.levelDb);
         entry->setProperty("mix", slot.mix);
+        entry->setProperty("auxA", slot.auxA);
+        entry->setProperty("auxB", slot.auxB);
         entry->setProperty("modelPath", juce::String::fromUTF8(slot.modelPath.c_str()));
         pedalSlots.add(juce::var(entry));
     }
     pedalboard->setProperty("slots", pedalSlots);
     root->setProperty("pedalboard", juce::var(pedalboard));
+
+    auto* autoMatch = new juce::DynamicObject();
+    autoMatch->setProperty("holding", state.autoMatch.holding);
+    autoMatch->setProperty("isolatedChain", state.autoMatch.isolatedChain);
+    autoMatch->setProperty("heldValues", floatArray(state.autoMatch.heldValues));
+    autoMatch->setProperty("releasedIndices", integerArray(state.autoMatch.releasedIndices));
+    root->setProperty("autoMatch", juce::var(autoMatch));
+
+    auto* cabinet = new juce::DynamicObject();
+    cabinet->setProperty("controls", floatArray(state.cabinet.controls));
+    root->setProperty("cabinet", juce::var(cabinet));
     return juce::var(root);
 }
 
@@ -221,6 +263,8 @@ ProjectState fromVar(const juce::var& root)
 
     const auto assets = root.getProperty("assets", {});
     state.assets.relativePaths = readStringArray(assets.getProperty("relativePaths", {}));
+    state.assets.cabinetIrHashA = assets.getProperty("cabinetIrHashA", "").toString().toStdString();
+    state.assets.cabinetIrHashB = assets.getProperty("cabinetIrHashB", "").toString().toStdString();
     state.assets.cabinetIrPathA = assets.getProperty("cabinetIrPathA", "").toString().toStdString();
     state.assets.cabinetIrPathB = assets.getProperty("cabinetIrPathB", "").toString().toStdString();
 
@@ -237,10 +281,23 @@ ProjectState fromVar(const juce::var& root)
             slot.tone = static_cast<float>(static_cast<double>(entry.getProperty("tone", 5.0)));
             slot.levelDb = static_cast<float>(static_cast<double>(entry.getProperty("levelDb", 0.0)));
             slot.mix = static_cast<float>(static_cast<double>(entry.getProperty("mix", 100.0)));
+            // Absent in projects written before a slot had voicing controls, so both fall back
+            // to the neutral 5 -- which is exactly what the archetypes that ignore them did.
+            slot.auxA = static_cast<float>(static_cast<double>(entry.getProperty("auxA", 5.0)));
+            slot.auxB = static_cast<float>(static_cast<double>(entry.getProperty("auxB", 5.0)));
             slot.modelPath = entry.getProperty("modelPath", "").toString().toStdString();
             state.pedalboard.slots.push_back(std::move(slot));
         }
     }
+
+    const auto autoMatch = root.getProperty("autoMatch", {});
+    state.autoMatch.holding = static_cast<bool>(autoMatch.getProperty("holding", false));
+    state.autoMatch.isolatedChain = static_cast<bool>(autoMatch.getProperty("isolatedChain", false));
+    state.autoMatch.heldValues = readFloatArray(autoMatch.getProperty("heldValues", {}));
+    state.autoMatch.releasedIndices = readIntegerArray(autoMatch.getProperty("releasedIndices", {}));
+
+    const auto cabinet = root.getProperty("cabinet", {});
+    state.cabinet.controls = readFloatArray(cabinet.getProperty("controls", {}));
     return state;
 }
 } // namespace
@@ -265,6 +322,8 @@ StateResult deserialize(std::string_view json)
     if (sourceVersion <= 1) parsed = migrateV1ToV2(parsed);
     if (sourceVersion <= 2) parsed = migrateV2ToV3(parsed);
     if (sourceVersion <= 3) parsed = migrateV3ToV4(parsed);
+    if (sourceVersion <= 4) parsed = migrateV4ToV5(parsed);
+    if (sourceVersion <= 5) parsed = migrateV5ToV6(parsed);
 
     auto state = fromVar(parsed);
     std::string error;
@@ -291,7 +350,7 @@ bool validate(const ProjectState& state, std::string& error) noexcept
         error = "Engine gain is outside the supported range";
         return false;
     }
-    if (state.engine.ampControls.size() > 64
+    if (state.engine.ampControls.size() > maximumAmpControls
         || std::any_of(state.engine.ampControls.begin(), state.engine.ampControls.end(),
                        [](float value) { return ! std::isfinite(value); }))
     {
@@ -336,20 +395,56 @@ bool validate(const ProjectState& state, std::string& error) noexcept
     }
     for (const auto& slot : state.pedalboard.slots)
     {
-        // Deliberately looser than the current kind count. This layer's job is to reject
-        // corruption, not to know the engine's enumeration -- a project from a later build
-        // that added a kind should still open, with the processor clamping what it applies.
-        if (slot.kind < 0 || slot.kind > 64)
+        // Deliberately looser than the current model count. This layer's job is to reject
+        // corruption, not to know the engine's table -- a project from a later build that added
+        // a pedal should still open, with the processor clamping what it applies. Raised from
+        // 64 when the table stopped being an enumeration of seven and became a catalogue.
+        if (slot.kind < 0 || slot.kind > 512)
         {
             error = "Pedal kind is outside the supported range";
             return false;
         }
         if (! std::isfinite(slot.drive) || ! std::isfinite(slot.tone)
-            || ! std::isfinite(slot.levelDb) || ! std::isfinite(slot.mix))
+            || ! std::isfinite(slot.levelDb) || ! std::isfinite(slot.mix)
+            || ! std::isfinite(slot.auxA) || ! std::isfinite(slot.auxB))
         {
             error = "Pedal control state is invalid";
             return false;
         }
+    }
+    /* The held rig. Bounded and finite-checked for the same reason as `ampControls`, and with
+       one rule of its own: a released index must point at a value that exists, or the plug-in
+       would mark a control released that this file says nothing about. */
+    if (state.autoMatch.heldValues.size() > maximumAutoMatchValues
+        || std::any_of(state.autoMatch.heldValues.begin(), state.autoMatch.heldValues.end(),
+                       [](float value) { return ! std::isfinite(value); }))
+    {
+        error = "Auto Match state is invalid";
+        return false;
+    }
+    if (state.autoMatch.holding && state.autoMatch.heldValues.empty())
+    {
+        error = "Auto Match claims to be holding a rig it did not save";
+        return false;
+    }
+    for (const auto index : state.autoMatch.releasedIndices)
+    {
+        if (index < 0 || index >= static_cast<int>(state.autoMatch.heldValues.size()))
+        {
+            error = "Auto Match released control is outside the saved rig";
+            return false;
+        }
+    }
+    /* The cabinet block. Bounded and finite-checked exactly as `ampControls` is -- the bound
+       stops a corrupt file asking for an unbounded allocation, and the finite check stops a NaN
+       reaching a convolver's delay line, where it would never leave. An empty list is valid and
+       normal: it is what every project written before schema 6 has. */
+    if (state.cabinet.controls.size() > maximumCabinetControls
+        || std::any_of(state.cabinet.controls.begin(), state.cabinet.controls.end(),
+                       [](float value) { return ! std::isfinite(value); }))
+    {
+        error = "Cabinet control state is invalid";
+        return false;
     }
     error.clear();
     return true;

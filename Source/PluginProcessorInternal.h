@@ -14,6 +14,7 @@
 #include <TubeForgeAssets.h>
 
 #include <nts/diagnostics/ProcessMemory.h>
+#include <nts/ir/CabinetMatch.h>
 #include <nts/reconstruction/StemRefinement.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_cryptography/juce_cryptography.h>
@@ -51,6 +52,17 @@ constexpr auto sag = "sag";
 constexpr auto feedback = "feedback";
 constexpr auto crossover = "crossover";
 constexpr auto cleanBlend = "cleanBlend";
+/// A switch on the current voicing's front panel -- Ultra Lo, Deep and the rest. Which ones exist
+/// depends on the voicing; see nts::amp::panelSwitchAppliesTo.
+constexpr auto panelSwitch = "panelSwitch";
+/// Untouched input summed over the whole amplifier. Distinct from `cleanBlend`, which blends only
+/// the low band -- see AmpParameters::dryBlend for why the difference matters.
+constexpr auto dryBlend = "dryBlend";
+/// The bi-amp controls. Named for the band rather than for a front panel, because the two bands
+/// are what the engine has -- see BassPathParameters.
+constexpr auto lowBandDrive = "lowBandDrive";
+constexpr auto lowBandLevel = "lowBandLevel";
+constexpr auto highBandLevel = "highBandLevel";
 constexpr auto cabinetAlignment = "cabinetAlignment";
 constexpr auto tightness = "tightness";
 constexpr auto pickEmphasis = "pickEmphasis";
@@ -82,6 +94,51 @@ constexpr auto reverbDamping = "reverbDamping";
 constexpr auto cabinetBlend = "cabinetBlend";
 constexpr auto tunerMute = "tunerMute";
 constexpr auto performanceTier = "performanceTier";
+/// Whether the song analyzer holds the rig. Not a tone control: it decides who *writes* the
+/// tone controls. See Source/AutoMatch.h.
+constexpr auto autoMatch = "autoMatch";
+/// Whether a held rig also follows the live signal. Only ever moves the input trim and the gate
+/// threshold, and only within 6 dB of what the match set. Off by default.
+constexpr auto autoMatchTracking = "autoMatchTracking";
+/* The cabinet stage's own controls.
+
+   Named `cab*` rather than `cabinet*` to keep them visibly separate from the four that predate
+   them -- `cabinet`, `cabinetBlend`, `cabinetWidth` and `cabinetAlignment` live in
+   `ampControlIds` and cannot move, whereas everything here is saved through `cabinetControlIds`
+   and `nts::state::CabinetState`. That split is not cosmetic: `ampControlIds` holds 58 of the 64
+   entries `ProjectState::validate` accepts, and overrunning it makes every saved project fail to
+   load. See the note at that list. */
+constexpr auto cabLevelA = "cabLevelA";
+constexpr auto cabLevelB = "cabLevelB";
+constexpr auto cabPanA = "cabPanA";
+constexpr auto cabPanB = "cabPanB";
+constexpr auto cabPhaseA = "cabPhaseA";
+constexpr auto cabPhaseB = "cabPhaseB";
+constexpr auto cabDelayA = "cabDelayA";
+constexpr auto cabMuteA = "cabMuteA";
+constexpr auto cabMuteB = "cabMuteB";
+constexpr auto cabLowCut = "cabLowCut";
+constexpr auto cabHighCut = "cabHighCut";
+constexpr auto cabDiBlend = "cabDiBlend";
+constexpr auto cabOutputTrim = "cabOutputTrim";
+/// The built-in cabinet model, per slot: which box, which microphone, and where it is pointed
+/// from how far away. Ignored while that slot has a user impulse response loaded.
+constexpr auto cabModelA = "cabModelA";
+constexpr auto cabModelB = "cabModelB";
+constexpr auto cabMicA = "cabMicA";
+constexpr auto cabMicB = "cabMicB";
+constexpr auto cabPositionA = "cabPositionA";
+constexpr auto cabPositionB = "cabPositionB";
+constexpr auto cabDistanceA = "cabDistanceA";
+constexpr auto cabDistanceB = "cabDistanceB";
+/// How a *loaded* response is prepared, per slot. Ignored while a slot is on the built-in model,
+/// which is rendered to the right length and level by construction.
+constexpr auto cabIrLengthA = "cabIrLengthA";
+constexpr auto cabIrLengthB = "cabIrLengthB";
+constexpr auto cabIrNormA = "cabIrNormA";
+constexpr auto cabIrNormB = "cabIrNormB";
+constexpr auto cabIrMinPhaseA = "cabIrMinPhaseA";
+constexpr auto cabIrMinPhaseB = "cabIrMinPhaseB";
 // Six per slot, in the order PedalParameters declares them, so the slot index can walk them.
 constexpr auto pedal1Kind = "pedal1Kind";
 constexpr auto pedal1Bypass = "pedal1Bypass";
@@ -89,24 +146,32 @@ constexpr auto pedal1Drive = "pedal1Drive";
 constexpr auto pedal1Tone = "pedal1Tone";
 constexpr auto pedal1Level = "pedal1Level";
 constexpr auto pedal1Mix = "pedal1Mix";
+constexpr auto pedal1AuxA = "pedal1AuxA";
+constexpr auto pedal1AuxB = "pedal1AuxB";
 constexpr auto pedal2Kind = "pedal2Kind";
 constexpr auto pedal2Bypass = "pedal2Bypass";
 constexpr auto pedal2Drive = "pedal2Drive";
 constexpr auto pedal2Tone = "pedal2Tone";
 constexpr auto pedal2Level = "pedal2Level";
 constexpr auto pedal2Mix = "pedal2Mix";
+constexpr auto pedal2AuxA = "pedal2AuxA";
+constexpr auto pedal2AuxB = "pedal2AuxB";
 constexpr auto pedal3Kind = "pedal3Kind";
 constexpr auto pedal3Bypass = "pedal3Bypass";
 constexpr auto pedal3Drive = "pedal3Drive";
 constexpr auto pedal3Tone = "pedal3Tone";
 constexpr auto pedal3Level = "pedal3Level";
 constexpr auto pedal3Mix = "pedal3Mix";
+constexpr auto pedal3AuxA = "pedal3AuxA";
+constexpr auto pedal3AuxB = "pedal3AuxB";
 constexpr auto pedal4Kind = "pedal4Kind";
 constexpr auto pedal4Bypass = "pedal4Bypass";
 constexpr auto pedal4Drive = "pedal4Drive";
 constexpr auto pedal4Tone = "pedal4Tone";
 constexpr auto pedal4Level = "pedal4Level";
 constexpr auto pedal4Mix = "pedal4Mix";
+constexpr auto pedal4AuxA = "pedal4AuxA";
+constexpr auto pedal4AuxB = "pedal4AuxB";
 } // namespace ParameterIds
 
 namespace
@@ -142,20 +207,97 @@ constexpr std::array ampControlIds {
     ParameterIds::delayTone, ParameterIds::reverbMix, ParameterIds::reverbSize,
     ParameterIds::reverbDamping, ParameterIds::cabinetBlend,
     // Appended for the same reason as the blocks above.
-    ParameterIds::loudnessMatch, ParameterIds::cabinetWidth, ParameterIds::tunerReference
+    ParameterIds::loudnessMatch, ParameterIds::cabinetWidth, ParameterIds::tunerReference,
+    /* The bi-amp and dry-blend controls, appended -- and they were briefly not.
+
+       Written next to `crossover` and `cleanBlend` first, because that is where they belong by
+       meaning, and that is the one thing this list must never be ordered by. `applyProjectState`
+       walks a saved project's values positionally against this table, so inserting four ids in
+       the middle shifted every id after them by four: an old project's Cab alignment landed in
+       Dry blend, its Tightness in Low drive, and so on to the end of the list.
+
+       Caught by launching the standalone and reading the panel -- Low drive sat at 5.4 and Low
+       level at -1.0 where the defaults are 2.6 and 0.0. Nothing failed, nothing warned, and every
+       test still passed, because a positional remap produces perfectly valid numbers in the wrong
+       fields. The grouping that reads well here is the grouping that corrupts saved state; the
+       append-only rule the blocks above state is the whole contract. */
+    ParameterIds::dryBlend, ParameterIds::lowBandDrive,
+    ParameterIds::lowBandLevel, ParameterIds::highBandLevel,
+    // Appended, for the reason stated at length above.
+    ParameterIds::panelSwitch,
+    /* Auto Match, appended for the same reason again.
+
+       Saved here rather than in a block of its own so that a project remembers whether the
+       analyzer was holding the rig. What it cannot remember this way is *which* controls had
+       been handed back -- that needs the released set and the matched values, which is a
+       schema-5 addition and is not done. Until it is, reopening a project with Auto Match on
+       comes back `armed` rather than `holding`: the switch is on, nothing is guarded, and
+       re-applying a candidate puts it back. Coming back armed is the safe direction to be
+       wrong in -- the alternative is a rig quietly re-writing knobs the user had taken back. */
+    ParameterIds::autoMatch,
+    // Appended, for the reason stated at length above.
+    ParameterIds::autoMatchTracking
 };
+/* One entry of `EngineState::ampControls` is written per id above, and `nts::state::validate`
+   rejects a longer array than this -- so overrunning it does not truncate a save, it makes **every
+   saved project fail to load** as "Amp control state is invalid". A valid project the user can no
+   longer open, caused by adding a knob.
+
+   The bi-amp band controls took this to 54. Whoever next appends here finds out at compile time
+   rather than from a bug report, which is the whole point of stating it where the list is. */
+static_assert(ampControlIds.size() <= nts::state::maximumAmpControls,
+              "ampControlIds has outgrown what ProjectState::validate will accept");
+
+/** The cabinet stage's controls, saved through `nts::state::CabinetState` at schema 6.
+
+    **A separate list, and that is the whole point.** `ampControlIds` above holds 58 of the 64
+    entries `ProjectState::validate` accepts, and the cabinet alone wants thirteen. Appending
+    them there would leave five slots for everything this plug-in ever grows, and the failure
+    mode when that runs out is not a truncated save -- it is every saved project refusing to
+    open. A block per subsystem is what stops the next feature having that argument.
+
+    The same append-only rule applies *within* this list, for exactly the reason spelled out at
+    length above `ampControlIds`: `applyProjectState` walks a saved project's values positionally
+    against it, so inserting an id in the middle silently moves every value after it into the
+    wrong control. Append, always.
+
+    The four cabinet controls that predate this block -- `cabinet`, `cabinetBlend`,
+    `cabinetWidth`, `cabinetAlignment` -- are deliberately **not** here. They are already saved
+    through `ampControlIds` at fixed positions, and writing them twice would mean two sources of
+    truth for one value.
+*/
+constexpr std::array cabinetControlIds {
+    ParameterIds::cabLevelA, ParameterIds::cabLevelB, ParameterIds::cabPanA,
+    ParameterIds::cabPanB, ParameterIds::cabPhaseA, ParameterIds::cabPhaseB,
+    ParameterIds::cabDelayA, ParameterIds::cabMuteA, ParameterIds::cabMuteB,
+    ParameterIds::cabLowCut, ParameterIds::cabHighCut, ParameterIds::cabDiBlend,
+    ParameterIds::cabOutputTrim,
+    // Appended, for the reason stated above. The model controls arrived after the first block.
+    ParameterIds::cabModelA, ParameterIds::cabModelB, ParameterIds::cabMicA,
+    ParameterIds::cabMicB, ParameterIds::cabPositionA, ParameterIds::cabPositionB,
+    ParameterIds::cabDistanceA, ParameterIds::cabDistanceB,
+    // Appended, for the reason stated above. The loaded-response controls arrived after the model.
+    ParameterIds::cabIrLengthA, ParameterIds::cabIrLengthB, ParameterIds::cabIrNormA,
+    ParameterIds::cabIrNormB, ParameterIds::cabIrMinPhaseA, ParameterIds::cabIrMinPhaseB
+};
+static_assert(cabinetControlIds.size() <= nts::state::maximumCabinetControls,
+              "cabinetControlIds has outgrown what ProjectState::validate will accept");
 
 /// Row per slot, column per PedalControl. The single place the two are paired.
 constexpr std::array<std::array<const char*, TubeForgeAudioProcessor::pedalParameterStride>,
                      nts::pedals::slotCount> pedalParameterIds { {
     { ParameterIds::pedal1Kind, ParameterIds::pedal1Bypass, ParameterIds::pedal1Drive,
-      ParameterIds::pedal1Tone, ParameterIds::pedal1Level, ParameterIds::pedal1Mix },
+      ParameterIds::pedal1Tone, ParameterIds::pedal1Level, ParameterIds::pedal1Mix,
+      ParameterIds::pedal1AuxA, ParameterIds::pedal1AuxB },
     { ParameterIds::pedal2Kind, ParameterIds::pedal2Bypass, ParameterIds::pedal2Drive,
-      ParameterIds::pedal2Tone, ParameterIds::pedal2Level, ParameterIds::pedal2Mix },
+      ParameterIds::pedal2Tone, ParameterIds::pedal2Level, ParameterIds::pedal2Mix,
+      ParameterIds::pedal2AuxA, ParameterIds::pedal2AuxB },
     { ParameterIds::pedal3Kind, ParameterIds::pedal3Bypass, ParameterIds::pedal3Drive,
-      ParameterIds::pedal3Tone, ParameterIds::pedal3Level, ParameterIds::pedal3Mix },
+      ParameterIds::pedal3Tone, ParameterIds::pedal3Level, ParameterIds::pedal3Mix,
+      ParameterIds::pedal3AuxA, ParameterIds::pedal3AuxB },
     { ParameterIds::pedal4Kind, ParameterIds::pedal4Bypass, ParameterIds::pedal4Drive,
-      ParameterIds::pedal4Tone, ParameterIds::pedal4Level, ParameterIds::pedal4Mix } } };
+      ParameterIds::pedal4Tone, ParameterIds::pedal4Level, ParameterIds::pedal4Mix,
+      ParameterIds::pedal4AuxA, ParameterIds::pedal4AuxB } } };
 
 void setCircuitParameter(nts::circuit::NodeSpec& node, std::string_view id, float value)
 {
@@ -183,6 +325,19 @@ std::filesystem::path logPath()
                                      .toStdString());
 }
 
+/** Where the "don't warn me again" answer lives.
+
+    A file of its own rather than a field in the assistant's preferences, which is a different
+    thing: that file is what the assistant has learned about how somebody plays, and this is one
+    interface answer about one dialog. Mixing them would mean clearing the assistant's
+    personalization also silently turned a warning back on.
+*/
+juce::File autoMatchPreferencesFile()
+{
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("TubeForge").getChildFile("auto-match-preferences.json");
+}
+
 juce::File assistantPreferencesFile()
 {
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
@@ -195,6 +350,15 @@ juce::File captureLibraryPath()
 {
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
         .getChildFile("TubeForge").getChildFile("captures");
+}
+
+/// Where the impulse-response browser keeps its root folder, favourites and recents. Beside the
+/// other TubeForge preferences rather than in the project: a shelf of responses is a statement
+/// about this machine, not about one rig.
+juce::File cabinetLibraryPreferencesPath()
+{
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("TubeForge").getChildFile("cabinet-library.json");
 }
 
 std::filesystem::path tonePackageLibraryPath()

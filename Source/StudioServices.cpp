@@ -412,6 +412,13 @@ void StudioServices::reconstructSongFile(
     {
         const std::scoped_lock lock(reconstructionMutex);
         latestReconstruction = std::move(result);
+        // Kept for the cabinet matcher; see the member's own note on why it lives here and not in
+        // the result. Copied rather than moved because `normalized` is read again below.
+        reconstructionReferenceAudio = normalized.audio.left;
+        reconstructionReferenceRate = workingSampleRate;
+        // Bumped inside the lock, with the result it describes. A poller comparing generations
+        // can then never see a new number beside the previous run's candidates.
+        reconstructionGenerationValue.fetch_add(1, std::memory_order_acq_rel);
         reconstructionStatus = "Ready: " + reference.gainCharacter + " part, " + reference.dominantPitch
             + ", " + reference.estimatedTuning + "; " + std::to_string(
             latestReconstruction->candidates.size()) + " playable candidates";
@@ -596,6 +603,24 @@ bool StudioServices::requestReconstructionRegion(std::size_t index)
     return true;
 }
 
+bool StudioServices::requestReconstructionInstrument(nts::reconstruction::TargetInstrument target)
+{
+    juce::File song;
+    nts::reconstruction::StereoMode stereoMode;
+    {
+        const std::scoped_lock lock(reconstructionMutex);
+        if (target == lastReconstructionTarget || ! lastReconstructionSong.existsAsFile()) return false;
+        song = lastReconstructionSong;
+        stereoMode = lastReconstructionStereoMode;
+    }
+    // Through the ordinary entry point rather than a private variant: changing instrument means
+    // different stems, a different region shortlist and a different set of voicings, which is
+    // every stage of the run. The one thing it must not reuse is the region index, because the
+    // regions themselves are about to be recomputed.
+    requestSongReconstruction(song, target, stereoMode);
+    return true;
+}
+
 bool StudioServices::applyReconstructionCandidate(std::size_t index, bool isolateChain)
 {
     nts::reconstruction::RigCandidate candidate;
@@ -613,6 +638,19 @@ bool StudioServices::applyReconstructionCandidate(std::size_t index, bool isolat
     if (applyRig) applyRig(p, isolateChain);
 
     return true;
+}
+
+juce::String StudioServices::reconstructionSourceName() const
+{
+    const std::scoped_lock lock(reconstructionMutex);
+    return lastReconstructionSong.getFileNameWithoutExtension();
+}
+
+std::vector<float> StudioServices::reconstructionReferenceSamples(double& sampleRate) const
+{
+    const std::scoped_lock lock(reconstructionMutex);
+    sampleRate = reconstructionReferenceRate;
+    return reconstructionReferenceAudio;
 }
 
 std::optional<nts::tone::ToneAnalysisResult> StudioServices::reconstructionReferenceTone() const

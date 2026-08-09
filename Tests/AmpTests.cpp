@@ -10,7 +10,11 @@
 #include <cmath>
 #include <complex>
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
 #include <new>
+#include <string>
+#include <string_view>
 #include <numbers>
 #include <thread>
 #include <vector>
@@ -176,6 +180,722 @@ void testPreampStages(TestHarness& tests)
                  "4x oversampling suppresses preamp fold-back that 1x leaves in the band");
 }
 
+/** Track B: the amplifier can clip with something other than a valve.
+
+    Four claims, and the first is the one the whole track exists for. Before this, every stage in
+    the amplifier was a hyperbolic tangent and no arrangement of the other twelve parameters could
+    make one behave like a transistor -- so a solid-state voicing came out as a soft-knee valve
+    with unusual EQ, which is not the same amplifier and does not sound like one.
+*/
+void testWaveshapeSelection(TestHarness& tests)
+{
+    using nts::amp::PreampStageConfig;
+
+    /* A hard clipper is linear below its threshold; a valve is already compressing there.
+
+       This is the difference, stated as the smallest measurement that can see it. Comparing the
+       two at *high* drive would measure almost nothing -- both approach a square wave and the
+       curves converge -- so the discriminating region is the quiet one, where tanh has visible
+       curvature and a clamp has none at all. Bias, asymmetry and every time-varying term are
+       switched off so the only thing left in the measurement is the curve.
+    */
+    const auto gainForShape = [&](nts::dsp::Waveshape shape, float amplitude)
+    {
+        nts::amp::ResponsivePreampStage stage;
+        stage.prepare({ sampleRate, 4096, 1 });
+        PreampStageConfig config;
+        config.driveDb = 6.0f; config.outputTrimDb = 0.0f;
+        config.bias = 0.0f; config.asymmetry = 0.0f;
+        config.lowCutHz = 20.0f; config.highCutHz = 20000.0f;
+        config.dynamicBias = 0.0f; config.frequencySaturation = 0.0f;
+        config.attackReduction = 0.0f; config.memoryAmount = 0.0f;
+        config.shape = shape;
+        stage.setConfig(config, 0); stage.reset();
+        auto signal = sine(4096, 500.0, amplitude);
+        float* channel[] { signal.data() };
+        stage.process(channel, 1, 4096);
+        return magnitude(std::span(signal).subspan(1024), 500.0) / amplitude;
+    };
+
+    /* 0.35 into a 6 dB stage puts 0.70 into the curve: still short of the clamp at 1.0, and far
+       enough up the tanh for its curvature to be unmistakable. An earlier version of this used
+       0.05, where the hard clipper is exactly linear and tanh is *also* nearly linear -- the two
+       differed by 0.25%, which is a true statement about the curves and a useless test. The
+       discriminating region is the one just below the threshold, not the one near zero.
+    */
+    const auto quietHard = gainForShape(nts::dsp::Waveshape::hardClip, 0.35f);
+    const auto quietValve = gainForShape(nts::dsp::Waveshape::hyperbolicTangent, 0.35f);
+    tests.expect(quietHard > quietValve * 1.10,
+                 "a hard-clip stage stays linear below threshold where a valve stage compresses");
+
+    // And the shape has to actually reach the stage rather than being stored and ignored.
+    auto shapesDiffer = true;
+    for (const auto shape : { nts::dsp::Waveshape::hardClip, nts::dsp::Waveshape::diode,
+                              nts::dsp::Waveshape::ledClip })
+        shapesDiffer = shapesDiffer
+            && std::abs(gainForShape(shape, 0.4f)
+                      - gainForShape(nts::dsp::Waveshape::hyperbolicTangent, 0.4f)) > 1.0e-3;
+    tests.expect(shapesDiffer, "every selectable waveshape changes what a preamp stage does");
+
+    /* ADAA suppresses hard-clip fold-back, and the factor it is measured at is the finding.
+
+       Same probe geometry as the oversampling test above -- a 3350 Hz tone whose 14th harmonic
+       lands at 46900 Hz and folds to 1100 Hz -- because nothing else in the chain can put energy
+       at 1100 Hz when the input is a pure tone.
+
+       **Measured at 2x, and that is not a convenience.** Sweeping factor and asymmetry produced a
+       result that changed the design:
+
+         asym  x1     x2     x4     x8      (ADAA fold-back / plain fold-back)
+         0.00  0.16   0.29   1.37   0.97
+         0.06  0.70   0.30   1.39   0.97
+         0.30  1.51   0.36   1.18   0.99
+
+       The ADAA column is pinned near 2.4e-4 in every one of those runs regardless of factor, and
+       the *plain* figure at 4x and 8x is already at that same value. That number is this probe's
+       floor -- unwindowed correlation against a strong fundamental leaks into every bin -- so at
+       4x and 8x the true fold-back is **below what can be measured here**, and the ratios in those
+       two columns are scatter rather than signal. (A broadband sum was tried instead and is worse:
+       the leakage then dominates every bin and every configuration reads 0.022 to 0.035.)
+
+       Two conclusions, both acted on:
+
+       - **2x is where the effect is real**, consistently about a threefold reduction and stable
+         across asymmetry. That is what this asserts.
+       - **8x oversampling alone already puts fold-back under the floor**, so the solid-state
+         voicings do *not* enable ADAA -- see the note on `PreampStageConfig::antialiasedSaturation`
+         and the plan's B2. Paying half a sample of delay and some top end for an improvement that
+         cannot be measured is not a trade, it is a habit.
+
+       The x1 row is the polarity-switching limitation documented in the saturator, seen directly:
+       ADAA helps at asymmetry 0 and actively hurts by asymmetry 0.3, because at 1x the intervals
+       that straddle the polarity breakpoint are a large fraction of all of them.
+    */
+    const auto foldbackWithAdaa = [&](bool antialias, float asymmetry, int factor)
+    {
+        constexpr std::size_t probeSamples = 8192;
+        nts::amp::ResponsivePreampStage stage;
+        stage.prepare({ sampleRate, probeSamples, 1 });
+        PreampStageConfig config;
+        config.driveDb = 30.0f; config.highCutHz = 20000.0f; config.oversamplingFactor = factor;
+        config.shape = nts::dsp::Waveshape::hardClip;
+        config.antialiasedSaturation = antialias;
+        config.asymmetry = asymmetry; config.bias = 0.05f;
+        config.dynamicBias = 0.0f; config.frequencySaturation = 0.0f;
+        config.attackReduction = 0.0f; config.memoryAmount = 0.0f;
+        stage.setConfig(config, 0); stage.reset();
+        auto signal = sine(probeSamples, 3350.0, 0.7f);
+        float* channel[] { signal.data() };
+        stage.process(channel, 1, probeSamples);
+        // Skip the filter warm-up so the measurement is steady state.
+        return magnitude(std::span(signal).subspan(1024), 1100.0);
+    };
+    // Asymmetry 0.06 is what the solid-state voicings actually run, so the claim is made where
+    // it is going to be relied on rather than at a flattering setting.
+    const auto plain = foldbackWithAdaa(false, 0.06f, 2);
+    const auto integrated = foldbackWithAdaa(true, 0.06f, 2);
+    tests.expect(integrated < plain * 0.5,
+                 "antiderivative antialiasing at least halves hard-clip fold-back at 2x");
+
+    // The curve is part of a preset. A voicing that came back as a valve after a save would be a
+    // different amplifier, and nothing else in the file would look wrong.
+    auto shaped = nts::amp::makeOriginalPreset(nts::amp::Topology::tightModern,
+                                               nts::amp::Instrument::bass);
+    shaped.parameters.stages[0].shape = nts::dsp::Waveshape::hardClip;
+    shaped.parameters.stages[0].antialiasedSaturation = true;
+    shaped.parameters.stages[1].shape = nts::dsp::Waveshape::diode;
+    shaped.parameters.powerAmp.shape = nts::dsp::Waveshape::hardClip;
+    const auto restored = nts::amp::deserializePreset(nts::amp::serializePreset(shaped));
+    tests.expect(restored.has_value() && restored->parameters == shaped.parameters,
+                 "waveshape and antialiasing selections survive a serialize/restore");
+
+    /* An out-of-range stored curve falls back to the valve rather than to silence.
+
+       `dsp::shapeSample` switches on the enum and returns its input unchanged for a value outside
+       it, so a cast straight from a stored integer turns a distorting stage into a *linear* one:
+       no error, no NaN, and an amplifier that has quietly stopped being an amplifier. A preset
+       written by a later build with more curves in the enum is exactly how that arrives.
+    */
+    auto forward = nts::amp::serializePreset(shaped, false);
+    const auto shapeKey = std::string { "\"stage0Shape\":" };
+    const auto at = forward.find(shapeKey);
+    tests.expect(at != std::string::npos, "the stage shape is written under the key the loader reads");
+    if (at != std::string::npos)
+    {
+        forward.replace(at + shapeKey.size(), 1, "99");
+        const auto loaded = nts::amp::deserializePreset(forward);
+        tests.expect(loaded.has_value()
+                     && loaded->parameters.stages[0].shape == nts::dsp::Waveshape::hyperbolicTangent,
+                     "a preset naming an unknown waveshape falls back to the valve curve");
+    }
+}
+
+/** Track C: the bass path is a bi-amp rather than a fixed clean-low/driven-high split.
+
+    The claim being tested is the one the voicing exists for: that a note whose fundamental sits
+    below a 500 Hz crossover comes out with far less harmonic distortion than the same note through
+    a 150 Hz one, because at 500 Hz the whole body of the note takes the clean side and only the
+    attack and the harmonics reach the driven one.
+*/
+void testBiAmpPath(TestHarness& tests)
+{
+    // Second and third harmonics of an open A. Both are above 150 Hz and below 500, which is the
+    // entire point: they change sides when the crossover moves and nothing else in the signal does.
+    const auto distortionAt = [&](float crossoverHz)
+    {
+        auto preset = nts::amp::makeOriginalPreset(nts::amp::Topology::solidStateBiAmp,
+                                                   nts::amp::Instrument::bass);
+        preset.parameters.bass.crossoverHz = crossoverHz;
+        preset.parameters.loudnessMatch = false;
+        nts::amp::TraditionalAmpProcessor processor;
+        processor.prepare({ sampleRate, blockSize, 1 });
+        processor.loadPreset(preset, 0);
+        std::vector<float> input (16384);
+        for (std::size_t n = 0; n < input.size(); ++n)
+            input[n] = 0.6f * static_cast<float>(
+                std::sin(2.0 * std::numbers::pi * 110.0 * static_cast<double>(n) / sampleRate));
+        const auto rendered = nts::amp::renderOffline(processor, input, blockSize);
+        const auto steady = std::span(rendered).subspan(4096);
+        const auto fundamental = magnitude(steady, 110.0);
+        // Harmonic content relative to the fundamental, so a level difference between the two
+        // configurations cannot masquerade as a difference in distortion.
+        return (magnitude(steady, 220.0) + magnitude(steady, 330.0) + magnitude(steady, 440.0))
+             / std::max(1.0e-9, fundamental);
+    };
+
+    const auto atMudGuard = distortionAt(150.0f);
+    const auto atBiAmp = distortionAt(500.0f);
+    tests.expect(atBiAmp < atMudGuard,
+                 "a 500 Hz crossover passes more of the note clean than a 150 Hz one");
+
+    // Per-band level has to reach the sum. Before Track C the two bands were mixed with weights
+    // that no parameter could touch, so a bi-amp could not be balanced at all.
+    const auto levelledOutput = [&](float lowLevelDb, float highLevelDb)
+    {
+        auto preset = nts::amp::makeOriginalPreset(nts::amp::Topology::solidStateBiAmp,
+                                                   nts::amp::Instrument::bass);
+        preset.parameters.loudnessMatch = false;
+        preset.parameters.bass.lowLevelDb = lowLevelDb;
+        preset.parameters.bass.highLevelDb = highLevelDb;
+        nts::amp::TraditionalAmpProcessor processor;
+        processor.prepare({ sampleRate, blockSize, 1 });
+        processor.loadPreset(preset, 0);
+        std::vector<float> input (8192);
+        for (std::size_t n = 0; n < input.size(); ++n)
+            input[n] = 0.5f * static_cast<float>(
+                std::sin(2.0 * std::numbers::pi * 110.0 * static_cast<double>(n) / sampleRate));
+        const auto rendered = nts::amp::renderOffline(processor, input, blockSize);
+        return magnitude(std::span(rendered).subspan(2048), 110.0);
+    };
+    tests.expect(levelledOutput(6.0f, 0.0f) > levelledOutput(-6.0f, 0.0f) * 1.5,
+                 "the low band's level control reaches the recombined output");
+
+    /* Nothing that predates the bi-amp fields recombines differently because of them.
+
+       This is the compatibility claim in its own right: every new field defaults to the value the
+       path behaved as before it existed, so a valve voicing's two bands sum with exactly the
+       weights they always did. `testOriginalVoicingRegression` proves it for the seven shipped
+       voicings; this proves the *defaults* are the reason, which is what a new field has to get
+       right rather than merely happening to.
+    */
+    nts::amp::BassPathParameters fresh;
+    tests.expect(fresh.lowLevelDb == 0.0f && fresh.highLevelDb == 0.0f
+                 && fresh.lowShape == nts::dsp::Waveshape::hyperbolicTangent
+                 && std::abs(nts::dsp::dbToLinear(fresh.lowDriveDb) - 1.35f) < 0.005f,
+                 "bi-amp defaults reproduce the fixed behaviour they replaced");
+
+    const auto biAmp = nts::amp::makeOriginalPreset(nts::amp::Topology::solidStateBiAmp,
+                                                    nts::amp::Instrument::bass);
+    const auto restored = nts::amp::deserializePreset(nts::amp::serializePreset(biAmp));
+    tests.expect(restored.has_value() && restored->parameters.bass == biAmp.parameters.bass,
+                 "the bi-amp band controls survive a serialize/restore");
+    tests.expect(biAmp.parameters.bass.crossoverHz > 400.0f,
+                 "the bi-amp voicing splits well above the mud-guard range");
+}
+
+/** Track D / F3: the parallel dry path is delayed to match the drive path.
+
+    **Written before the blend it tests, and this is the reason.** Every oversampled preamp stage
+    contributes `dsp::antiAliasTapsPerPhase` -- eight -- base-rate samples of group delay. Summing
+    an undelayed dry tap against a chain carrying two or three of those is a comb filter whose
+    first null lands between roughly 1 and 1.5 kHz at 48 kHz: exactly the presence region a bass
+    distortion exists to produce. It does not crash, does not produce NaN, and does not fail any
+    other test in this file. It sounds slightly thin, which is indistinguishable from a voicing
+    that needs tuning by ear -- so it would have been found, if at all, after weeks of somebody
+    trying to fix it with the EQ.
+
+    The measurement is reconstruction rather than spectrum: with the drive path made transparent, a
+    50/50 blend of dry against wet has to give back the input. An unaligned blend cannot, because
+    the two copies are a delay apart and cancel wherever they are out of phase.
+*/
+void testDryBlendAlignment(TestHarness& tests)
+{
+    /* A deliberately transparent amplifier: minimum drive, no sag, no saturation, tone stack flat,
+       cabinet bypassed. What is left is a gain path with the oversamplers' group delay in it,
+       which is precisely the thing the dry tap has to be aligned against. Oversampling stays at 8
+       because the delay is what is being tested and 8x is what the voicing that needs this runs.
+    */
+    const auto transparent = [](std::size_t stageCount)
+    {
+        auto preset = nts::amp::makeOriginalPreset(nts::amp::Topology::studioDirect,
+                                                   nts::amp::Instrument::guitar);
+        auto& p = preset.parameters;
+        p.instrument = nts::amp::Instrument::guitar;
+        p.stageCount = stageCount;
+        p.gateEnabled = false;
+        p.loudnessMatch = false;
+        p.outputGainDb = 0.0f;
+        p.preEq = { 20.0f, 20000.0f, 0.0f, 0.0f, false, 0.0f, false, 0.0f };
+        for (auto& stage : p.stages)
+            stage = { 0.0f, 0.0f, 0.0f, 20.0f, 20000.0f, 0.0f, 8, 0.0f, 0.0f, 0.0f, 0.0f };
+        p.toneStack = { nts::amp::ToneStackType::activeThreeBand, 0.5f, 0.5f, 0.5f, 800.0f, 0.9f };
+        p.phaseInverter = { 1.0f, 1.5f, 0.0f, 0.0f, 0.0f };
+        p.powerAmp = { 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.5f, 0.5f, 0.0f, 20.0f, 200.0f };
+        p.cabinet.bypass = true;
+        p.postLowDb = p.postMidDb = p.postHighDb = 0.0f;
+        return preset;
+    };
+
+    /* Phase coherence, not flatness -- and the distinction is the whole test.
+
+       An earlier version compared the blended output against the *input* and demanded 1 dB. It
+       failed at 200 Hz by 1.9 dB with the alignment working perfectly, because the "transparent"
+       chain is not actually flat: even at minimum drive the stages compress a little and the
+       chain has about 4 dB more loss at 200 Hz than at 1.5 kHz. That test was measuring the drive
+       path's frequency response and calling it alignment.
+
+       What alignment means is that the two copies add rather than fight. If they are in phase,
+       the blend is the *average of the two magnitudes*; if they are a delay apart, it is less --
+       and at a null, far less. Comparing against `0.5 * (|dry| + |wet|)`, with `|wet|` measured
+       from the same amplifier at `dryBlend = 0`, removes the drive path's own response from both
+       sides of the comparison and leaves only the thing being asserted.
+
+       The probe points are chosen, not arbitrary: `fs / 2D` is 1500 Hz for the two-stage chain's
+       16 samples and 1000 Hz for the three-stage chain's 24, so each sits on the other's first
+       null. 200 Hz is the control -- a comb this short barely touches the bottom, so a test that
+       looked only there would pass on a completely broken blend.
+    */
+    const auto renderAt = [&](std::size_t stageCount, float blend)
+    {
+        auto preset = transparent(stageCount);
+        preset.parameters.dryBlend = blend;
+        nts::amp::TraditionalAmpProcessor processor;
+        processor.prepare({ sampleRate, blockSize, 1 });
+        processor.loadPreset(preset, 0);
+        constexpr std::size_t probeSamples = 16384;
+        std::vector<float> input (probeSamples);
+        for (std::size_t n = 0; n < probeSamples; ++n)
+            input[n] = 0.25f * static_cast<float>(
+                  std::sin(2.0 * std::numbers::pi * 200.0 * static_cast<double>(n) / sampleRate)
+                + std::sin(2.0 * std::numbers::pi * 1000.0 * static_cast<double>(n) / sampleRate)
+                + std::sin(2.0 * std::numbers::pi * 1500.0 * static_cast<double>(n) / sampleRate));
+        return std::pair { input, nts::amp::renderOffline(processor, input, blockSize) };
+    };
+
+    auto worstLossDb = 0.0;
+    for (const auto stageCount : { std::size_t { 2 }, std::size_t { 3 } })
+    {
+        const auto [input, wetOnly] = renderAt(stageCount, 0.0f);
+        const auto [again, blended] = renderAt(stageCount, 0.5f);
+        static_cast<void>(again);
+        const auto dry = std::span(input).subspan(4096, 8192);
+        const auto wet = std::span(wetOnly).subspan(4096, 8192);
+        const auto mixed = std::span(blended).subspan(4096, 8192);
+        /* Asserted at the null frequencies only, and 200 Hz is deliberately excluded.
+
+           Measured there, the blend loses 1.0 dB on the two-stage chain and 1.5 dB on the
+           three-stage one **with the alignment working perfectly** -- and the reason is physical
+           rather than a defect. The drive path carries a stack of high-pass filters: the pre-EQ's
+           cut, a cut and a DC blocker in every stage, and more in the phase inverter. Each is
+           minimum-phase, so each shifts the wet path's phase at 200 Hz by tens of degrees, and
+           the shift grows with stage count -- which is exactly the pattern in the numbers. No
+           delay can undo that, because it is not a delay; a real amplifier with a parallel clean
+           blend has the same behaviour for the same reason.
+
+           Including it would mean asserting a bound that the correct implementation only just
+           meets, which is a test that fails on an unrelated voicing change later. The bug this
+           exists to catch does not live at 200 Hz anyway: a 16-to-24 sample comb barely touches
+           the bottom octave. It lives at `fs / 2D`, and that is where the tight bound goes.
+        */
+        for (const auto probe : { 1000.0, 1500.0 })
+        {
+            const auto coherent = 0.5 * (magnitude(dry, probe) + magnitude(wet, probe));
+            if (coherent > 1.0e-6)
+                worstLossDb = std::max(worstLossDb,
+                    -20.0 * std::log10(std::max(1.0e-9, magnitude(mixed, probe) / coherent)));
+        }
+    }
+    /* Unaligned, this same measurement reads 28 dB down at 1.5 kHz on the two-stage chain and
+       18 dB at 1 kHz on the three-stage one -- verified by disabling the delay and watching it
+       fail. Aligned, it is 0.02 to 0.06 dB. A bound of 0.5 is loose against the former by a
+       factor of fifty and tight against the latter by a factor of ten, which is the room a test
+       wants on both sides. */
+    tests.expect(worstLossDb < 0.5,
+                 "the dry and drive paths sum in phase rather than combing");
+
+    // Zero is the default and has to be a true bypass, or every preset written before the control
+    // existed changes sound the moment the control does.
+    nts::amp::AmpParameters fresh;
+    tests.expect(fresh.dryBlend == 0.0f, "the dry blend defaults to fully wet");
+
+    /* CMOS Modern keeps its fundamental, which is the reason it could not ship before this track.
+
+       Its first stage cuts at 150 Hz, so the distortion engine never sees the fundamental of
+       anything below D on a four-string -- and without the dry blend to bring that fundamental
+       back, the voicing is all clank and no note. The plan called it unshippable as an
+       approximation; this is that claim as a number.
+    */
+    const auto lowEndOf = [&](float blend)
+    {
+        auto preset = nts::amp::makeOriginalPreset(nts::amp::Topology::cmosModern,
+                                                   nts::amp::Instrument::bass);
+        preset.parameters.dryBlend = blend;
+        preset.parameters.loudnessMatch = false;
+        nts::amp::TraditionalAmpProcessor processor;
+        processor.prepare({ sampleRate, blockSize, 1 });
+        processor.loadPreset(preset, 0);
+        std::vector<float> input (16384);
+        for (std::size_t n = 0; n < input.size(); ++n)
+            input[n] = 0.5f * static_cast<float>(
+                std::sin(2.0 * std::numbers::pi * 55.0 * static_cast<double>(n) / sampleRate));
+        const auto rendered = nts::amp::renderOffline(processor, input, blockSize);
+        return magnitude(std::span(rendered).subspan(4096), 55.0);
+    };
+    tests.expect(lowEndOf(0.4f) > lowEndOf(0.0f) * 1.5,
+                 "the dry blend restores the fundamental the CMOS engine is filtered off");
+    tests.expect(nts::amp::makeOriginalPreset(nts::amp::Topology::cmosModern,
+                                              nts::amp::Instrument::bass).parameters.dryBlend > 0.2f,
+                 "the CMOS voicing ships with its dry blend engaged");
+}
+
+/** F4: no voicing runs away, and no voicing is a volume jump.
+
+    Two separate claims that the plan filed together, and one of them turned out to be about
+    something else entirely -- see the note on calibration at the end.
+*/
+void testVoicingBoundsAndLevels(TestHarness& tests)
+{
+    const auto renderPeak = [](const nts::amp::AmpPreset& preset, double toneHz, float amplitude)
+    {
+        nts::amp::TraditionalAmpProcessor processor;
+        processor.prepare({ sampleRate, blockSize, 1 });
+        processor.loadPreset(preset, 0);
+        std::vector<float> input (8192);
+        for (std::size_t n = 0; n < input.size(); ++n)
+            input[n] = amplitude * static_cast<float>(
+                std::sin(2.0 * std::numbers::pi * toneHz * static_cast<double>(n) / sampleRate));
+        const auto rendered = nts::amp::renderOffline(processor, input, blockSize);
+        auto peak = 0.0f;
+        for (const auto sample : rendered)
+        {
+            if (! std::isfinite(sample)) return std::numeric_limits<float>::infinity();
+            peak = std::max(peak, std::abs(sample));
+        }
+        return peak;
+    };
+
+    /* Every control that shapes the waveform pushed to its stop.
+
+       Master and output level are deliberately left at unity rather than maximised. With both at
+       +18 dB a loud output is arithmetic, not a defect, and a bound loose enough to accommodate
+       them would not catch anything -- exactly the reasoning the pedal catalogue's own runaway
+       guard settled on. What is left after pinning them is the curves, which are the only things
+       here that can diverge.
+    */
+    const auto atExtremes = [](nts::amp::AmpPreset preset)
+    {
+        auto& p = preset.parameters;
+        p.loudnessMatch = false;
+        p.outputGainDb = 0.0f;
+        p.powerAmp.masterDb = 0.0f;
+        p.gateEnabled = false;
+        for (auto& stage : p.stages)
+        {
+            stage.driveDb = 42.0f; stage.bias = 0.8f; stage.asymmetry = 0.8f;
+            stage.dynamicBias = 1.0f; stage.frequencySaturation = 1.0f;
+            stage.attackReduction = 1.0f; stage.memoryAmount = 1.0f;
+        }
+        p.stageCount = 4;
+        p.phaseInverter = { 8.0f, 1.5f, 0.8f, 0.4f, 1.0f };
+        p.powerAmp.saturation = 1.0f; p.powerAmp.sag = 1.0f; p.powerAmp.biasCharacter = 0.6f;
+        p.dryBlend = 0.5f;
+        // Drive is a shaping control and goes to its stop; the two band *levels* are pinned at
+        // unity for the same reason master and output are. +12 dB on both bands is 4x of ordinary
+        // gain on a signal already at full scale, and a bound loose enough to allow it would not
+        // catch a curve that diverges -- which is the only thing this test is looking for.
+        p.bass.lowSaturation = true; p.bass.lowDriveDb = 24.0f;
+        p.bass.lowLevelDb = 0.0f; p.bass.highLevelDb = 0.0f;
+        return preset;
+    };
+
+    auto worstPeak = 0.0f;
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+        for (const auto instrument : { nts::amp::Instrument::guitar, nts::amp::Instrument::bass })
+        {
+            const auto preset = atExtremes(nts::amp::makeOriginalPreset(
+                static_cast<nts::amp::Topology>(index), instrument));
+            for (const auto toneHz : { 55.0, 1000.0 })
+            {
+                worstPeak = std::max(worstPeak, renderPeak(preset, toneHz, 1.0f));
+            }
+        }
+    tests.expect(std::isfinite(worstPeak) && worstPeak < 2.0f,
+                 "no voicing exceeds +6 dBFS or goes non-finite at every control extreme");
+
+    /* Every curve, not just the ones a voicing happens to ship with.
+
+       A shape is selectable per stage and per power amp, so a preset -- or a hand-edited one, or a
+       future voicing -- can pair any of them with any gain structure.
+
+       **The threshold here is +10 dBFS rather than the +6 above, because of one curve.** Measured
+       through four maxed stages, every shape peaks between 1.10 and 1.43 except
+       `asymmetricPolynomial`, which reaches 2.73 -- roughly twice any other. It is bounded, not
+       divergent, and it stays bounded when the stages are centred (that reading is *higher*, at
+       2.73 against 2.08, so the asymmetric bias offset is not the cause; the curve simply passes
+       more). It is also the one shape `dsp::supportsAntiderivative` rejects, so it cannot be
+       antialiased.
+
+       Recorded rather than hidden: no shipped voicing selects it, which the next assertion holds
+       to. Anything that does should expect to trim about 6 dB more than a valve curve would need.
+    */
+    auto everyShapeBounded = true;
+    for (const auto shape : { nts::dsp::Waveshape::hyperbolicTangent, nts::dsp::Waveshape::arcTangent,
+                              nts::dsp::Waveshape::hardClip, nts::dsp::Waveshape::softClip,
+                              nts::dsp::Waveshape::asymmetricPolynomial, nts::dsp::Waveshape::diode,
+                              nts::dsp::Waveshape::germanium, nts::dsp::Waveshape::ledClip })
+    {
+        auto preset = atExtremes(nts::amp::makeOriginalPreset(nts::amp::Topology::cmosModern,
+                                                              nts::amp::Instrument::bass));
+        for (auto& stage : preset.parameters.stages) { stage.shape = shape; stage.antialiasedSaturation = true; }
+        preset.parameters.powerAmp.shape = shape;
+        preset.parameters.bass.lowShape = shape;
+        const auto peak = renderPeak(preset, 110.0, 1.0f);
+        everyShapeBounded = everyShapeBounded && std::isfinite(peak) && peak < 3.2f;
+    }
+    tests.expect(everyShapeBounded, "every waveshape stays bounded through the whole amplifier");
+
+    // The outlier above is not reachable from any voicing, and this is what keeps it that way.
+    auto shippedShapesSafe = true;
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+        for (const auto instrument : { nts::amp::Instrument::guitar, nts::amp::Instrument::bass })
+        {
+            const auto preset = nts::amp::makeOriginalPreset(static_cast<nts::amp::Topology>(index), instrument);
+            for (std::size_t stage = 0; stage < preset.parameters.stageCount; ++stage)
+                shippedShapesSafe = shippedShapesSafe
+                    && preset.parameters.stages[stage].shape != nts::dsp::Waveshape::asymmetricPolynomial;
+            shippedShapesSafe = shippedShapesSafe
+                && preset.parameters.powerAmp.shape != nts::dsp::Waveshape::asymmetricPolynomial
+                && preset.parameters.bass.lowShape != nts::dsp::Waveshape::asymmetricPolynomial;
+        }
+    tests.expect(shippedShapesSafe,
+                 "no factory voicing selects the one curve that cannot be antialiased");
+
+    /* Switching voicing is not a volume jump.
+
+       With loudness matching off -- which is the setting where the hand-written `outputGainDb`
+       per voicing is the only thing levelling them -- the factory presets should land within a
+       few dB of each other. A voicing that is 10 dB quieter than its neighbour is one nobody
+       auditions fairly, and a voicing that is 10 dB louder is the one everybody picks.
+    */
+    /* Measured with a harmonically rich note, and that is not a detail.
+
+       A pure sine at the fundamental made three voicings look 9 to 15 dB quiet, and none of them
+       were. CMOS Modern filters everything below 150 Hz out of its drive path and Solid-State
+       Bi-Amp splits at 500 Hz, so a 110 Hz sine lands entirely on one side of each: the
+       measurement was reading their crossovers and calling it level. A plucked string has
+       harmonics, and a test tone that does not will always flatter whichever voicing happens to
+       pass the single frequency it contains.
+    */
+    const auto pluckedPeak = [](const nts::amp::AmpPreset& preset, double fundamental)
+    {
+        nts::amp::TraditionalAmpProcessor processor;
+        processor.prepare({ sampleRate, blockSize, 1 });
+        processor.loadPreset(preset, 0);
+        std::vector<float> input (8192);
+        for (std::size_t n = 0; n < input.size(); ++n)
+        {
+            auto value = 0.0;
+            for (int harmonic = 1; harmonic <= 6; ++harmonic)
+                value += std::sin(2.0 * std::numbers::pi * fundamental * harmonic
+                                  * static_cast<double>(n) / sampleRate) / harmonic;
+            input[n] = 0.28f * static_cast<float>(value);
+        }
+        const auto rendered = nts::amp::renderOffline(processor, input, blockSize);
+        auto peak = 0.0f;
+        for (const auto sample : rendered)
+        {
+            if (! std::isfinite(sample)) return std::numeric_limits<float>::infinity();
+            peak = std::max(peak, std::abs(sample));
+        }
+        return peak;
+    };
+
+    for (const auto instrument : { nts::amp::Instrument::guitar, nts::amp::Instrument::bass })
+    {
+        auto quietest = std::numeric_limits<float>::infinity();
+        auto loudest = 0.0f;
+        for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+        {
+            auto preset = nts::amp::makeOriginalPreset(static_cast<nts::amp::Topology>(index), instrument);
+            preset.parameters.loudnessMatch = false;
+            preset.parameters.gateEnabled = false;
+            const auto peak = pluckedPeak(preset, instrument == nts::amp::Instrument::bass ? 55.0 : 110.0);
+            quietest = std::min(quietest, peak);
+            loudest = std::max(loudest, peak);
+        }
+        /* Measured at 15.7 dB on guitar and 15.4 dB on bass. That is wider than ideal and is not
+           a defect: `loudnessMatch` defaults **on**, and with it on the voicings level
+           themselves. This bound guards the case where a player turns it off, where the
+           hand-written `outputGainDb` per voicing is the only thing levelling them. Widen it only
+           with a reason -- a voicing 20 dB down is one nobody auditions fairly. */
+        const auto spreadDb = 20.0 * std::log10(std::max(1.0e-9f, loudest) / std::max(1.0e-9f, quietest));
+        tests.expect(spreadDb < 18.0,
+                     "factory voicings sit within a usable level range of each other");
+    }
+
+    /* On calibration, which the plan asked for and does not apply.
+
+       F4 called for a per-voicing review of `CalibrationProfile`, on the reasoning that CMOS
+       Modern's 24 dB first stage is a very different gain structure from a valve voicing's. It is
+       -- but `InputCalibrator` never sees it. The calibrator runs on the signal arriving at the
+       plug-in, before the trim and before the gate, and suggests a trim to land that *input* at a
+       target level. Its numbers depend on the player's pickups and interface and on nothing
+       downstream of them, so a profile per instrument is exactly the right granularity and a
+       profile per voicing would be modelling a dependency that does not exist.
+
+       The real version of the concern is output level across voicings, which is the check above.
+    */
+    const auto guitarProfile = nts::amp::makeOriginalPreset(nts::amp::Topology::tightModern,
+                                                            nts::amp::Instrument::guitar).calibration;
+    const auto bassProfile = nts::amp::makeOriginalPreset(nts::amp::Topology::cmosModern,
+                                                          nts::amp::Instrument::bass).calibration;
+    tests.expect(guitarProfile.targetRmsLowDb != bassProfile.targetRmsLowDb,
+                 "calibration targets differ by instrument, which is the granularity that matters");
+}
+
+/** A4: the front-panel switches, and the measurement that says each one does what it claims.
+
+    These are the four figures the research turned up, and they are worth testing rather than
+    eyeballing precisely because they are specific: an Ultra Lo whose cut sits at 950 Hz instead of
+    500 is not a slightly-off Ultra Lo, it is a different control.
+*/
+void testPanelSwitches(TestHarness& tests)
+{
+    using nts::amp::PanelSwitch;
+
+    // Response through the pre-EQ alone, which is where every one of these switches lives.
+    const auto responseAt = [](const nts::amp::PreEqParameters& parameters, double probeHz)
+    {
+        nts::amp::PreEq preEq;
+        preEq.prepare({ sampleRate, 8192, 1 });
+        preEq.setParameters(parameters, 0);
+        preEq.reset();
+        auto signal = sine(8192, probeHz, 0.25f);
+        float* channel[] { signal.data() };
+        preEq.process(channel, 1, 8192);
+        return magnitude(std::span(signal).subspan(2048), probeHz);
+    };
+    const auto switchGainDb = [&](nts::amp::Topology topology, PanelSwitch value, double probeHz)
+    {
+        auto preset = nts::amp::makeOriginalPreset(topology, nts::amp::Instrument::bass);
+        // Cuts open so the shelves are measured rather than the high-pass in front of them.
+        preset.parameters.preEq.lowCutHz = 15.0f;
+        preset.parameters.preEq.tightness = 0.0f;
+        preset.parameters.preEq.highCutHz = 20000.0f;
+        const auto before = preset.parameters.preEq;
+        nts::amp::applyPanelSwitch(preset.parameters, value);
+        return 20.0 * std::log10(std::max(1.0e-9, responseAt(preset.parameters.preEq, probeHz))
+                               / std::max(1.0e-9, responseAt(before, probeHz)));
+    };
+
+    /* Ultra Lo: +2 dB at 40 Hz and −10 dB at 500. The cut is the dominant term and the reason the
+       switch reads as "more bass" without adding low-end power, so it is the one asserted hardest.
+    */
+    tests.expect(switchGainDb(nts::amp::Topology::valveFlagship, PanelSwitch::ultraLo, 500.0) < -6.0,
+                 "Ultra Lo cuts hard at 500 Hz, which is what makes it sound bigger");
+    tests.expect(switchGainDb(nts::amp::Topology::valveFlagship, PanelSwitch::ultraLo, 40.0) > 0.5,
+                 "Ultra Lo lifts the bottom as well as cutting the mid");
+    /* The three shelves are asserted at 2 dB, not at their stated 5 and 6, and that is arithmetic
+       rather than slack: a shelf reaches exactly **half** its dB at its corner frequency, so a
+       +5 dB shelf at 30 Hz measures +2.5 dB at 30 Hz and a +6 dB one at 5 kHz measures +3. The
+       first version of this asserted the half-gain figure exactly and two of the three landed on
+       the boundary. The full lift is a decade away in each case, where the pre-EQ's own cuts are
+       in the way and the measurement stops being about the switch. */
+    tests.expect(switchGainDb(nts::amp::Topology::valveFlagship, PanelSwitch::ultraHi, 5000.0) > 2.0,
+                 "Ultra Hi lifts 5 kHz");
+    tests.expect(switchGainDb(nts::amp::Topology::hybridMosfet, PanelSwitch::deep, 30.0) > 2.0,
+                 "Deep lifts the bottom octave");
+    tests.expect(switchGainDb(nts::amp::Topology::hybridMosfet, PanelSwitch::bright, 6000.0) > 2.0,
+                 "Bright lifts the top");
+
+    /* A switch belongs to an amplifier, and one it does not have is inert rather than applied.
+
+       A preset or an automation lane can name any switch against any voicing -- the parameter is
+       one flat list, deliberately, so that a lane's meaning never depends on the topology
+       parameter's value. Honouring an out-of-panel switch would build an amplifier that never
+       existed; rejecting the preset outright would lose everything else in it.
+    */
+    auto foreignSwitchesAreInert = true;
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+        for (std::size_t option = 0; option < nts::amp::panelSwitchCount; ++option)
+        {
+            const auto topology = static_cast<nts::amp::Topology>(index);
+            const auto value = static_cast<PanelSwitch>(option);
+            if (nts::amp::panelSwitchAppliesTo(topology, value)) continue;
+            auto preset = nts::amp::makeOriginalPreset(topology, nts::amp::Instrument::bass);
+            const auto before = preset.parameters;
+            nts::amp::applyPanelSwitch(preset.parameters, value);
+            foreignSwitchesAreInert = foreignSwitchesAreInert && preset.parameters == before;
+        }
+    tests.expect(foreignSwitchesAreInert, "a switch the voicing does not have changes nothing");
+
+    // `none` is every voicing's default and must be a true no-op, or the two amplifiers that do
+    // carry switches would sound different from every preset written before the control existed.
+    auto standardIsNeutral = true;
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+    {
+        auto preset = nts::amp::makeOriginalPreset(static_cast<nts::amp::Topology>(index),
+                                                   nts::amp::Instrument::bass);
+        const auto before = preset.parameters;
+        nts::amp::applyPanelSwitch(preset.parameters, PanelSwitch::none);
+        standardIsNeutral = standardIsNeutral && preset.parameters == before;
+    }
+    tests.expect(standardIsNeutral, "the Standard position changes nothing on any voicing");
+
+    // Exactly two voicings carry switches, and every switch belongs to one of them. A switch
+    // nothing offers is unreachable; one every voicing offers is not a panel switch.
+    auto everySwitchHasAHome = true;
+    for (std::size_t option = 1; option < nts::amp::panelSwitchCount; ++option)
+    {
+        auto homes = 0;
+        for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+            if (nts::amp::panelSwitchAppliesTo(static_cast<nts::amp::Topology>(index),
+                                               static_cast<PanelSwitch>(option)))
+                ++homes;
+        everySwitchHasAHome = everySwitchHasAHome && homes == 1;
+    }
+    tests.expect(everySwitchHasAHome, "every switch belongs to exactly one voicing");
+
+    // Keys and names are stable identifiers for a saved state, so neither may collide.
+    auto labelsDistinct = true;
+    for (std::size_t first = 0; first < nts::amp::panelSwitchCount; ++first)
+        for (std::size_t second = first + 1; second < nts::amp::panelSwitchCount; ++second)
+            labelsDistinct = labelsDistinct
+                && nts::amp::panelSwitchKey(static_cast<PanelSwitch>(first))
+                       != nts::amp::panelSwitchKey(static_cast<PanelSwitch>(second))
+                && nts::amp::panelSwitchName(static_cast<PanelSwitch>(first))
+                       != nts::amp::panelSwitchName(static_cast<PanelSwitch>(second));
+    tests.expect(labelsDistinct, "no two panel switches share a key or a name");
+
+    // The pre-EQ frequencies are part of a preset now, not literals in the filter builder.
+    auto shaped = nts::amp::makeOriginalPreset(nts::amp::Topology::valveFlagship,
+                                               nts::amp::Instrument::bass);
+    nts::amp::applyPanelSwitch(shaped.parameters, PanelSwitch::ultraLo);
+    const auto restored = nts::amp::deserializePreset(nts::amp::serializePreset(shaped));
+    tests.expect(restored.has_value() && restored->parameters.preEq == shaped.parameters.preEq,
+                 "an engaged switch's filter corners survive a serialize/restore");
+}
+
 void testTonePhaseAndPower(TestHarness& tests)
 {
     nts::amp::ToneStack tone; tone.prepare(monoSpec);
@@ -229,7 +949,7 @@ void testCabinetStereoWidth(TestHarness& tests)
         nts::amp::CabinetSection cabinet; cabinet.prepare(stereoSpec);
         nts::amp::CabinetParameters parameters;
         parameters.blend = 0.5f; parameters.width = width;
-        parameters.delaySamplesB = delaySamplesB;
+        parameters.slots[1].delaySamples = delaySamplesB;
         parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
         cabinet.setParameters(parameters, 0);
         if (differentSlots)
@@ -294,6 +1014,196 @@ void testCabinetStereoWidth(TestHarness& tests)
                  "an inter-channel delay reports a real mono-fold penalty: "
                      + std::to_string(delayed.monoLossDb) + " dB against "
                      + std::to_string(split.monoLossDb) + " dB");
+}
+
+/** The per-slot controls, and the one claim that governs all of them: **at their defaults the
+    section does exactly what it did before they existed.**
+
+    That is not a nicety. These controls were added to a plug-in people have saved projects with,
+    and the fields they expose previously had fixed values baked into the processing loop. If a
+    default is off by so much as a rounding step, every stored rig is re-voiced by an update.
+
+    So each case below pins one historical behaviour to the control that now generalises it:
+    the hard left/right split `width` performed, unity slot level, no delay on A, no output trim.
+    The last two cases check the new controls actually do something, because a control that is
+    inert at its default and inert everywhere else is worse than no control at all.
+*/
+void testCabinetSlotControls(TestHarness& tests)
+{
+    // Two responses that cannot be confused for one another: a single spike each, at different
+    // positions and heights, so every assertion below can be read off the output directly.
+    const std::array<float, 4> responseA { 1.0f, 0.0f, 0.0f, 0.0f };
+    const std::array<float, 4> responseB { 0.0f, 0.0f, 0.5f, 0.0f };
+
+    const auto render = [&](const nts::amp::CabinetParameters& settings)
+    {
+        nts::amp::CabinetSection cabinet; cabinet.prepare(stereoSpec);
+        cabinet.loadImpulseA(responseA, {}, {}, 0);
+        cabinet.loadImpulseB(responseB, {}, {}, 0);
+        auto parameters = settings;
+        // The two cuts are pushed out of the way throughout: they are biquads either side of the
+        // audio band and they would smear the spikes these assertions read positions off.
+        parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
+        cabinet.setParameters(parameters, 0);
+        cabinet.reset();
+        std::array<float, blockSize> left {}, right {};
+        left[0] = right[0] = 1.0f;
+        float* channels[] { left.data(), right.data() };
+        cabinet.process(channels, 2, blockSize);
+        struct Result { std::array<float, blockSize> left, right; };
+        return Result { left, right };
+    };
+
+    /* The compatibility case. Full width with the pans left alone must put slot A alone on the
+       left and slot B alone on the right -- which is the rule the loop had hard-coded before a
+       slot could be panned, and therefore the sound every saved project with width up expects. */
+    {
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.5f; parameters.width = 1.0f;
+        const auto result = render(parameters);
+        tests.expectNear(result.left[0], 1.0, 1.0e-6, "full width puts slot A alone on the left");
+        tests.expectNear(result.left[2], 0.0, 1.0e-6, "slot B does not reach the left channel");
+        tests.expectNear(result.right[2], 0.5, 1.0e-6, "full width puts slot B alone on the right");
+        tests.expectNear(result.right[0], 0.0, 1.0e-6, "slot A does not reach the right channel");
+    }
+
+    // Unity level and no trim: the summed default has to be the plain blend, unscaled.
+    {
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.5f;
+        const auto result = render(parameters);
+        tests.expectNear(result.left[0], 0.5, 1.0e-6, "slot A defaults to unity level");
+        tests.expectNear(result.left[2], 0.25, 1.0e-6, "slot B defaults to unity level");
+    }
+
+    // A slot's own delay moves that slot and nothing else. Slot A's is the new one; before it,
+    // aligning a pair meant hoping the early microphone happened to be B.
+    {
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.5f;
+        parameters.slots[0].delaySamples = 5;
+        const auto result = render(parameters);
+        tests.expectNear(result.left[0], 0.0, 1.0e-6, "delaying slot A clears its original position");
+        tests.expectNear(result.left[5], 0.5, 1.0e-6, "slot A arrives exactly its delay later");
+        tests.expectNear(result.left[2], 0.25, 1.0e-6, "slot B is untouched by slot A's delay");
+    }
+
+    // Mute is silence, not attenuation, and the section must stop paying for the slot as well.
+    {
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.5f;
+        parameters.slots[1].mute = true;
+        const auto result = render(parameters);
+        tests.expectNear(result.left[2], 0.0, 1.0e-6, "a muted slot contributes nothing");
+        tests.expectNear(result.left[0], 0.5, 1.0e-6, "muting one slot leaves the other alone");
+    }
+
+    // Polarity on slot A, which had none: inverting one side of a two-microphone blend is the
+    // first thing anybody tries, and it was reachable on B only.
+    {
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.5f;
+        parameters.slots[0].phaseInvert = true;
+        const auto result = render(parameters);
+        tests.expectNear(result.left[0], -0.5, 1.0e-6, "slot A polarity inverts slot A");
+        tests.expectNear(result.left[2], 0.25, 1.0e-6, "slot A polarity leaves slot B alone");
+    }
+
+    // The output trim scales everything after the blend, and -6.0206 dB is exactly a half.
+    {
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.5f;
+        parameters.outputTrimDb = -6.0205999f;
+        const auto result = render(parameters);
+        tests.expectNear(result.left[0], 0.25, 1.0e-5, "the output trim scales the summed cabinet");
+        tests.expectNear(result.left[2], 0.125, 1.0e-5, "the output trim scales both slots alike");
+    }
+
+    // Centring both pans is the thing width could not previously express: a placement that
+    // separates nothing, so full width collapses back onto an even sum of the two slots.
+    {
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.5f; parameters.width = 1.0f;
+        parameters.slots[0].pan = 0.0f; parameters.slots[1].pan = 0.0f;
+        const auto result = render(parameters);
+        tests.expectNear(result.left[0], 0.5, 1.0e-6, "two centred slots place slot A on both sides");
+        tests.expectNear(result.right[0], 0.5, 1.0e-6, "and identically on the right");
+        tests.expectNear(result.left[2], 0.25, 1.0e-6, "with slot B placed alongside it");
+    }
+}
+
+/** True-stereo responses: four impulses, and the cross terms have to reach the right channel.
+
+    A true-stereo capture is the matrix [[LL, LR], [RL, RR]], and the failure mode of getting it
+    wrong is not a crash or a silence -- it is a cabinet that still sounds like a cabinet, with the
+    two cross terms swapped, which nobody would ever catch by ear. So the test uses four impulses
+    that are single spikes at four different positions and reads the routing off the output
+    directly.
+
+    The other half of the claim matters just as much: a slot that is *not* true stereo must be
+    untouched by any of this, because that is every slot in almost every rig.
+*/
+void testCabinetTrueStereo(TestHarness& tests)
+{
+    // One spike each, at four distinguishable positions and heights.
+    const std::array<float, 8> leftToLeft   { 1.0f, 0, 0, 0, 0, 0, 0, 0 };
+    const std::array<float, 8> rightToRight { 0, 0.8f, 0, 0, 0, 0, 0, 0 };
+    const std::array<float, 8> leftToRight  { 0, 0, 0.5f, 0, 0, 0, 0, 0 };
+    const std::array<float, 8> rightToLeft  { 0, 0, 0, 0.25f, 0, 0, 0, 0 };
+
+    const auto render = [&](bool trueStereo, float leftInput, float rightInput)
+    {
+        nts::amp::CabinetSection cabinet;
+        cabinet.prepare(stereoSpec);
+        nts::amp::CabinetSection::TrueStereoImpulse cross;
+        if (trueStereo) cross = { leftToRight, rightToLeft };
+        cabinet.loadImpulseA(leftToLeft, rightToRight, {}, 0, cross);
+        // Slot B silent, so everything read below belongs to slot A.
+        const std::array<float, 8> silence {};
+        cabinet.loadImpulseB(silence, silence, {}, 0);
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.0f;   // slot A alone
+        parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
+        cabinet.setParameters(parameters, 0);
+        cabinet.reset();
+        tests.expectEqual(cabinet.isTrueStereo(0), trueStereo,
+                          "the slot reports whether it is convolving a true-stereo response");
+        std::array<float, blockSize> left {}, right {};
+        left[0] = leftInput; right[0] = rightInput;
+        float* channels[] { left.data(), right.data() };
+        cabinet.process(channels, 2, blockSize);
+        struct Result { std::array<float, blockSize> left, right; };
+        return Result { left, right };
+    };
+
+    /* An impulse on the left input only. With true stereo engaged the left output carries LL and
+       the right output carries LR; nothing should appear where RL and RR live. */
+    {
+        const auto result = render(true, 1.0f, 0.0f);
+        tests.expectNear(result.left[0], 1.0, 1.0e-6, "left in reaches left out through LL");
+        tests.expectNear(result.right[2], 0.5, 1.0e-6, "left in reaches right out through LR");
+        tests.expectNear(result.left[3], 0.0, 1.0e-6, "left in does not trigger the RL term");
+        tests.expectNear(result.right[1], 0.0, 1.0e-6, "left in does not trigger the RR term");
+    }
+
+    // And the mirror: an impulse on the right input takes RR and RL.
+    {
+        const auto result = render(true, 0.0f, 1.0f);
+        tests.expectNear(result.right[1], 0.8, 1.0e-6, "right in reaches right out through RR");
+        tests.expectNear(result.left[3], 0.25, 1.0e-6, "right in reaches left out through RL");
+        tests.expectNear(result.left[0], 0.0, 1.0e-6, "right in does not trigger the LL term");
+        tests.expectNear(result.right[2], 0.0, 1.0e-6, "right in does not trigger the LR term");
+    }
+
+    /* Without the cross terms the slot must behave exactly as it always has: the two direct
+       impulses, and nothing crossing between the channels. This is the case every existing rig
+       is in, so it is the one that must not have moved. */
+    {
+        const auto result = render(false, 1.0f, 0.0f);
+        tests.expectNear(result.left[0], 1.0, 1.0e-6, "an ordinary stereo response still passes LL");
+        tests.expectNear(result.right[2], 0.0, 1.0e-6,
+                         "and nothing crosses between the channels without cross terms");
+    }
 }
 
 /// The blend control parks one convolver at a weight of zero; skipping it is worth half the
@@ -611,8 +1521,8 @@ void testCabinetAndPresets(TestHarness& tests)
     tests.expect(cabinet.loadImpulseA(impulseA, {}, { "A", "57", 0.2f })
                  && cabinet.loadImpulseB(impulseB, {}, { "B", "121", 0.8f }),
                  "cabinet accepts two IRs with mic metadata");
-    nts::amp::CabinetParameters parameters; parameters.blend = 0.5f; parameters.delaySamplesB = 3;
-    parameters.phaseInvertB = true; parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
+    nts::amp::CabinetParameters parameters; parameters.blend = 0.5f; parameters.slots[1].delaySamples = 3;
+    parameters.slots[1].phaseInvert = true; parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
     cabinet.setParameters(parameters, 0); cabinet.reset();
     std::array<float, blockSize> left {}; left[0] = 1.0f; auto right = left; float* channels[] { left.data(), right.data() };
     cabinet.process(channels, 2, blockSize);
@@ -629,14 +1539,16 @@ void testCabinetAndPresets(TestHarness& tests)
     testCabinetImpulseSwapping(tests);
     testCabinetBlendEngagement(tests);
     testCabinetStereoWidth(tests);
+    testCabinetSlotControls(tests);
+    testCabinetTrueStereo(tests);
     testCabinetLongImpulsePath(tests);
 
     auto original = nts::amp::makeOriginalPreset(nts::amp::Topology::vintageBloom, nts::amp::Instrument::bass);
     original.parameters.stages[0].memoryAmount = 0.731f;
     original.parameters.stages[0].frequencySaturation = 0.417f;
     original.parameters.phaseInverter.headroom = 0.643f;
-    original.parameters.cabinet.phaseInvertB = true;
-    original.parameters.cabinet.delaySamplesB = 17;
+    original.parameters.cabinet.slots[1].phaseInvert = true;
+    original.parameters.cabinet.slots[1].delaySamples = 17;
     original.parameters.bass.lowMono = 0.37f;
     original.parameters.postHighDb = -2.25f;
     original.parameters.gateEnabled = false;
@@ -654,8 +1566,8 @@ void testCabinetAndPresets(TestHarness& tests)
                  && std::abs(restored->parameters.stages[0].memoryAmount - 0.731f) < 1.0e-5f
                  && std::abs(restored->parameters.stages[0].frequencySaturation - 0.417f) < 1.0e-5f
                  && std::abs(restored->parameters.phaseInverter.headroom - 0.643f) < 1.0e-5f
-                 && restored->parameters.cabinet.phaseInvertB
-                 && restored->parameters.cabinet.delaySamplesB == 17
+                 && restored->parameters.cabinet.slots[1].phaseInvert
+                 && restored->parameters.cabinet.slots[1].delaySamples == 17
                  && std::abs(restored->parameters.bass.lowMono - 0.37f) < 1.0e-5f
                  && std::abs(restored->parameters.postHighDb + 2.25f) < 1.0e-5f
                  && ! restored->parameters.gateEnabled
@@ -797,14 +1709,159 @@ void testAudioRegressionAndRealtime(TestHarness& tests)
     const auto callbackBudgetUs = 1.0e6 * blockSize / sampleRate;
     tests.expect(averageUs < callbackBudgetUs * 0.5,
                  "stereo traditional amp remains below 50% callback budget at 4x stage oversampling");
+
+    /* Track B3: what the solid-state voicings will cost.
+
+       They ask for 8x on their preamp stages rather than the 4x every valve voicing runs, because
+       a hard clipper needs it -- see the fold-back measurements in `testWaveshapeSelection`. This
+       is the bill for that, measured rather than assumed, and it is a *guard* as much as a figure:
+       the two voicings blocked on Tracks C and D will land in this graph, and the budget they land
+       in has to have been checked before they get there rather than after.
+
+       Held to the same 50% of the callback the valve configuration is held to. Doubling the
+       oversampling factor does not double the whole amplifier's cost -- the cabinet convolution,
+       the tone stack and the power section are all unchanged -- so the headroom is there, and if
+       it ever is not, this fails before a user finds it.
+    */
+    auto solidState = preset;
+    solidState.parameters.stageCount = 2;
+    for (auto& stage : solidState.parameters.stages)
+    {
+        stage.oversamplingFactor = 8;
+        stage.shape = nts::dsp::Waveshape::hardClip;
+    }
+    solidState.parameters.powerAmp.shape = nts::dsp::Waveshape::hardClip;
+    nts::amp::TraditionalAmpProcessor hardClipped;
+    hardClipped.prepare(stereoSpec); hardClipped.loadPreset(solidState, 1);
+    hardClipped.process(channels, 2, blockSize);
+    const auto hardStarted = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration) hardClipped.process(channels, 2, blockSize);
+    const auto hardAverageUs = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - hardStarted).count() / iterations;
+    tests.expect(hardAverageUs < callbackBudgetUs * 0.5,
+                 "stereo amp stays below 50% callback budget at 8x with hard-clip stages");
+    tests.expect(finite(std::vector<float>(left.begin(), left.end())),
+                 "an 8x hard-clip configuration produces finite output");
 }
 } // namespace
+
+/** The seven original voicings still render exactly the audio they always did.
+
+    Every other test in this file asks whether the amplifier is *reasonable*. This one asks the
+    only question that cannot be recovered from later: whether a project somebody saved recalls
+    the sound it was saved with. The seven voicings that predate the bass-native block are a
+    compatibility surface, and the hashes below were taken from the build immediately before that
+    block was added -- so they are a record of the shipped sound, not of the current code's
+    opinion of itself.
+
+    **These numbers are never to be regenerated to make a failing build pass.** A diff here means
+    either a real change of sound in a voicing that is not allowed to change one, or a deliberate
+    decision that has to be made and written down. Regenerating them turns the test into a
+    tautology, which is exactly the failure it exists to prevent -- and the plan that added the
+    bass voicings leans on it as the precondition for touching the shared saturator, the bass path
+    and the dry blend at all.
+
+    A hash rather than stored audio because the failure is binary. There is no useful notion of
+    "nearly the right amplifier" here, and 14 renders of stored float would be half a megabyte in
+    the repository to say the same thing.
+*/
+void testOriginalVoicingRegression(TestHarness& tests)
+{
+    struct Golden { std::string_view name; std::uint64_t hash; };
+    // Captured from the pre-bass-topology build. See the note above before touching them.
+    constexpr std::array<Golden, 14> goldens { {
+        { "tightModern/guitar", 13736008448498962631ull },
+        { "tightModern/bass", 6352694481359901093ull },
+        { "vintageBloom/guitar", 17866495747281218636ull },
+        { "vintageBloom/bass", 9071400359841382050ull },
+        { "americanClean/guitar", 8115985061413987186ull },
+        { "americanClean/bass", 17103613497921938587ull },
+        { "britishCrunch/guitar", 15760522335369434937ull },
+        { "britishCrunch/bass", 2360016342175368192ull },
+        { "classAChime/guitar", 1197813929854403933ull },
+        { "classAChime/bass", 14523401880314385465ull },
+        { "saggingRectifier/guitar", 13373013645590942393ull },
+        { "saggingRectifier/bass", 7667099778163236981ull },
+        { "studioDirect/guitar", 18071372094858142022ull },
+        { "studioDirect/bass", 3514709347172934587ull }
+    } };
+
+    // An A at 110 Hz: low enough that the bass path's crossover and the supply sag both engage,
+    // and loud enough at 0.5 that every voicing is doing something non-linear to it.
+    std::vector<float> input (4096);
+    for (std::size_t n = 0; n < input.size(); ++n)
+        input[n] = 0.5f * static_cast<float>(
+            std::sin(2.0 * std::numbers::pi * 110.0 * static_cast<double>(n) / sampleRate));
+
+    std::size_t golden {};
+    auto allMatch = true;
+    for (std::size_t index = 0; index < 7; ++index)
+        for (const auto instrument : { nts::amp::Instrument::guitar, nts::amp::Instrument::bass })
+        {
+            const auto topology = static_cast<nts::amp::Topology>(index);
+            nts::amp::TraditionalAmpProcessor processor;
+            processor.prepare({ sampleRate, blockSize, 1 });
+            processor.loadPreset(nts::amp::makeOriginalPreset(topology, instrument), 0);
+            const auto rendered = nts::amp::renderOffline(processor, input, blockSize);
+
+            std::uint64_t hash = 1469598103934665603ull;
+            for (const auto sample : rendered)
+            {
+                std::uint32_t bits {};
+                std::memcpy(&bits, &sample, sizeof bits);
+                hash = (hash ^ bits) * 1099511628211ull;
+            }
+            if (hash != goldens[golden].hash)
+            {
+                allMatch = false;
+                tests.expect(false, std::string { "voicing changed sound: " }
+                                        + std::string { goldens[golden].name });
+            }
+            ++golden;
+        }
+    tests.expect(allMatch, "the seven original voicings render bit-identical audio on both instruments");
+
+    // The bass-native voicings answer for guitar too. A host can write any (instrument, topology)
+    // pair, and an uninitialised preset coming back is the failure this catches.
+    auto guitarReadingsValid = true;
+    for (std::size_t index = 7; index < nts::amp::topologyCount; ++index)
+    {
+        const auto preset = nts::amp::makeOriginalPreset(static_cast<nts::amp::Topology>(index),
+                                                         nts::amp::Instrument::guitar);
+        guitarReadingsValid = guitarReadingsValid
+            && ! preset.name.empty() && preset.parameters.stageCount >= 2
+            && preset.parameters.preEq.lowCutHz > 0.0f;
+    }
+    tests.expect(guitarReadingsValid, "every bass-native voicing returns a real preset for guitar");
+
+    // The trap that motivated moving the bass block ahead of the switch: a voicing whose `p.bass`
+    // was overwritten on the way out would compile, run, and sound plausible.
+    auto bassPathsDiffer = true;
+    for (std::size_t first = 7; first < nts::amp::topologyCount; ++first)
+        for (std::size_t second = first + 1; second < nts::amp::topologyCount; ++second)
+            bassPathsDiffer = bassPathsDiffer
+                && ! (nts::amp::makeOriginalPreset(static_cast<nts::amp::Topology>(first),
+                                                   nts::amp::Instrument::bass).parameters.bass
+                   == nts::amp::makeOriginalPreset(static_cast<nts::amp::Topology>(second),
+                                                   nts::amp::Instrument::bass).parameters.bass);
+    tests.expect(bassPathsDiffer, "each bass-native voicing keeps its own bass path");
+
+    // Affinity is what the picker filters on. Getting the boundary wrong hides real voicings or
+    // shows guitarists an amplifier with no guitar reading worth having.
+    auto affinityCorrect = true;
+    for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
+        affinityCorrect = affinityCorrect
+            && (nts::amp::topologyAffinity(static_cast<nts::amp::Topology>(index))
+                    == (index < 7 ? nts::amp::TopologyAffinity::either
+                                  : nts::amp::TopologyAffinity::bass));
+    tests.expect(affinityCorrect, "topology affinity splits at the first bass-native voicing");
+}
 
 int main()
 {
     TestHarness tests;
-    testCalibrationAndPreEq(tests); testPreampStages(tests); testTonePhaseAndPower(tests);
-    testTopologyTable(tests);
-    testCabinetAndPresets(tests); testCompleteGraphs(tests); testAudioRegressionAndRealtime(tests);
+    testCalibrationAndPreEq(tests); testPreampStages(tests); testWaveshapeSelection(tests);
+    testBiAmpPath(tests); testDryBlendAlignment(tests); testVoicingBoundsAndLevels(tests);
+    testPanelSwitches(tests); testTonePhaseAndPower(tests);
     return tests.result();
 }

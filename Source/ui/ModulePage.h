@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../TubeForgeTheme.h"
+
 #include <juce_gui_basics/juce_gui_basics.h>
 
 class TubeForgeAudioProcessor;
@@ -58,9 +60,60 @@ public:
 
     [[nodiscard]] bool songMatchVeilShown() const noexcept { return veilShown; }
 
+    /** A standing note that Auto Match is holding the controls on this page.
+
+        Unlike the veil this dims nothing and covers nothing: it is a state the user chose and
+        may sit in for a whole session, so it has to be readable at a glance and invisible the
+        rest of the time. Empty text removes it.
+
+        Held controls are deliberately *not* recoloured -- in Auto Match almost every control on
+        a page is held, so tinting them all would repaint the page in one colour and say nothing.
+        What is worth marking is the exception, which is why `markAutoMatch` below colours the
+        controls the user has taken back rather than the ones the analyzer still owns.
+    */
+    void setAutoMatchBadge(juce::String text)
+    {
+        if (text == autoMatchBadge) return;
+        autoMatchBadge = std::move(text);
+        repaint();
+    }
+
+    /** Colours one control by whether Auto Match still holds it.
+
+        `released` is the only state that gets a colour of its own: it means the analyzer set
+        this control and the user then took it back, so it is no longer part of the matched rig
+        and will not be rewritten. Everything else -- held, or Auto Match off entirely -- keeps
+        the normal accent, because that is the ordinary appearance of a control.
+    */
+    static void markAutoMatch(juce::Slider& slider, bool released)
+    {
+        const auto colour = released ? tf::theme::good : tf::theme::accent;
+        slider.setColour(juce::Slider::rotarySliderFillColourId, colour);
+        slider.setColour(juce::Slider::trackColourId, colour);
+    }
+
     /// Drawn over the children so it dims the controls rather than sitting behind them.
     void paintOverChildren(juce::Graphics& graphics) override
     {
+        /* The Auto Match note, drawn first so the song-match veil covers it if both are up --
+           which they can be, because re-running a match while one is already held is normal.
+           A pill in the top-right corner: it is the one band of every page that carries no
+           control, so this never has to move anything to make room for itself. */
+        if (autoMatchBadge.isNotEmpty())
+        {
+            const auto font = tf::theme::font(9.5f, true);
+            const auto width = std::min(getWidth() - 24,
+                                        juce::GlyphArrangement::getStringWidthInt(font, autoMatchBadge) + 26);
+            const auto pill = juce::Rectangle<int>(getWidth() - width - 8, 2, width, 18);
+            graphics.setColour(tf::theme::accentWash);
+            graphics.fillRoundedRectangle(pill.toFloat(), 9.0f);
+            graphics.setColour(tf::theme::accent.withAlpha(0.45f));
+            graphics.drawRoundedRectangle(pill.toFloat().reduced(0.5f), 9.0f, 1.0f);
+            graphics.setColour(tf::theme::accent);
+            graphics.setFont(font);
+            graphics.drawText(autoMatchBadge, pill, juce::Justification::centred, false);
+        }
+
         if (! veilShown) return;
         const auto bounds = getLocalBounds();
         // Dimmed rather than opaque: the point is that the page is discouraged, not gone, and the
@@ -89,4 +142,5 @@ protected:
 private:
     bool veilShown {};
     juce::String veilReason;
+    juce::String autoMatchBadge;
 };

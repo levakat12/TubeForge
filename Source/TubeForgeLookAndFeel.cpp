@@ -27,6 +27,12 @@ TubeForgeLookAndFeel::TubeForgeLookAndFeel()
     setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
     setColour(juce::TextEditor::focusedOutlineColourId, juce::Colours::transparentBlack);
     setColour(juce::CaretComponent::caretColourId, theme::accent);
+    /* The slider fill is a colour id rather than a constant so a page can recolour one control
+       without a second look and feel. Auto Match is the caller that needs it: a control the
+       analyzer is holding and a control the user has taken back have to look different, and the
+       difference has to be on the control itself rather than in a legend somewhere. */
+    setColour(juce::Slider::rotarySliderFillColourId, theme::accent);
+    setColour(juce::Slider::trackColourId, theme::accent);
     setColour(juce::Slider::textBoxTextColourId, theme::textPrimary);
     setColour(juce::Slider::textBoxBackgroundColourId, juce::Colours::transparentBlack);
     setColour(juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
@@ -43,7 +49,7 @@ void TubeForgeLookAndFeel::drawRotarySlider(juce::Graphics& graphics, int x, int
                                             float sliderPosition, float rotaryStartAngle,
                                             float rotaryEndAngle, juce::Slider& slider)
 {
-    juce::ignoreUnused(slider);
+    const auto fill = slider.findColour(juce::Slider::rotarySliderFillColourId);
     const auto bounds = juce::Rectangle<int>(x, y, width, height).toFloat().reduced(2.0f);
     const auto size = std::min(bounds.getWidth(), bounds.getHeight());
     const auto centre = bounds.getCentre();
@@ -63,7 +69,7 @@ void TubeForgeLookAndFeel::drawRotarySlider(juce::Graphics& graphics, int x, int
     {
         juce::Path value;
         value.addCentredArc(centre.x, centre.y, arcRadius, arcRadius, 0.0f, rotaryStartAngle, angle, true);
-        graphics.setColour(theme::accent);
+        graphics.setColour(fill);
         graphics.strokePath(value, stroke);
     }
 
@@ -75,7 +81,7 @@ void TubeForgeLookAndFeel::drawRotarySlider(juce::Graphics& graphics, int x, int
 
     // A single pointer from the middle of the cap to its rim: the whole read-out of the knob.
     const auto direction = juce::Point<float>(std::sin(angle), -std::cos(angle));
-    graphics.setColour(theme::accent.brighter(0.25f));
+    graphics.setColour(fill.brighter(0.25f));
     graphics.drawLine({ centre + direction * (capRadius * 0.30f),
                         centre + direction * (capRadius * 0.82f) }, 1.6f);
 }
@@ -90,6 +96,7 @@ void TubeForgeLookAndFeel::drawLinearSlider(juce::Graphics& graphics, int x, int
                                                minSliderPos, maxSliderPos, style, slider);
         return;
     }
+    const auto fill = slider.findColour(juce::Slider::trackColourId);
     const auto centreY = static_cast<float>(y) + static_cast<float>(height) * 0.5f;
     const auto track = juce::Rectangle<float>(static_cast<float>(x), centreY - 1.5f,
                                               static_cast<float>(width), 3.0f);
@@ -99,12 +106,12 @@ void TubeForgeLookAndFeel::drawLinearSlider(juce::Graphics& graphics, int x, int
     const auto thumbX = std::clamp(sliderPosition, track.getX(), track.getRight());
     if (thumbX > track.getX() + 0.5f)
     {
-        graphics.setColour(theme::accent.withAlpha(slider.isEnabled() ? 0.85f : 0.35f));
+        graphics.setColour(fill.withAlpha(slider.isEnabled() ? 0.85f : 0.35f));
         graphics.fillRoundedRectangle(track.withRight(thumbX), 1.5f);
     }
     graphics.setColour(theme::sunken);
     graphics.fillEllipse(juce::Rectangle<float>(13.0f, 13.0f).withCentre({ thumbX, centreY }));
-    graphics.setColour(slider.isMouseOverOrDragging() ? theme::accent.brighter(0.3f) : theme::accent);
+    graphics.setColour(slider.isMouseOverOrDragging() ? fill.brighter(0.3f) : fill);
     graphics.fillEllipse(juce::Rectangle<float>(9.0f, 9.0f).withCentre({ thumbX, centreY }));
 }
 

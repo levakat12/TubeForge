@@ -54,6 +54,18 @@ private:
     juce::Label instrumentCaption;
     juce::ComboBox instrumentSelector;
     juce::Label voicingCaption;
+    juce::Label panelSwitchCaption;
+    /** The current voicing's front-panel switch, shown only when it has one.
+
+        Hand-driven with item ids carrying the `PanelSwitch` value, for the same reason the
+        topology box on the tone page is: `ComboBoxAttachment` maps by selected *position*, which
+        breaks the moment a list is filtered -- and this one is filtered by construction, since
+        Ultra Lo exists on one amplifier and Deep on another.
+    */
+    juce::ComboBox panelSwitchSelector;
+    void rebuildPanelSwitches();
+    /// The voicing the switch list was last built for, so `refresh` only rebuilds on a change.
+    int listedTopology { -1 };
     std::unique_ptr<tf::ui::GearChip> voicing;
     juce::ToggleButton cabinetEnabled { "Cabinet" };
     std::array<juce::Label, 7> knobLabels;

@@ -298,6 +298,83 @@ int main()
     tests.expect(reconstruction.candidates.front().rigPreset.parameters.stageCount >= 2,
                  "candidate contains an editable traditional-amp preset");
 
+    /* The search offers a guitarist only voicings a guitarist would use.
+
+       Every voicing answers for guitar, so a bass-native one appearing here would not crash or
+       sound broken -- it would quietly take a shortlist slot from an amplifier the player might
+       actually have used, and cost an extra offline render to do it. That is the kind of wrong
+       that looks like a mediocre match rather than a bug.
+    */
+    auto guitarCandidatesAreGuitarVoicings = true;
+    for (const auto& candidate : reconstruction.candidates)
+        guitarCandidatesAreGuitarVoicings = guitarCandidatesAreGuitarVoicings
+            && nts::amp::topologyAffinity(candidate.rigPreset.parameters.topology)
+                   == nts::amp::TopologyAffinity::either;
+    tests.expect(guitarCandidatesAreGuitarVoicings,
+                 "a guitar reconstruction never proposes a bass-native voicing");
+
+    auto bassReference = reference;
+    bassReference.target = TargetInstrument::bass;
+    const auto bassRun = reconstructor.reconstruct(bassReference, di, sampleRate, 10);
+    tests.expect(bassRun.success, "a bass reconstruction completes: " + bassRun.error);
+
+    /* The searchable set, tested where it is decidable.
+
+       This file first tried to assert that a fitted bi-amp candidate keeps its 500 Hz split and
+       that a hard-clipping candidate keeps its 8x. Both were **vacuous**: a shortlist is filled by
+       refining the *winning* point, and topology is deliberately excluded from the "is this a
+       different rig" test, so a synthetic reference that favours one voicing returns ten
+       refinements of it and never reaches another. Asking for ten candidates instead of three
+       changed nothing. Assertions over candidates that never appear are worse than no assertion --
+       they read as coverage and are silence.
+
+       What *is* decidable is the set the search draws from, which is why it is published. The
+       length of that list is also the cost: the topology re-check renders the winning point under
+       every voicing the coarse pass did not reach.
+    */
+    const auto guitarSearch = searchableTopologies(nts::amp::Instrument::guitar);
+    const auto bassSearch = searchableTopologies(nts::amp::Instrument::bass);
+    tests.expectEqual(bassSearch.size(), nts::amp::topologyCount,
+                      "a bass reconstruction searches every voicing");
+    tests.expect(guitarSearch.size() < bassSearch.size() && ! guitarSearch.empty(),
+                 "a guitar reconstruction searches fewer voicings than a bass one");
+    auto guitarSearchIsGuitarOnly = true;
+    for (const auto topology : guitarSearch)
+        guitarSearchIsGuitarOnly = guitarSearchIsGuitarOnly
+            && nts::amp::topologyAffinity(topology) == nts::amp::TopologyAffinity::either;
+    tests.expect(guitarSearchIsGuitarOnly, "no bass-native voicing is searched for a guitar reference");
+
+    /* The crossover is scaled from the voicing rather than replaced by an absolute range.
+
+       Checked as a ratio against each candidate's own factory value, which is the property the fit
+       now has and the previous absolute `90 + tightness * 180` did not. Weaker than "the bi-amp
+       keeps its 500 Hz split" and the strongest thing this API can observe; the voicing-specific
+       consequence is covered where it is reachable, in the amp tests, by the factory preset.
+    */
+    auto crossoverScalesFromTheVoicing = true;
+    auto crossoverStillFitted = false;
+    for (const auto& candidate : bassRun.candidates)
+    {
+        const auto factory = nts::amp::makeOriginalPreset(candidate.rigPreset.parameters.topology,
+                                                          nts::amp::Instrument::bass);
+        const auto ratio = candidate.rigPreset.parameters.bass.crossoverHz
+                         / std::max(1.0f, factory.parameters.bass.crossoverHz);
+        crossoverScalesFromTheVoicing = crossoverScalesFromTheVoicing && ratio >= 0.5f && ratio <= 1.5f;
+        crossoverStillFitted = crossoverStillFitted || std::abs(ratio - 1.0f) > 0.01f;
+    }
+    tests.expect(crossoverScalesFromTheVoicing,
+                 "a fitted crossover stays within half to one-and-a-half of its voicing's own");
+    tests.expect(crossoverStillFitted, "tightness still moves the fitted crossover");
+
+    // The candidate label used to name only two voicings, so eleven of thirteen read "bloom".
+    auto candidatesAreNamedForTheirVoicing = true;
+    for (const auto& candidate : reconstruction.candidates)
+        candidatesAreNamedForTheirVoicing = candidatesAreNamedForTheirVoicing
+            && candidate.rigPreset.name.find(std::string(
+                   nts::amp::topologyName(candidate.rigPreset.parameters.topology))) != std::string::npos;
+    tests.expect(candidatesAreNamedForTheirVoicing,
+                 "a candidate is named for the voicing it actually uses");
+
     {
         // Offering the user a shortlist is only useful if the entries differ.
         // The variant offset used to come from `variant % 5`, so a pool of twelve

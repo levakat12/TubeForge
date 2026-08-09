@@ -84,7 +84,12 @@ void TubeForgeAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
                    static_cast<std::size_t>(getTotalNumOutputChannels()));
     traditionalAmp.prepare({ sampleRate, static_cast<std::size_t>(samplesPerBlock),
                               static_cast<std::size_t>(getTotalNumOutputChannels()) });
-    traditionalAmp.setParametersImmediately(currentAmpParameters());
+    traditionalAmp.setParametersImmediately(liveAmpParameters());
+    cabinetStage.prepare(sharedSpec);
+    cabinetStage.setParameters(currentCabinetParameters(), 0);
+    // The model is rendered against the session's rate, so a host rate change re-renders it -- the
+    // same reason the decoded audio of a user response is kept and re-prepared below.
+    refreshCabinetResponses();
     // prepare() reinstates the built-in responses, so any user response has to go back in --
     // and re-prepared against the new rate, which is the reason the decoded audio is kept.
     for (int slot = 0; slot < 2; ++slot) applyCabinetIr(slot);
@@ -118,6 +123,7 @@ void TubeForgeAudioProcessor::releaseResources()
     cancelPendingUpdate();
     engine.reset();
     traditionalAmp.reset();
+    cabinetStage.reset();
     physicalCircuit.reset();
     neuralAmp.reset();
     pedalBoard.reset();
@@ -358,8 +364,7 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         }
         else
         {
-            const auto ampParameters = currentAmpParameters();
-            traditionalAmp.setParameters(ampParameters);
+            traditionalAmp.setParameters(liveAmpParameters());
             traditionalAmp.process(outputs.data(), static_cast<std::size_t>(outputCount),
                                    static_cast<std::size_t>(buffer.getNumSamples()));
         }
@@ -368,6 +373,26 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         // unaffected: it returns early and keeps gating inside AmpVoice, where its dry reference
         // requires.
         runSharedGate();
+
+        /* The speaker, shared by all three engines.
+
+           After the gate rather than before it, which is both what a real rig does -- a gate sits
+           in front of the power section, not in front of the microphone -- and the only order
+           that works: a cabinet before the attenuation would ring on past a closed gate for the
+           length of its impulse, which is exactly the chopped-then-smeared artefact a gate is
+           there to avoid. */
+        cabinetStage.setParameters(currentCabinetParameters());
+        cabinetStage.process(outputs.data(), static_cast<std::size_t>(outputCount),
+                             static_cast<std::size_t>(buffer.getNumSamples()));
+
+        /* Noticing that the built-in model has moved, and doing nothing about it here.
+
+           Rendering it means two transforms and an allocation, which is not audio-thread work, so
+           the callback compares a hash and asks the message thread. Same arrangement as the
+           physical circuit's recompile, and for the same reason. The comparison itself is nine
+           parameter reads and a multiply each -- cheaper than the string lookup it replaces. */
+        if (cabinetModelHash() != renderedCabinetModelHash.load(std::memory_order_acquire))
+            triggerAsyncUpdate();
 
         // Delay then reverb, in that order: reverb on the repeats sounds like a room the
         // echoes happen in, whereas delaying a reverb tail smears it into mush.
@@ -494,8 +519,11 @@ double TubeForgeAudioProcessor::getTailLengthSeconds() const
     // committed to the smaller window and the longer mode's decay would be cut.
     // The effects outlast the cabinet by a wide margin -- a long reverb is seconds where the
     // cabinet is milliseconds -- so they set the tail whenever they are engaged.
+    // The cabinet is added to whichever engine is longest rather than compared against them: it
+    // sits after all three, so its decay runs on past whatever reaches it.
     const auto tail = std::max({ traditionalAmp.tailSamples(), physicalCircuit.tailSamples(),
-                                 delayEffect.tailSamples() + reverbEffect.tailSamples() });
+                                 delayEffect.tailSamples() + reverbEffect.tailSamples() })
+                    + cabinetStage.tailSamples();
     const auto latency = static_cast<std::size_t>(
         std::max(0, pendingOversamplingLatencySamples.load(std::memory_order_relaxed)));
     return static_cast<double>(tail + latency) / std::max(1.0, currentSampleRate);
@@ -585,6 +613,21 @@ TubeForgeAudioProcessor::PerformanceTier TubeForgeAudioProcessor::performanceTie
         static_cast<int>(std::lround(parameterOf(Param::performanceTier))), 0, 2));
 }
 
+int TubeForgeAudioProcessor::pedalboardCost() const noexcept
+{
+    // Read from the parameters rather than from the board itself: this is called from the
+    // editor, the board is owned by the audio thread, and the answer is the same either way
+    // because the board's models come from exactly these parameters.
+    auto total = 0;
+    for (std::size_t slot = 0; slot < nts::pedals::slotCount; ++slot)
+    {
+        const auto parameters = currentPedalParameters(slot);
+        if (parameters.model == 0 || parameters.bypassed) continue;
+        total += nts::pedals::pedalModel(parameters.model).tier;
+    }
+    return total;
+}
+
 TubeForgeAudioProcessor::TunerReading TubeForgeAudioProcessor::tunerReading() const noexcept
 {
     const std::scoped_lock lock(tunerMutex);
@@ -634,7 +677,6 @@ nts::amp::AmpParameters TubeForgeAudioProcessor::currentAmpParameters() const no
     parameters.powerAmp.presence = parameterOf(Param::presence) * 0.1f;
     parameters.powerAmp.resonance = parameterOf(Param::resonance) * 0.1f;
     parameters.powerAmp.masterDb = parameterOf(Param::master);
-    parameters.cabinet.bypass = parameterOf(Param::cabinet) < 0.5f;
     // stage1..stage4 are adjacent enumerators, so the stage index walks them directly.
     static_assert(static_cast<std::size_t>(Param::stage4) - static_cast<std::size_t>(Param::stage1) == 3,
                   "stage drive parameters must stay contiguous for this indexing to hold");
@@ -673,18 +715,66 @@ nts::amp::AmpParameters TubeForgeAudioProcessor::currentAmpParameters() const no
     parameters.powerAmp.feedback = parameterOf(Param::feedback) * 0.01f;
     parameters.bass.crossoverHz = parameterOf(Param::crossover);
     parameters.bass.cleanBlend = parameterOf(Param::cleanBlend) * 0.01f;
-    parameters.cabinet.delaySamplesB = static_cast<std::size_t>(
-        parameterOf(Param::cabinetAlignment));
+    parameters.dryBlend = parameterOf(Param::dryBlend) * 0.01f;
+    // After the voicing, because a switch is a control the player moved and the voicing is where
+    // they started. Inert for a voicing that does not carry it -- see applyPanelSwitch.
+    nts::amp::applyPanelSwitch(parameters, static_cast<nts::amp::PanelSwitch>(
+        std::clamp(static_cast<int>(parameterOf(Param::panelSwitch)), 0,
+                   static_cast<int>(nts::amp::panelSwitchCount) - 1)));
+    parameters.bass.lowDriveDb = parameterOf(Param::lowBandDrive);
+    parameters.bass.lowLevelDb = parameterOf(Param::lowBandLevel);
+    parameters.bass.highLevelDb = parameterOf(Param::highBandLevel);
+    // The whole cabinet, from the controls that now back every one of its fields. Taken wholesale
+    // rather than field by field so there is one place the mapping lives -- and so this function
+    // keeps answering "what does the rig say", which preset export and the assistant both need to
+    // include a cabinet even though the live amplifier no longer runs one.
+    parameters.cabinet = currentCabinetParameters();
+    return parameters;
+}
+
+nts::amp::AmpParameters TubeForgeAudioProcessor::liveAmpParameters() const noexcept
+{
+    auto parameters = currentAmpParameters();
+    // The cabinet is `cabinetStage` now, after whichever engine is selected. The copy inside
+    // AmpVoice must not also run, or the traditional path alone would be convolved twice.
+    parameters.cabinet.bypass = true;
+    return parameters;
+}
+
+nts::amp::CabinetParameters TubeForgeAudioProcessor::currentCabinetParameters() const noexcept
+{
+    const auto limits = tierLimits();
+    nts::amp::CabinetParameters cabinet;
+    cabinet.bypass = parameterOf(Param::cabinet) < 0.5f;
     // Eco runs one convolution rather than two: pinning the blend to slot A leaves the second
     // convolver contributing nothing, which CabinetSection then skips outright.
-    parameters.cabinet.blend = limits.singleCabinet ? 0.0f
-                                                    : parameterOf(Param::cabinetBlend) * 0.01f;
+    cabinet.blend = limits.singleCabinet ? 0.0f : parameterOf(Param::cabinetBlend) * 0.01f;
     // Zeroed on the single-cabinet tier for the same reason, and this one has to be: width keeps
     // both convolvers engaged whatever the blend says, so leaving it up would reinstate the second
     // convolution the tier exists to avoid.
-    parameters.cabinet.width = limits.singleCabinet ? 0.0f
-                                                   : parameterOf(Param::cabinetWidth) * 0.01f;
-    return parameters;
+    cabinet.width = limits.singleCabinet ? 0.0f : parameterOf(Param::cabinetWidth) * 0.01f;
+    cabinet.lowCutHz = parameterOf(Param::cabLowCut);
+    cabinet.highCutHz = parameterOf(Param::cabHighCut);
+    cabinet.bassDiBlend = parameterOf(Param::cabDiBlend) * 0.01f;
+    cabinet.outputTrimDb = parameterOf(Param::cabOutputTrim);
+
+    cabinet.slots[0].levelDb = parameterOf(Param::cabLevelA);
+    cabinet.slots[1].levelDb = parameterOf(Param::cabLevelB);
+    cabinet.slots[0].pan = parameterOf(Param::cabPanA) * 0.01f;
+    cabinet.slots[1].pan = parameterOf(Param::cabPanB) * 0.01f;
+    cabinet.slots[0].phaseInvert = parameterOf(Param::cabPhaseA) >= 0.5f;
+    cabinet.slots[1].phaseInvert = parameterOf(Param::cabPhaseB) >= 0.5f;
+    cabinet.slots[0].delaySamples = static_cast<std::size_t>(parameterOf(Param::cabDelayA));
+    cabinet.slots[1].delaySamples = static_cast<std::size_t>(parameterOf(Param::cabinetAlignment));
+    cabinet.slots[0].mute = parameterOf(Param::cabMuteA) >= 0.5f;
+    /* Slot B is muted outright on the single-cabinet tier, not merely weighted out.
+
+       Pinning the blend to A was enough while the blend was the only thing that could engage the
+       second convolver. It is not enough now: a slot's own level and pan can hold it engaged
+       whatever the blend says, so a user on Eco who raised Cabinet B's level would quietly get
+       back the second convolution the tier exists to remove. */
+    cabinet.slots[1].mute = limits.singleCabinet || parameterOf(Param::cabMuteB) >= 0.5f;
+    return cabinet;
 }
 
 nts::pedals::PedalParameters TubeForgeAudioProcessor::currentPedalParameters(
@@ -695,22 +785,26 @@ nts::pedals::PedalParameters TubeForgeAudioProcessor::currentPedalParameters(
     static_assert(static_cast<std::size_t>(Param::pedal2Kind)
                       - static_cast<std::size_t>(Param::pedal1Kind) == pedalParameterStride,
                   "the per-slot pedal parameters must stay contiguous for this indexing to hold");
-    static_assert(static_cast<std::size_t>(Param::pedal1Mix)
+    static_assert(static_cast<std::size_t>(Param::pedal1AuxB)
                       - static_cast<std::size_t>(Param::pedal1Kind) == pedalParameterStride - 1,
-                  "a slot's six parameters must stay in PedalParameters order");
+                  "a slot's parameters must stay contiguous and in PedalControl order");
 
     const auto base = static_cast<std::size_t>(Param::pedal1Kind) + slot * pedalParameterStride;
     const auto at = [this, base](std::size_t offset)
     { return parameterOf(static_cast<Param>(base + offset)); };
 
     nts::pedals::PedalParameters parameters;
-    parameters.kind = static_cast<nts::pedals::PedalKind>(
-        std::clamp(static_cast<int>(std::lround(at(0))), 0, static_cast<int>(nts::pedals::kindCount) - 1));
+    // Clamped against the model table rather than a literal, so appending a pedal needs no
+    // change here. PedalSlot::setParameters clamps again for the same reason.
+    parameters.model = std::clamp(static_cast<int>(std::lround(at(0))), 0,
+                                  static_cast<int>(nts::pedals::modelCount()) - 1);
     parameters.bypassed = at(1) >= 0.5f;
     parameters.drive = at(2);
     parameters.tone = at(3);
     parameters.levelDb = at(4);
     parameters.mix = at(5);
+    parameters.auxA = at(6);
+    parameters.auxB = at(7);
     return parameters;
 }
 
@@ -720,8 +814,16 @@ void TubeForgeAudioProcessor::refreshProcessingLatency(bool notifyHostFromAudioT
     // mode change the two differ for the length of the fade, and reporting the incoming
     // engine's latency early would misalign the dry path against the outgoing audio.
     const auto mode = activeEngineMode;
-    const auto processingLatency = mode == 0 ? static_cast<int>(traditionalAmp.latencySamples())
-                                            : mode == 2 ? static_cast<int>(physicalCircuit.latencySamples()) : 0;
+    const auto engineLatency = mode == 0 ? static_cast<int>(traditionalAmp.latencySamples())
+                                         : mode == 2 ? static_cast<int>(physicalCircuit.latencySamples()) : 0;
+    /* The cabinet's own buffering, added to every engine rather than only the traditional one.
+
+       It is zero until a response long enough to want the partitioned FFT path is loaded, and one
+       partition after that. It has to be summed rather than maximised: the stage is downstream of
+       the engine, so a block passes through both delays in series. Getting this wrong does not
+       merely misreport -- the bypass path is delayed by exactly this number, so an unreported
+       partition would make engaging bypass step the signal in time. */
+    const auto processingLatency = engineLatency + static_cast<int>(cabinetStage.latencySamples());
     const auto previous = pendingOversamplingLatencySamples.exchange(processingLatency,
                                                                       std::memory_order_relaxed);
     if (processingLatency != previous && notifyHostFromAudioThread)
@@ -739,6 +841,37 @@ void TubeForgeAudioProcessor::handleAsyncUpdate()
     // The import worker writes artifact directories; the list of them is rebuilt here, on the
     // message thread, which is the only thread that reads it.
     if (pendingCaptureRefresh.exchange(false, std::memory_order_acquire)) captures.refresh();
+
+    /* A full-rig capture finished loading, so the cabinet stage steps out of its way. See
+       `pendingFullRigCabinetBypass` for why only this direction is automatic.
+
+       Inside an AutoWriteScope: `setParameterValue` issues real begin/end gestures, so without it
+       the Auto Match guard would read this as the player reaching for the cabinet switch and
+       either raise a dialog or hand the control back. */
+    if (pendingFullRigCabinetBypass.exchange(false, std::memory_order_acquire))
+    {
+        const AutoWriteScope autoWrite(*this);
+        setParameterValue(parameterState, ParameterIds::cabinet, 0.0f);
+    }
+
+    // The built-in cabinet model moved. Compared rather than acting on a flag, so that whatever
+    // caused this update -- the audio thread noticing, or one of the bulk-write paths asking
+    // directly -- the answer is the same and a redundant call renders nothing.
+    if (cabinetModelHash() != renderedCabinetModelHash.load(std::memory_order_acquire))
+        refreshCabinetResponses();
+
+    /* Auto Match was holding a rig when the instrument changed, so the match is re-run against
+       the other instrument's voicings. Latched by the guard, which may have been on the audio
+       thread; this is the message thread, which is where a worker may be started.
+
+       A false return means there is nothing to re-run against -- no song has been matched in
+       this session -- and is not a failure: the hold has already been dropped, so the rig is
+       simply the user's again. */
+    if (const auto instrument = autoMatchInstrumentRequest.exchange(-1, std::memory_order_acquire);
+        instrument >= 0)
+        (void) studio.requestReconstructionInstrument(
+            instrument == 1 ? nts::reconstruction::TargetInstrument::bass
+                            : nts::reconstruction::TargetInstrument::guitar);
 
     if (const auto tier = automaticTierRequest.exchange(-1, std::memory_order_relaxed); tier >= 0)
     {

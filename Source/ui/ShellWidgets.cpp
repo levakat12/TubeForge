@@ -209,6 +209,31 @@ juce::Path buildGlyph(Glyph glyph)
                 path.lineTo(12.0f + sine * 9.4f, 12.0f - cosine * 9.4f);
             }
             break;
+
+        case Glyph::reset:
+        {
+            // Three-quarters of a circle with an arrowhead on the open end, drawn as line
+            // segments like every other glyph here so one stroke width governs all of them.
+            constexpr auto radius = 7.0f;
+            constexpr auto start = juce::MathConstants<float>::pi * 0.35f;
+            constexpr auto sweep = juce::MathConstants<float>::twoPi * 0.78f;
+            constexpr int segments = 18;
+            for (int step = 0; step <= segments; ++step)
+            {
+                const auto angle = start + sweep * static_cast<float>(step) / static_cast<float>(segments);
+                const auto x = 12.0f + std::sin(angle) * radius;
+                const auto y = 12.0f - std::cos(angle) * radius;
+                if (step == 0) path.startNewSubPath(x, y);
+                else           path.lineTo(x, y);
+            }
+            const auto tip = start + sweep;
+            const auto tipX = 12.0f + std::sin(tip) * radius;
+            const auto tipY = 12.0f - std::cos(tip) * radius;
+            path.startNewSubPath(tipX - 3.6f, tipY - 1.2f);
+            path.lineTo(tipX, tipY);
+            path.lineTo(tipX + 0.6f, tipY - 4.2f);
+            break;
+        }
     }
     return path;
 }

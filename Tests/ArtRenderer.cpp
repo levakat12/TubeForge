@@ -19,6 +19,8 @@
 #include "ui/FaceplateArt.h"
 #include "ui/PedalArt.h"
 
+#include <nts/pedals/PedalBoard.h>
+
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include <iostream>
@@ -67,25 +69,33 @@ int renderFaceplates(const juce::File& directory)
 
 int renderPedals(const juce::File& directory)
 {
-    // One strip holding every kind, because a pedal is judged against the others on the board
-    // rather than on its own.
-    const auto count = static_cast<int>(tf::ui::pedalFaceCount());
-    juce::Image canvas(juce::Image::ARGB, pedalCell * count, pedalHeight, true,
+    /* One sheet holding every model, because a pedal is judged against the others on the board
+       rather than on its own -- but wrapped into rows rather than laid out as one strip. At
+       thirty-seven models a single row is seven thousand pixels wide, which is a picture nobody
+       can actually look at. */
+    const auto count = static_cast<int>(nts::pedals::modelCount());
+    const auto columns = std::min(count, 10);
+    const auto rows = (count + columns - 1) / columns;
+
+    juce::Image canvas(juce::Image::ARGB, pedalCell * columns, pedalHeight * rows, true,
                        juce::SoftwareImageType {});
     juce::Graphics graphics(canvas);
     graphics.fillAll(backdrop);
 
     for (int kind = 0; kind < count; ++kind)
     {
+        const auto x = (kind % columns) * pedalCell;
+        const auto y = (kind / columns) * pedalHeight;
+
         tf::ui::PedalArt art;
-        const auto& face = tf::ui::pedalFace(kind);
-        art.setFace(face);
-        art.paint(graphics, juce::Rectangle<int>(kind * pedalCell, 0, pedalCell, pedalHeight - 30)
+        art.setFace(tf::ui::pedalFace(kind));
+        art.paint(graphics, juce::Rectangle<int>(x, y, pedalCell, pedalHeight - 30)
                                 .toFloat().reduced(10.0f));
-        graphics.setColour(juce::Colours::white.withAlpha(0.8f));
+        // Captioned with the model's name rather than the plate's, which is deliberately short.
+        graphics.setColour(juce::Colours::white.withAlpha(0.85f));
         graphics.setFont(juce::Font { juce::FontOptions { 12.0f } });
-        graphics.drawText(face.name,
-                          juce::Rectangle<int>(kind * pedalCell, pedalHeight - 26, pedalCell, 20),
+        graphics.drawText(juce::String(std::string(nts::pedals::pedalModel(kind).name)),
+                          juce::Rectangle<int>(x, y + pedalHeight - 26, pedalCell, 20),
                           juce::Justification::centred, true);
     }
     return write(canvas, directory.getChildFile("pedal-faces.png")) ? 1 : 0;

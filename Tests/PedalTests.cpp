@@ -10,9 +10,11 @@
 
 #include <nts/pedals/PedalBoard.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <numbers>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -76,11 +78,13 @@ float rootMeanSquare(const std::vector<float>& samples, std::size_t from = 0)
     return count == 0 ? 0.0f : static_cast<float>(std::sqrt(energy / static_cast<double>(count)));
 }
 
+/// Takes a `PedalKind` rather than a bare index so these read as the archetype they mean, which
+/// is also the guard that the archetypes keep their model indices.
 nts::pedals::PedalParameters engaged(nts::pedals::PedalKind kind, float drive = 8.0f,
                                      float mix = 100.0f)
 {
     nts::pedals::PedalParameters parameters;
-    parameters.kind = kind;
+    parameters.model = nts::pedals::modelIndexOf(kind);
     parameters.drive = drive;
     parameters.tone = 7.0f;
     parameters.levelDb = 0.0f;
@@ -230,25 +234,251 @@ void testNeuralSlotWithoutModelPassesAudio(TestHarness& harness)
     }
 }
 
-void testEveryKindStaysFiniteAtExtremes(TestHarness& harness)
+/** Every model's shaping stage is bounded.
+
+    Separate from the four-slot finiteness test above, and it has to be: four slots at +24 dB of
+    make-up each is 96 dB of legitimate gain, which swamps any threshold small enough to catch a
+    curve that is actually diverging. So this runs *one* slot at unity level, where the only
+    thing that can make the output large is the shape itself.
+
+    Worth its own test because published pedal blueprints contain unbounded curves -- a cubic
+    with a positive-leading tail runs away past roughly |x| > 2 instead of saturating, and it
+    builds, loads and plays perfectly until someone turns the drive up.
+*/
+void testEveryModelIsBounded(TestHarness& harness)
 {
-    const auto tone = makeTone(blockSize * 4, 82.4, 0.9f);
-    for (std::size_t index = 1; index < nts::pedals::kindCount; ++index)
+    // Hot, but no hotter than a loud pickup: what is being tested is the curve, not headroom.
+    const auto tone = makeTone(blockSize * 4, 82.4, 1.0f);
+    for (std::size_t index = 1; index < nts::pedals::modelCount(); ++index)
     {
         nts::pedals::PedalBoard board;
         board.prepare(testSpec());
-        auto parameters = engaged(static_cast<nts::pedals::PedalKind>(index), 10.0f);
+        nts::pedals::PedalParameters parameters;
+        parameters.model = static_cast<int>(index);
+        parameters.drive = 10.0f;
+        parameters.tone = 10.0f;
+        parameters.levelDb = 0.0f;
+        parameters.mix = 100.0f;
+        parameters.auxA = 10.0f;
+        parameters.auxB = 10.0f;
+        board.setParameters(0, parameters);
+
+        auto peak = 0.0f;
+        for (const auto sample : render(board, tone, 32)) peak = std::max(peak, std::abs(sample));
+        // A bounded shaper cannot exceed its own ceiling however hard it is driven, and every
+        // model's make-up trim is under 24 dB. Sixteen is far above any of them and far below
+        // what a diverging polynomial reaches within one block.
+        harness.expect(peak < 16.0f,
+                       std::string(nts::pedals::pedalModel(static_cast<int>(index)).name)
+                           + " saturates rather than diverging at full drive");
+    }
+}
+
+/// The model with a given name, or -1. By name because indices move when the table grows.
+int modelNamed(std::string_view name)
+{
+    for (std::size_t index = 0; index < nts::pedals::modelCount(); ++index)
+        if (nts::pedals::pedalModel(static_cast<int>(index)).name == name)
+            return static_cast<int>(index);
+    return -1;
+}
+
+/** Modulation modulates, and a phaser is not a delay.
+
+    A steady sine through a swept delay comes out with its amplitude moving, because the delayed
+    copy drifts in and out of phase with itself. Measuring that the envelope varies is the
+    difference between an engine that is running and one that is merely not crashing -- which is
+    all a finiteness test proves.
+*/
+void testModulationSweeps(TestHarness& harness)
+{
+    const auto envelopeSpread = [](const std::vector<float>& signal)
+    {
+        // Peak per 512-sample window, then how far the loudest window is above the quietest.
+        auto lowest = 1.0e9f;
+        auto highest = 0.0f;
+        for (std::size_t start = 0; start + 512 <= signal.size(); start += 512)
+        {
+            auto peak = 0.0f;
+            for (std::size_t n = start; n < start + 512; ++n) peak = std::max(peak, std::abs(signal[n]));
+            lowest = std::min(lowest, peak);
+            highest = std::max(highest, peak);
+        }
+        return lowest <= 0.0f ? 0.0f : highest / lowest;
+    };
+
+    for (const auto name : { "Ensemble", "Jet Flanger", "Orange Phase" })
+    {
+        const auto model = modelNamed(name);
+        harness.expect(model >= 0, std::string(name) + " is in the model table");
+        if (model < 0) continue;
+
+        nts::pedals::PedalBoard board;
+        board.prepare(testSpec());
+        nts::pedals::PedalParameters parameters;
+        parameters.model = model;
+        parameters.drive = 8.0f;    // rate, well up so a few cycles fit in the render
+        parameters.tone = 9.0f;     // depth
+        parameters.mix = 100.0f;
+        parameters.auxA = 7.0f;     // feedback where the model has one
+        board.setParameters(0, parameters);
+
+        // 220 Hz so the comb notches land somewhere the tone can actually be cancelled.
+        const auto output = render(board, makeTone(blockSize * 256, 220.0, 0.5f), 256);
+        auto finite = true;
+        for (const auto sample : output) finite = finite && std::isfinite(sample);
+        harness.expect(finite, std::string(name) + " stays finite with feedback up");
+        harness.expect(envelopeSpread(output) > 1.15f,
+                       std::string(name) + " actually sweeps rather than sitting still");
+    }
+}
+
+/** The crusher holds its output flat and then jumps, which is what sample-and-hold means.
+
+    Two earlier attempts measured the wrong thing and are worth recording. Counting distinct
+    output levels fails because the resonant filter after the reduction smooths the steps back
+    into a continuum. Measuring inharmonic energy fails because an unwindowed transform of a
+    strong sine leaks across every bin, so both signals are dominated by leakage from their own
+    fundamental -- and the crushed one, being quieter, scored *lower*.
+
+    What cannot be confounded is the shape of the first difference. A sine steps by a smooth
+    amount every sample, so its largest step is only about pi/2 times its average one. A
+    sample-and-hold signal barely moves for tens of samples and then jumps, so that ratio is
+    several times larger. It survives the filter because the filter is near Nyquist and the
+    jumps are what it passes.
+*/
+void testCrushQuantises(TestHarness& harness)
+{
+    const auto jumpiness = [](const std::vector<float>& signal)
+    {
+        auto largest = 0.0;
+        auto total = 0.0;
+        for (std::size_t n = 1; n < signal.size(); ++n)
+        {
+            const auto step = std::abs(static_cast<double>(signal[n]) - signal[n - 1]);
+            largest = std::max(largest, step);
+            total += step;
+        }
+        const auto mean = total / static_cast<double>(std::max<std::size_t>(1, signal.size() - 1));
+        return mean <= 0.0 ? 0.0 : largest / mean;
+    };
+
+    const auto model = modelNamed("Bit Mapper");
+    harness.expect(model >= 0, "Bit Mapper is in the model table");
+    if (model < 0) return;
+
+    // Long enough that `render` never wraps its source: a tone that does not fit a whole number
+    // of cycles into the buffer clicks at every wrap, and a click is exactly the artefact this
+    // measurement is looking for.
+    const auto tone = makeTone(blockSize * 64, 620.0, 0.8f);
+
+    nts::pedals::PedalBoard board;
+    board.prepare(testSpec());
+    nts::pedals::PedalParameters parameters;
+    parameters.model = model;
+    parameters.drive = 9.0f;     // heavy downsampling
+    parameters.tone = 10.0f;     // filter wide open, so this measures the reduction not the filter
+    parameters.mix = 100.0f;
+    parameters.auxA = 10.0f;     // fewest bits
+    board.setParameters(0, parameters);
+    const auto crushed = render(board, tone, 64);
+
+    nts::pedals::PedalBoard empty;
+    empty.prepare(testSpec());
+    const auto clean = render(empty, tone, 64);
+
+    auto finite = true;
+    for (const auto sample : crushed) finite = finite && std::isfinite(sample);
+    harness.expect(finite, "the crusher stays finite at its most extreme setting");
+    harness.expect(jumpiness(crushed) > jumpiness(clean) * 3.0,
+                   "the crusher holds and jumps rather than moving smoothly like its input");
+}
+/** The pitch shifter shifts pitch, up when asked up and down when asked down.
+
+    Measured by comparing energy at the shifted frequency against energy at the original. A
+    finiteness test would pass on an engine that did nothing at all; this one cannot.
+*/
+void testPitchShifts(TestHarness& harness)
+{
+    constexpr double input = 440.0;
+
+    const auto energyAt = [](const std::vector<float>& signal, double frequency)
+    {
+        double real {}, imaginary {};
+        // The last half only: the first is the slot's blend ramping in from dry, which still
+        // contains the unshifted tone and would be measured as a failure to shift.
+        for (std::size_t n = signal.size() / 2; n < signal.size(); ++n)
+        {
+            const auto phase = 2.0 * std::numbers::pi * frequency * static_cast<double>(n) / sampleRate;
+            real += signal[n] * std::cos(phase);
+            imaginary += signal[n] * std::sin(phase);
+        }
+        return real * real + imaginary * imaginary;
+    };
+
+    const auto model = modelNamed("Dive Bomb");
+    harness.expect(model >= 0, "Dive Bomb is in the model table");
+    if (model < 0) return;
+
+    // Long enough that `render` never wraps -- see the crusher test for why that matters.
+    const auto tone = makeTone(blockSize * 256, input, 0.6f);
+
+    const auto shiftedEnergy = [&](float pitchControl, double atFrequency)
+    {
+        nts::pedals::PedalBoard board;
+        board.prepare(testSpec());
+        nts::pedals::PedalParameters parameters;
+        parameters.model = model;
+        parameters.drive = pitchControl;
+        parameters.tone = 10.0f;
+        parameters.mix = 100.0f;
+        board.setParameters(0, parameters);
+        return energyAt(render(board, tone, 256), atFrequency);
+    };
+
+    // The control spans -24 to +24 semitones, so 7.5 is +12 and 2.5 is -12.
+    const auto up = shiftedEnergy(7.5f, input * 2.0);
+    const auto upFundamental = shiftedEnergy(7.5f, input);
+    harness.expect(up > upFundamental,
+                   "shifting up puts more energy an octave above than at the original pitch");
+
+    const auto down = shiftedEnergy(2.5f, input * 0.5);
+    const auto downFundamental = shiftedEnergy(2.5f, input);
+    harness.expect(down > downFundamental,
+                   "shifting down puts more energy an octave below than at the original pitch");
+
+    // And at the centre of the control it is a straight wire with a window on it.
+    const auto unity = shiftedEnergy(5.0f, input);
+    harness.expect(unity > 0.0, "no shift leaves the original pitch in place");
+}
+
+void testEveryKindStaysFiniteAtExtremes(TestHarness& harness)
+{
+    const auto tone = makeTone(blockSize * 4, 82.4, 0.9f);
+    // Every model in the table, not only the seven archetypes: a modelled pedal added with an
+    // unbounded shaping curve -- which at least one published blueprint has -- would otherwise
+    // reach a user before it reached a test.
+    for (std::size_t index = 1; index < nts::pedals::modelCount(); ++index)
+    {
+        nts::pedals::PedalBoard board;
+        board.prepare(testSpec());
+        nts::pedals::PedalParameters parameters;
+        parameters.model = static_cast<int>(index);
+        parameters.drive = 10.0f;
         parameters.tone = 10.0f;
         parameters.levelDb = 24.0f;
-        // Every slot on the same kind, so this also covers four of them in series.
+        parameters.mix = 100.0f;
+        parameters.auxA = 10.0f;
+        parameters.auxB = 10.0f;
+        // Every slot on the same model, so this also covers four of them in series.
         for (std::size_t slot = 0; slot < nts::pedals::slotCount; ++slot)
             board.setParameters(slot, parameters);
 
         const auto output = render(board, tone, 32);
         auto finite = true;
         for (const auto sample : output) finite = finite && std::isfinite(sample);
-        harness.expect(finite, "kind " + std::to_string(index)
-                                   + " stays finite through four slots at full drive and level");
+        const auto name = std::string(nts::pedals::pedalModel(static_cast<int>(index)).name);
+        harness.expect(finite, name + " stays finite through four slots at full drive and level");
     }
 }
 } // namespace
@@ -263,5 +493,9 @@ int main()
     testSwitchingToNoneReturnsToDry(harness);
     testNeuralSlotWithoutModelPassesAudio(harness);
     testEveryKindStaysFiniteAtExtremes(harness);
+    testEveryModelIsBounded(harness);
+    testModulationSweeps(harness);
+    testCrushQuantises(harness);
+    testPitchShifts(harness);
     return harness.result();
 }

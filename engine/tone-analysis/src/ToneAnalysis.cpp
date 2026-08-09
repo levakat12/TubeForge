@@ -344,7 +344,27 @@ ToneAnalysisResult ToneAnalyzer::analyze(const AnalysisInput& input) const
     report.compression.value = dynamic.compressionAmount;
     report.cleanLowBlendEstimate.value = clamp01(spectral.lowFrequencyExtension
         * (1.0f - nonlinear.saturationOnset) * 1.2f);
-    report.cabinetDarkness.value = 1.0f - report.brightness.value;
+    /* Cabinet darkness, measured rather than renamed.
+
+       This used to be `1 - brightness`, which is not a second measurement of anything: it carried
+       no information the brightness descriptor did not already carry, it fed `cabinet.highCutHz`
+       in the reconstruction, and it occupied a slot in the tone embedding where it double-counted
+       brightness against itself.
+
+       What separates a dark *cabinet* from a dark *amplifier* is where the energy stops rather
+       than how much of it there is. A guitar speaker is a steep low-pass with a corner between
+       about 4 and 6 kHz -- so the two things that describe one are how much is left above that
+       corner (`highFrequencyRolloff`) and how fast the spectrum falls across the whole band
+       (`spectralSlopeDbPerOctave`). A bright amplifier into a dark cabinet has a steep slope and
+       little top; a dark amplifier into a bright cabinet has a shallow slope and a low centroid,
+       and the old formula could not tell those apart.
+
+       Weighted towards the roll-off, which is the more direct of the two: the slope also responds
+       to the low end, and a bass-heavy reference should not read as a dark speaker. The slope is
+       normalised over -24 to 0 dB/octave, the same span the embedding already uses for it. */
+    const auto slopeDarkness = clamp01(-spectral.spectralSlopeDbPerOctave / 24.0f);
+    report.cabinetDarkness.value = clamp01(spectral.highFrequencyRolloff * 0.65f
+                                           + slopeDarkness * 0.35f);
     report.roomAmount.value = spatial.roomReverbEstimate;
     context.gainCategory = gain < 0.16f ? GainCategory::clean : gain < 0.34f ? GainCategory::edgeOfBreakup
         : gain < 0.56f ? GainCategory::crunch : gain < 0.82f ? GainCategory::highGain : GainCategory::fuzz;

@@ -3,6 +3,7 @@
 #include "TubeForgeTheme.h"
 
 #include "ui/AmplifierPage.h"
+#include "ui/AutoMatchDialog.h"
 #include "ui/CabinetPage.h"
 #include "ui/CapturesPage.h"
 #include "ui/TunerPage.h"
@@ -175,6 +176,9 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     presetPrevious.setTooltip("Previous profile in the library");
     presetNext.setTooltip("Next profile in the library");
     presetBrowse.setTooltip("Open the profile library");
+    resetVoicing.setTooltip("Put every amplifier control back to what the selected voicing "
+                            "specifies. Keeps the instrument and the voicing; leaves the "
+                            "pedalboard and the sends alone.");
     saveProject.setTooltip("Save the whole session as a .tforge project");
     openProject.setTooltip("Open a .tforge project");
     audioSettings.setTooltip("Audio device settings");
@@ -186,7 +190,7 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
 
     for (auto* component : std::initializer_list<juce::Component*> {
              &title, &productTagline, &presetCaption, &presetName, &presetPrevious, &presetNext,
-             &presetBrowse, &engineCaption, &inputLabel, &outputLabel, &inputMeter, &outputMeter,
+             &presetBrowse, &resetVoicing, &engineCaption, &inputLabel, &outputLabel, &inputMeter, &outputMeter,
              &pageHost, &mode, &deviceStatus, &signalChain, &diagnosticsText, &inputGain,
              &outputGain, &bypass, &proMode, &engineModeSelector, &audioSettings, &openProject,
              &saveProject, &performanceCaption, &performanceSelector })
@@ -219,6 +223,11 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     presetPrevious.onClick = [this] { if (library != nullptr) library->selectRelative(-1); };
     presetNext.onClick = [this] { if (library != nullptr) library->selectRelative(1); };
     presetBrowse.onClick = [this] { setActiveModule(libraryModule); };
+    resetVoicing.onClick = [this]
+    {
+        processor.loadVoicingDefaults();
+        presetName.setText("Voicing default", juce::dontSendNotification);
+    };
 
     setActiveModule(0);
     applyProModeVisibility();
@@ -491,9 +500,11 @@ void TubeForgeAudioProcessorEditor::layOutRail()
 
     constexpr int actionWidth = 26;
     constexpr int actionGap = 10;
+    constexpr int actionCount = 4;
     auto actions = centre.removeFromTop(24);
-    auto actionX = actions.getCentreX() - (actionWidth * 3 + actionGap * 2) / 2;
-    for (auto* action : { &saveProject, &openProject, &presetBrowse })
+    auto actionX = actions.getCentreX()
+                 - (actionWidth * actionCount + actionGap * (actionCount - 1)) / 2;
+    for (auto* action : { &saveProject, &openProject, &presetBrowse, &resetVoicing })
     {
         action->setBounds(actionX, actions.getY(), actionWidth, actions.getHeight());
         actionX += actionWidth + actionGap;
@@ -514,6 +525,10 @@ void TubeForgeAudioProcessorEditor::timerCallback()
     processor.refreshPhysicalCircuit();
     processor.refreshNonRealtimeDiagnostics();
     processor.refreshAssistant();
+    // Applies a match the moment one finishes, when Auto Match is on. Beside the assistant
+    // refresh for the same reason: it is engine work that has to happen whether or not the Song
+    // Match page is the one being looked at.
+    processor.refreshAutoMatch();
     // The tuner's queue is written by the audio thread and has to be drained whether or not
     // anyone is looking at it, or it fills and the reading goes stale the moment it is opened.
     processor.updateTuner();
@@ -541,6 +556,9 @@ void TubeForgeAudioProcessorEditor::timerCallback()
             "these pages. You can still change them -- nothing here affects the match itself -- "
             "but anything you dial in now is likely to be overwritten.");
 
+    refreshAutoMatchMarking();
+    pollAutoMatchWarning();
+
     // Only the page the user is actually looking at pulls state into its views.
     pages[static_cast<std::size_t>(activeModule)]->refresh();
 
@@ -558,6 +576,79 @@ void TubeForgeAudioProcessorEditor::timerCallback()
         diagnosticSummary + "\nDeadline " + juce::String(diagnostics.deadlineMilliseconds, 3)
         + " ms; memory " + juce::String(static_cast<double>(diagnostics.workingSetBytes) / (1024.0 * 1024.0), 1)
         + " MiB; background failures " + juce::String(diagnostics.backgroundJobFailureCount));
+}
+
+void TubeForgeAudioProcessorEditor::refreshAutoMatchMarking()
+{
+    const auto state = processor.autoMatchState();
+    const auto holding = state == tf::automatch::State::holding
+                      || state == tf::automatch::State::overridden;
+    const auto released = processor.autoMatchReleasedCount();
+    auto badge = juce::String();
+    if (holding)
+    {
+        badge = "AUTO MATCH";
+        if (processor.autoMatchTracking()) badge += "   /   TRACKING";
+        if (released > 0) badge += "   /   " + juce::String(released) + " YOURS";
+    }
+
+    // Amplifier, Pedals and Tone Shaping: the pages a matched rig actually writes, and the same
+    // three the song-match veil covers for the same reason.
+    for (const auto index : { std::size_t { 0 }, std::size_t { 1 }, std::size_t { 2 } })
+        pages[index]->setAutoMatchBadge(badge);
+
+    /* A control the host moved is handed back without a dialog -- see the guard -- so this is
+       the only place the user finds out it happened. Reported once, as a message rather than as
+       a question, because there is nothing to decide: the write has already landed. */
+    if (const auto external = processor.takeAutoMatchExternalReleases(); ! external.isEmpty())
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
+            "Auto Match handed a control back",
+            external.joinIntoString(", ") + (external.size() == 1 ? " was" : " were")
+            + " changed from outside this window -- host automation, a preset or a foot "
+              "controller. Auto Match has stopped holding "
+            + juce::String(external.size() == 1 ? "it" : "them") + " so the two do not fight.");
+}
+
+void TubeForgeAudioProcessorEditor::pollAutoMatchWarning()
+{
+    const auto owned = processor.takeAutoMatchWarning();
+    if (owned < 0) return;
+    const auto mask = tf::automatch::bit(static_cast<std::size_t>(owned));
+    // Already asked about, or the user has said they have heard enough. Either way the control
+    // is still theirs to move -- what is suppressed is the question, not the change.
+    const auto suppressed = processor.autoMatchWarningsSuppressed();
+    if (autoMatchDialogOpen || suppressed || (autoMatchWarnedMask & mask) != 0)
+    {
+        if (suppressed || (autoMatchWarnedMask & mask) != 0)
+            processor.releaseAutoMatchParameter(
+                tf::automatch::owned[static_cast<std::size_t>(owned)].id);
+        return;
+    }
+    autoMatchWarnedMask |= mask;
+    autoMatchDialogOpen = true;
+
+    const auto id = tf::automatch::owned[static_cast<std::size_t>(owned)].id;
+    tf::ui::AutoMatchDialog::show(this, processor.autoMatchParameterName(owned),
+        processor.autoMatchValueText(owned), processor.autoMatchSourceName(),
+        [safeThis = juce::Component::SafePointer<TubeForgeAudioProcessorEditor>(this), id]
+        (tf::ui::AutoMatchDialog::Answer answer, bool suppress)
+        {
+            if (safeThis == nullptr) return;
+            safeThis->autoMatchDialogOpen = false;
+            if (suppress) safeThis->processor.setAutoMatchWarningsSuppressed(true);
+            switch (answer)
+            {
+                case tf::ui::AutoMatchDialog::Answer::keepMatched:
+                    safeThis->processor.restoreAutoMatchParameter(id);
+                    break;
+                case tf::ui::AutoMatchDialog::Answer::changeAnyway:
+                    safeThis->processor.releaseAutoMatchParameter(id);
+                    break;
+                case tf::ui::AutoMatchDialog::Answer::turnOff:
+                    safeThis->processor.setAutoMatchEnabled(false);
+                    break;
+            }
+        });
 }
 
 void TubeForgeAudioProcessorEditor::chooseProjectToSave()

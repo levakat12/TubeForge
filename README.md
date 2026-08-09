@@ -54,6 +54,8 @@ See [Phase 2 coverage](docs/phase-02-coverage.md), [DSP architecture](docs/phase
 - Seven original topologies -- Tight Modern, Vintage Bloom, American Clean, British Crunch,
   Class-A Chime, Sagging Rectifier and Studio Direct -- each with guitar and bass variants, and
   each with its own drawn faceplate.
+- Sixty-two pedals over nine DSP engines, browsable by the character of the sound, each with its
+  own drawn enclosure and its own control names.
 - Profile-aware DI calibration, automatic trim suggestion, gate, pre-EQ, tightness, and pick emphasis.
 - Two-to-four responsive oversampled preamp stages with bias shift, memory, transient response, and asymmetric saturation.
 - Coupled passive, active, and bass semi-parametric tone stacks.

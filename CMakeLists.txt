@@ -184,6 +184,9 @@ target_link_libraries(nts_state PUBLIC juce::juce_core)
 
 add_library(nts_ir STATIC
     engine/ir/src/CabinetIrLoader.cpp
+    engine/ir/src/CabinetModel.cpp
+    engine/ir/src/CabinetMatch.cpp
+    engine/ir/src/CabinetLibrary.cpp
 )
 target_include_directories(nts_ir PUBLIC engine/ir/include)
 target_link_libraries(nts_ir PUBLIC nts_dsp nts_diagnostics juce::juce_audio_formats)
@@ -308,6 +311,8 @@ target_sources(TubeForge PRIVATE
     Source/ui/ModulePage.h
     Source/ui/UiSupport.cpp
     Source/ui/UiSupport.h
+    Source/ui/AutoMatchDialog.cpp
+    Source/ui/AutoMatchDialog.h
     Source/ui/ShellWidgets.cpp
     Source/ui/ShellWidgets.h
     Source/ui/AmplifierPage.cpp
@@ -334,6 +339,8 @@ target_sources(TubeForge PRIVATE
     Source/ui/ProfileLibraryPage.h
     Source/ui/CabinetPage.cpp
     Source/ui/CabinetPage.h
+    Source/ui/CabinetPicker.cpp
+    Source/ui/CabinetPicker.h
     Source/ui/TunerPage.cpp
     Source/ui/TunerPage.h
     Source/ui/CircuitPage.cpp
@@ -345,6 +352,8 @@ target_sources(TubeForge PRIVATE
     Source/PluginProcessorAudio.cpp
     Source/PluginProcessorHost.cpp
     Source/PluginProcessorAssets.cpp
+    Source/PluginProcessorAutoMatch.cpp
+    Source/AutoMatch.h
     Source/PluginProcessorSupport.cpp
     Source/PluginProcessorInternal.h
     Source/PluginProcessor.h
@@ -426,6 +435,8 @@ target_sources(nts_standalone_app PRIVATE
     Source/ui/ModulePage.h
     Source/ui/UiSupport.cpp
     Source/ui/UiSupport.h
+    Source/ui/AutoMatchDialog.cpp
+    Source/ui/AutoMatchDialog.h
     Source/ui/ShellWidgets.cpp
     Source/ui/ShellWidgets.h
     Source/ui/AmplifierPage.cpp
@@ -452,6 +463,8 @@ target_sources(nts_standalone_app PRIVATE
     Source/ui/ProfileLibraryPage.h
     Source/ui/CabinetPage.cpp
     Source/ui/CabinetPage.h
+    Source/ui/CabinetPicker.cpp
+    Source/ui/CabinetPicker.h
     Source/ui/TunerPage.cpp
     Source/ui/TunerPage.h
     Source/ui/CircuitPage.cpp
@@ -463,6 +476,8 @@ target_sources(nts_standalone_app PRIVATE
     Source/PluginProcessorAudio.cpp
     Source/PluginProcessorHost.cpp
     Source/PluginProcessorAssets.cpp
+    Source/PluginProcessorAutoMatch.cpp
+    Source/AutoMatch.h
     Source/PluginProcessorSupport.cpp
     Source/PluginProcessorInternal.h
     Source/PluginProcessor.h
@@ -684,6 +699,8 @@ if(TUBEFORGE_BUILD_TESTS)
     Source/ui/ModulePage.h
     Source/ui/UiSupport.cpp
     Source/ui/UiSupport.h
+    Source/ui/AutoMatchDialog.cpp
+    Source/ui/AutoMatchDialog.h
     Source/ui/ShellWidgets.cpp
     Source/ui/ShellWidgets.h
     Source/ui/AmplifierPage.cpp
@@ -710,6 +727,8 @@ if(TUBEFORGE_BUILD_TESTS)
     Source/ui/ProfileLibraryPage.h
     Source/ui/CabinetPage.cpp
     Source/ui/CabinetPage.h
+    Source/ui/CabinetPicker.cpp
+    Source/ui/CabinetPicker.h
     Source/ui/TunerPage.cpp
     Source/ui/TunerPage.h
     Source/ui/CircuitPage.cpp
@@ -721,6 +740,8 @@ if(TUBEFORGE_BUILD_TESTS)
     Source/PluginProcessorAudio.cpp
     Source/PluginProcessorHost.cpp
     Source/PluginProcessorAssets.cpp
+    Source/PluginProcessorAutoMatch.cpp
+    Source/AutoMatch.h
     Source/PluginProcessorSupport.cpp
     Source/PluginProcessorInternal.h
     Source/PluginProcessor.h

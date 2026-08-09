@@ -33,7 +33,8 @@ public:
     void refresh() override;
 
 private:
-    static constexpr int selectorCount = 6;
+    /// Five, not six: the cabinet selector is gone. See the note above `selectorIds`.
+    static constexpr int selectorCount = 5;
 
     std::array<juce::Label, selectorCount> captions;
     juce::ComboBox preampTube;
@@ -41,7 +42,6 @@ private:
     juce::ComboBox powerTopology;
     juce::ComboBox toneStack;
     juce::ComboBox backend;
-    juce::ComboBox cabinetStyle;
     CircuitSchematicView schematic;
 
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>,

@@ -65,7 +65,7 @@ function(tubeforge_set_warning_policy target)
 endfunction()
 
 # The highest-yield check available for this codebase: lock-free ring buffers, double-buffered
-# atomic slot swaps in the neural and circuit runtimes, raw pointer arrays into vector storage
+# atomic slot swaps in the neural runtime, raw pointer arrays into vector storage
 # throughout the DSP, and hand-written SSE2 kernels. Any of those can be off by one without a
 # single test failing.
 #
@@ -192,6 +192,7 @@ target_include_directories(nts_ir PUBLIC engine/ir/include)
 target_link_libraries(nts_ir PUBLIC nts_dsp nts_diagnostics juce::juce_audio_formats)
 
 add_library(nts_ml_runtime STATIC
+    engine/ml-runtime/src/PackedFeatureRegressor.cpp
     engine/ml-runtime/src/PackedTanhModel.cpp
     engine/ml-runtime/src/PackedWaveNetModel.cpp
     engine/ml-runtime/src/NeuralModel.cpp
@@ -217,15 +218,6 @@ add_library(nts_pedals STATIC
 target_include_directories(nts_pedals PUBLIC engine/pedals/include)
 target_link_libraries(nts_pedals PUBLIC nts_dsp nts_ml_runtime)
 
-add_library(nts_circuit STATIC
-    engine/circuit/src/CircuitTypes.cpp
-    engine/circuit/src/Components.cpp
-    engine/circuit/src/CircuitGraph.cpp
-    engine/circuit/src/CircuitProcessor.cpp
-)
-target_include_directories(nts_circuit PUBLIC engine/circuit/include)
-target_link_libraries(nts_circuit PUBLIC nts_dsp nts_ml_runtime juce::juce_core)
-
 add_library(nts_tone_analysis STATIC
     engine/tone-analysis/src/ToneAnalysis.cpp
     engine/tone-analysis/src/ToneProfileDatabase.cpp
@@ -238,7 +230,15 @@ add_library(nts_reconstruction STATIC
     engine/reconstruction/src/StemRefinement.cpp
 )
 target_include_directories(nts_reconstruction PUBLIC engine/reconstruction/include)
-target_link_libraries(nts_reconstruction PUBLIC nts_amp nts_tone_analysis juce::juce_core)
+# nts_ir is here for `measureCabinetResidual`, which is what `estimateProductionProfile` measures
+# the mix's spectral shape with. Reusing it rather than growing a second band-analysis is the
+# point: the residual the production estimate carries and the one Cabinet Match fits are then the
+# same measurement in the same bands, so they compose instead of disagreeing.
+# nts_ml_runtime is here for the optional learned production estimator. PUBLIC because
+# `estimateProductionProfile` takes one in its signature, so every consumer needs the header --
+# and the dependency is the packed loader alone, which links nothing but nts_dsp.
+target_link_libraries(nts_reconstruction PUBLIC
+    nts_amp nts_tone_analysis nts_ir nts_ml_runtime juce::juce_core)
 
 add_library(nts_assistant STATIC
     engine/assistant/src/ToneAssistant.cpp
@@ -254,7 +254,7 @@ add_library(nts_ecosystem STATIC
 target_include_directories(nts_ecosystem PUBLIC engine/ecosystem/include)
 target_link_libraries(nts_ecosystem PUBLIC nts_amp nts_ml_runtime juce::juce_cryptography)
 
-foreach(target nts_audio_core nts_dsp nts_amp nts_diagnostics nts_state nts_ir nts_ml_runtime nts_nam nts_pedals nts_circuit nts_tone_analysis nts_reconstruction nts_assistant nts_ecosystem)
+foreach(target nts_audio_core nts_dsp nts_amp nts_diagnostics nts_state nts_ir nts_ml_runtime nts_nam nts_pedals nts_tone_analysis nts_reconstruction nts_assistant nts_ecosystem)
     target_link_libraries(${target} PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags
@@ -343,12 +343,8 @@ target_sources(TubeForge PRIVATE
     Source/ui/CabinetPicker.h
     Source/ui/TunerPage.cpp
     Source/ui/TunerPage.h
-    Source/ui/CircuitPage.cpp
-    Source/ui/CircuitPage.h
-    Source/ui/ToneAnalyzerPage.cpp
-    Source/ui/ToneAnalyzerPage.h
-    Source/ui/SongMatchPage.cpp
-    Source/ui/SongMatchPage.h
+    Source/ui/ToneMatchPage.cpp
+    Source/ui/ToneMatchPage.h
     Source/PluginProcessorAudio.cpp
     Source/PluginProcessorHost.cpp
     Source/PluginProcessorAssets.cpp
@@ -401,7 +397,6 @@ target_link_libraries(TubeForge PRIVATE
     nts_audio_core
     nts_amp
     nts_ir
-    nts_circuit
     nts_tone_analysis
     nts_reconstruction
     nts_assistant
@@ -467,12 +462,8 @@ target_sources(nts_standalone_app PRIVATE
     Source/ui/CabinetPicker.h
     Source/ui/TunerPage.cpp
     Source/ui/TunerPage.h
-    Source/ui/CircuitPage.cpp
-    Source/ui/CircuitPage.h
-    Source/ui/ToneAnalyzerPage.cpp
-    Source/ui/ToneAnalyzerPage.h
-    Source/ui/SongMatchPage.cpp
-    Source/ui/SongMatchPage.h
+    Source/ui/ToneMatchPage.cpp
+    Source/ui/ToneMatchPage.h
     Source/PluginProcessorAudio.cpp
     Source/PluginProcessorHost.cpp
     Source/PluginProcessorAssets.cpp
@@ -496,7 +487,6 @@ target_link_libraries(nts_standalone_app PRIVATE
     nts_audio_core
     nts_amp
     nts_ir
-    nts_circuit
     nts_tone_analysis
     nts_reconstruction
     nts_assistant
@@ -579,10 +569,43 @@ if(TUBEFORGE_BUILD_TESTS)
     add_executable(nts_nam_cli Tests/NamCli.cpp)
     target_link_libraries(nts_nam_cli PRIVATE nts_nam)
 
-    add_executable(nts_circuit_tests Tests/CircuitTests.cpp)
-    target_include_directories(nts_circuit_tests PRIVATE Tests)
-    target_link_libraries(nts_circuit_tests PRIVATE nts_circuit)
-    add_test(NAME nts_circuit_tests COMMAND nts_circuit_tests)
+    # A tool rather than a test, for the same reason as the rig harness above: what it produces is
+    # a baseline to record, not a threshold to pass. Registering it with ctest would mean either an
+    # assertion nobody has measured yet or a number that gets edited whenever it fails, and both
+    # are worse than a tool somebody runs. Much faster than the rig harness -- it runs no search.
+    juce_add_console_app(nts_production_recovery PRODUCT_NAME "nts_production_recovery")
+    target_sources(nts_production_recovery PRIVATE Tests/ProductionRecovery.cpp)
+    target_include_directories(nts_production_recovery PRIVATE Tests)
+    target_compile_definitions(nts_production_recovery PRIVATE
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1)
+    # nts_ml_runtime is here for the optional learned estimator: the harness scores it beside the
+    # deterministic one on the same attempts, which is the only comparison that proves one beats
+    # the other rather than that two runs differed.
+    target_link_libraries(nts_production_recovery PRIVATE
+        nts_reconstruction nts_tone_analysis nts_amp nts_ml_runtime)
+
+    # A tool rather than a test, for a different reason than the probe below: it is slow. It
+    # renders every guitar voicing at three drive settings and runs a full search on each, which is
+    # minutes rather than seconds. Run it when changing anything the search depends on.
+    juce_add_console_app(nts_rig_recovery PRODUCT_NAME "nts_rig_recovery")
+    target_sources(nts_rig_recovery PRIVATE Tests/RigRecovery.cpp)
+    target_include_directories(nts_rig_recovery PRIVATE Tests)
+    target_compile_definitions(nts_rig_recovery PRIVATE
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1)
+    target_link_libraries(nts_rig_recovery PRIVATE nts_reconstruction nts_tone_analysis nts_amp)
+
+    # A tool rather than a test: it needs a folder of real recordings that cannot live in the
+    # repository, so it is built but never registered with ctest. Run it by hand against your own
+    # material -- see the file's own note for why synthetic signals cannot replace it.
+    juce_add_console_app(nts_song_probe PRODUCT_NAME "nts_song_probe")
+    target_sources(nts_song_probe PRIVATE Tests/SongProbe.cpp)
+    target_compile_definitions(nts_song_probe PRIVATE
+        JUCE_USE_MP3AUDIOFORMAT=1
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_STANDALONE_APPLICATION=1)
+    target_link_libraries(nts_song_probe PRIVATE
+        nts_reconstruction nts_tone_analysis nts_amp juce::juce_audio_formats)
 
     add_executable(nts_tone_analysis_tests Tests/ToneAnalysisTests.cpp)
     target_include_directories(nts_tone_analysis_tests PRIVATE Tests)
@@ -609,7 +632,7 @@ if(TUBEFORGE_BUILD_TESTS)
     # compile JUCE's vendored codec C (libvorbis and friends), which does not build
     # warning-clean and is not ours to fix.
     foreach(target nts_ml_runtime_tests nts_ml_runtime_cli nts_ml_runtime_benchmarks
-                   nts_pedal_tests nts_nam_tests nts_nam_cli nts_circuit_tests
+                   nts_pedal_tests nts_nam_tests nts_nam_cli
                    nts_tone_analysis_tests nts_reconstruction_tests nts_assistant_tests
                    nts_ecosystem_tests)
         tubeforge_set_warning_policy(${target})
@@ -617,7 +640,7 @@ if(TUBEFORGE_BUILD_TESTS)
 
     # The suites the sanitizer leg runs. Excludes the soak and VST3 host tests, whose runtimes
     # are impractical under ASan's slowdown.
-    foreach(target nts_ml_runtime_tests nts_pedal_tests nts_nam_tests nts_circuit_tests
+    foreach(target nts_ml_runtime_tests nts_pedal_tests nts_nam_tests
                    nts_tone_analysis_tests nts_reconstruction_tests nts_assistant_tests
                    nts_ecosystem_tests)
         tubeforge_stage_sanitizer_runtime(${target})
@@ -731,12 +754,8 @@ if(TUBEFORGE_BUILD_TESTS)
     Source/ui/CabinetPicker.h
     Source/ui/TunerPage.cpp
     Source/ui/TunerPage.h
-    Source/ui/CircuitPage.cpp
-    Source/ui/CircuitPage.h
-    Source/ui/ToneAnalyzerPage.cpp
-    Source/ui/ToneAnalyzerPage.h
-    Source/ui/SongMatchPage.cpp
-    Source/ui/SongMatchPage.h
+    Source/ui/ToneMatchPage.cpp
+    Source/ui/ToneMatchPage.h
     Source/PluginProcessorAudio.cpp
     Source/PluginProcessorHost.cpp
     Source/PluginProcessorAssets.cpp
@@ -753,7 +772,6 @@ if(TUBEFORGE_BUILD_TESTS)
         nts_audio_core
         nts_amp
         nts_ir
-        nts_circuit
         nts_tone_analysis
         nts_reconstruction
         nts_assistant

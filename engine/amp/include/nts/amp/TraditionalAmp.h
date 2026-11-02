@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <span>
@@ -889,6 +890,29 @@ private:
     std::array<double, dsp::maximumChannels> inputEnergy {};
     std::array<double, dsp::maximumChannels> outputEnergy {};
     std::array<float, dsp::maximumChannels> matchGain { 1.0f, 1.0f };
+    /** One-pole rates for the loudness matcher, computed from the sample rate in `prepare`.
+
+        **Derived rather than written as constants, because they used to be constants and that was
+        a defect**: the previous 0.9995 and 0.0002 are per-sample, so every time constant in the
+        feature halved at 96 kHz and halved again at 192. A player at a high rate got a loudness
+        matcher twice as twitchy as the one it was tuned for, which is exactly the wrong direction.
+
+        Both are the `k` of `value += k * (target - value)`, so a longer time constant is a smaller
+        number. See the note at the use site for why the constants they replace are much slower.
+    */
+    double energySmoothing { 1.0e-4 };
+    float matchSmoothing { 2.6e-5f };
+    /** How long both energy followers must have had signal before the gain may move again.
+
+        The ratio of the two is only meaningful once they are describing the *same passage*. Coming
+        out of a rest they are not: the input side has a note and the output side is still emptying
+        the amplifier's filters and its cabinet, so the ratio starts wrong and the gain chases it
+        into the front of the phrase. Waiting two energy time constants costs nothing a player can
+        hear -- the gain is held at what it settled on, which is the right answer for the same rig
+        playing the same guitar -- and removes the attack region from the measurement entirely.
+    */
+    std::array<std::uint32_t, dsp::maximumChannels> matchSettleCount {};
+    std::uint32_t matchSettleSamples { 14400 };
 };
 
 class TraditionalAmpProcessor

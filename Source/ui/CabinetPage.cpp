@@ -308,7 +308,7 @@ CabinetPage::CabinetPage(TubeForgeAudioProcessor& processorToUse)
     tf::ui::configureLabel(monoFold, "Mono fold: --", 11.0f, false, theme::textSecondary);
     tf::ui::configureLabel(help,
                            "The cabinet runs after whichever engine is selected, so it applies to "
-                           "the traditional amp, a neural capture and the physical circuit alike -- "
+                           "the traditional amp and a neural capture alike -- "
                            "which is what makes a preamp-only capture usable. Responses are decoded, "
                            "resampled to the current rate, trimmed and normalised before they are "
                            "used, then faded in, so a cabinet can be swapped while you play. The "

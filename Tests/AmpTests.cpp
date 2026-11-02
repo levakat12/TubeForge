@@ -9,12 +9,14 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <new>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <numbers>
 #include <thread>
 #include <vector>
@@ -44,6 +46,54 @@ constexpr std::size_t blockSize = 128;
 const nts::dsp::ProcessSpec monoSpec { sampleRate, blockSize, 1 };
 const nts::dsp::ProcessSpec stereoSpec { sampleRate, blockSize, 2 };
 
+using Block = std::array<float, blockSize>;
+
+/** Compares a whole rendered block against an expected one, and says where the worst error is.
+
+    **The cabinet tests read positions off a filtered impulse, so they cannot pick samples.** They
+    used to: a spike at index 0 was asserted to arrive as 1.0 at index 0, on the stated grounds
+    that setting the section's cuts to 20 Hz and 20 kHz put them out of the way. A 20 kHz low-pass
+    at a 48 kHz rate sits at 0.42 of the sample rate, and what it does to a unit impulse is spread
+    it into 0.688 followed by a ringing tail -- so every such assertion was 30% out, and the
+    neighbouring "nothing here" checks were reading that tail rather than silence.
+
+    Comparing against a *measured* reference removes the assumption. Everything these tests
+    exercise -- slot gain, polarity, mute, delay, pan, the true-stereo routing -- is applied before
+    the cuts, and gains, delays and sums all commute with a linear time-invariant filter. So the
+    expected output is the same combination applied to a reference the section itself produced,
+    and the comparison is exact rather than approximate.
+*/
+void expectSeriesNear(TestHarness& tests, const Block& actual, const Block& expected,
+                      const std::string& what)
+{
+    auto worst = 0.0;
+    std::size_t worstIndex {};
+    for (std::size_t index = 0; index < blockSize; ++index)
+    {
+        const auto error = std::abs(static_cast<double>(actual[index]) - expected[index]);
+        if (error > worst) { worst = error; worstIndex = index; }
+    }
+    tests.expect(worst < 1.0e-6, what + " (worst " + std::to_string(worst)
+                                     + " at sample " + std::to_string(worstIndex) + ")");
+}
+
+/// A reference response scaled and delayed: what one slot control does to it.
+Block scaledBy(const Block& source, float gain, std::size_t shift = 0)
+{
+    Block result {};
+    for (std::size_t index = shift; index < blockSize; ++index)
+        result[index] = source[index - shift] * gain;
+    return result;
+}
+
+Block sumOf(std::initializer_list<Block> terms)
+{
+    Block result {};
+    for (const auto& term : terms)
+        for (std::size_t index = 0; index < blockSize; ++index) result[index] += term[index];
+    return result;
+}
+
 std::vector<float> sine(std::size_t samples, double frequency, float amplitude = 0.25f)
 {
     std::vector<float> result(samples);
@@ -65,6 +115,88 @@ double magnitude(std::span<const float> samples, double frequency)
 bool finite(std::span<const float> samples)
 {
     return std::all_of(samples.begin(), samples.end(), [](float value) { return std::isfinite(value); });
+}
+
+/** Worst non-harmonic fold-back in the audible band, in dB below the fundamental.
+
+    **Exact-bin probes, because the obvious form of this measurement has a floor that hides the
+    answer.** An earlier version placed probes at round frequencies and read arbitrary bins. A
+    0.7-amplitude fundamental analysed over a record that does not hold a whole number of its
+    periods smears across every other bin, and that smear sat at about -37 dB -- so four different
+    configurations all "measured" -37.2 and the conclusion drawn was that oversampling stops
+    helping. It does not: the real figure at 4x is -52 dB, and 16 dB of genuine performance was
+    being reported as an instrument floor.
+
+    Choosing `f = bin * sampleRate / length` makes the record hold exactly `bin` periods, so a
+    rectangular window leaks nothing into any other bin centre. Harmonics land on `n * bin`, folds
+    land on that index reflected into `[0, length/2]`, and every one of them is exact. No window
+    function, and no floor above the arithmetic.
+
+    Anything landing on a real harmonic is dropped rather than counted, because at that bin the
+    fold and the harmonic are the same number and neither can be attributed.
+*/
+[[nodiscard]] double worstFoldbackDb(nts::dsp::Waveshape shape, int factor, bool antialiased,
+                                     float driveDb = 30.0f)
+{
+    constexpr std::size_t analysisLength = 16384;
+    constexpr std::size_t warmUp = 8192;
+    constexpr auto binHz = sampleRate / static_cast<double>(analysisLength);
+    constexpr auto nyquist = sampleRate * 0.5;
+
+    const auto binMagnitude = [](std::span<const float> samples, std::size_t bin)
+    {
+        const auto omega = 2.0 * std::numbers::pi * static_cast<double>(bin)
+                         / static_cast<double>(samples.size());
+        const auto coefficient = 2.0 * std::cos(omega);
+        double s1 {}, s2 {};
+        for (const auto value : samples)
+        { const auto s0 = value + coefficient * s1 - s2; s2 = s1; s1 = s0; }
+        return 2.0 * std::hypot(s1 - s2 * std::cos(omega), s2 * std::sin(omega))
+             / static_cast<double>(samples.size());
+    };
+
+    auto peak = 0.0;
+    for (const auto probeBin : { std::size_t { 401 }, std::size_t { 571 },
+                                 std::size_t { 779 }, std::size_t { 1045 } })
+    {
+        nts::amp::ResponsivePreampStage stage;
+        stage.prepare({ sampleRate, analysisLength + warmUp, 1 });
+        nts::amp::PreampStageConfig config;
+        config.driveDb = driveDb;
+        config.highCutHz = 20000.0f;
+        config.oversamplingFactor = factor;
+        config.shape = shape;
+        config.antialiasedSaturation = antialiased;
+        // Static asymmetry stays -- a symmetric curve makes only odd harmonics and half the folds
+        // here are even. The time-varying terms go, because they modulate the waveform at low
+        // frequency and put energy in these bins that is not fold-back.
+        config.asymmetry = 0.3f; config.bias = 0.05f;
+        config.dynamicBias = 0.0f; config.frequencySaturation = 0.0f;
+        config.attackReduction = 0.0f; config.memoryAmount = 0.0f;
+        stage.setConfig(config, 0); stage.reset();
+
+        auto signal = sine(analysisLength + warmUp,
+                           static_cast<double>(probeBin) * binHz, 0.7f);
+        float* channel[] { signal.data() };
+        stage.process(channel, 1, analysisLength + warmUp);
+        const auto steady = std::span(signal).subspan(warmUp, analysisLength);
+        const auto fundamental = binMagnitude(steady, probeBin);
+        if (fundamental <= 0.0) continue;
+
+        for (std::size_t harmonic = 2; harmonic <= 120; ++harmonic)
+        {
+            const auto idealBin = probeBin * harmonic;
+            if (static_cast<double>(idealBin) * binHz < nyquist) continue;
+            auto folded = idealBin % analysisLength;
+            if (folded > analysisLength / 2) folded = analysisLength - folded;
+            const auto foldedHz = static_cast<double>(folded) * binHz;
+            // Below 200 Hz the stage's DC blocker dominates; above 18 kHz the high cut does.
+            if (foldedHz < 200.0 || foldedHz > 18000.0) continue;
+            if (folded % probeBin == 0) continue;
+            peak = std::max(peak, binMagnitude(steady, folded) / fundamental);
+        }
+    }
+    return 20.0 * std::log10(std::max(peak, 1.0e-12));
 }
 
 void testCalibrationAndPreEq(TestHarness& tests)
@@ -134,50 +266,65 @@ void testPreampStages(TestHarness& tests)
     tests.expect(std::abs(afterAutomation.front() - beforeAutomation.back()) < 0.8f,
                  "preamp gain automation is ramped without an unbounded discontinuity");
 
-    // Aliasing check. A 3350 Hz tone driven hard puts its 14th harmonic at
-    // 46900 Hz, which folds back to 1100 Hz when the stage runs without
-    // oversampling. Nothing else in the chain can put energy there: the input is
-    // a pure tone, so harmonic products only ever land on multiples of 3350 Hz.
-    // That makes the level at 1100 Hz a direct measurement of fold-back.
-    constexpr auto probeHz = 3350.0;
-    constexpr auto aliasHz = 1100.0;
-    constexpr std::size_t aliasSamples = 8192;
+    /* Fold-back, and the two levers that actually move it.
 
-    const auto aliasEnergyAt = [&](int oversamplingFactor)
+       **The probe this replaces reported an instrument floor as a physical limit.** It placed
+       probes at round frequencies and read arbitrary bins, so leakage from the fundamental put a
+       hard bottom at about -37 dB on every reading -- and the conclusion drawn from that was that
+       oversampling stops paying past 2x. See `worstFoldbackDb`, which places every probe on an
+       exact bin and has no floor above the arithmetic. Measured properly, on this stage at 30 dB
+       drive:
+
+           curve      ADAA    1x      2x      4x      8x
+           tanh       off   -22.0   -34.7   -52.4   -57.9
+           tanh       on    -31.5   -44.6   -56.2   -57.9
+           hardClip   off   -21.3   -32.2   -48.5   -56.3
+           hardClip   on    -31.0   -43.0   -55.1   -56.3
+
+       Two things follow, and both are worth pinning down so they cannot quietly regress.
+
+       Oversampling is worth about 12 dB per doubling up to 4x, not the 11 the broken probe
+       suggested and not the "nothing" it suggested past that. And **antiderivative antialiasing
+       is worth 9 to 11 dB at the low factors**, which is where it matters: it attacks the corner
+       of the curve where the harmonics are generated, rather than resampling to outrun them
+       afterwards. `4x + ADAA` lands within 2 dB of plain `8x` for half the oversampling work.
+    */
+    const auto tanhShape = nts::dsp::Waveshape::hyperbolicTangent;
+    const auto clipShape = nts::dsp::Waveshape::hardClip;
+
+    tests.expect(worstFoldbackDb(tanhShape, 1, false) > -30.0,
+                 "the probe provokes real fold-back when nothing is filtering it");
+    // Generous against the measured -34.7 and -52.4, so this tracks the design rather than the
+    // last digit of an arithmetic that varies a little across compilers.
+    tests.expect(worstFoldbackDb(tanhShape, 2, false) < -30.0, "2x rejects fold-back below -30 dB");
+    tests.expect(worstFoldbackDb(tanhShape, 4, false) < -45.0, "4x rejects fold-back below -45 dB");
+    tests.expect(worstFoldbackDb(tanhShape, 4, false) < worstFoldbackDb(tanhShape, 2, false) - 10.0,
+                 "each doubling of the oversampling factor buys real rejection");
+
+    /* ADAA has to earn its place at the factors somebody would actually ship.
+
+       Asserted at 1x and 2x rather than 4x because that is where the gain is large and where the
+       decision is live: the pedals run at 1x with no antialiasing at all, and the Eco tier pins
+       the amplifier there too. A regression that quietly stopped ADAA working would show up here
+       as 9 dB, which is audible, rather than at 4x where it is worth 4. */
+    for (const auto shape : { tanhShape, clipShape })
     {
-        nts::amp::ResponsivePreampStage aliasStage;
-        aliasStage.prepare({ sampleRate, aliasSamples, 1 });
-        nts::amp::PreampStageConfig aliasConfig;
-        aliasConfig.driveDb = 30.0f;
-        aliasConfig.highCutHz = 20000.0f;
-        aliasConfig.oversamplingFactor = oversamplingFactor;
-        // Only the time-varying behaviour is disabled. Bias drift, memory, attack
-        // reduction, and dynamic saturation modulate the waveform at low
-        // frequency, which puts energy near 1100 Hz that is not fold-back.
-        // Static asymmetry is kept deliberately: a symmetric shaper produces only
-        // odd harmonics, and the 14th harmonic this probe relies on is even.
-        aliasConfig.asymmetry = 0.3f;
-        aliasConfig.bias = 0.05f;
-        aliasConfig.dynamicBias = 0.0f;
-        aliasConfig.frequencySaturation = 0.0f;
-        aliasConfig.attackReduction = 0.0f;
-        aliasConfig.memoryAmount = 0.0f;
-        aliasStage.setConfig(aliasConfig, 0);
-        aliasStage.reset();
-        auto signal = sine(aliasSamples, probeHz, 0.7f);
-        float* channel[] { signal.data() };
-        aliasStage.process(channel, 1, aliasSamples);
-        // Skip the filter warm-up so the measurement is steady state.
-        return magnitude(std::span(signal).subspan(1024), aliasHz);
-    };
+        const auto plain1x = worstFoldbackDb(shape, 1, false);
+        const auto adaa1x = worstFoldbackDb(shape, 1, true);
+        tests.expect(adaa1x < plain1x - 6.0,
+                     "antialiased saturation is worth real rejection at 1x ("
+                         + std::to_string(plain1x - adaa1x) + " dB)");
+        const auto plain2x = worstFoldbackDb(shape, 2, false);
+        const auto adaa2x = worstFoldbackDb(shape, 2, true);
+        tests.expect(adaa2x < plain2x - 6.0,
+                     "antialiased saturation is worth real rejection at 2x ("
+                         + std::to_string(plain2x - adaa2x) + " dB)");
+    }
 
-    // Measured rejection at the shipped 8 taps per phase is about -30 dB
-    // (ratio 0.033). The bound is set well clear of that so the test asserts a
-    // real effect without tracking platform-to-platform arithmetic noise.
-    const auto aliasAt1x = aliasEnergyAt(1);
-    const auto aliasAt4x = aliasEnergyAt(4);
-    tests.expect(aliasAt4x < aliasAt1x * 0.15,
-                 "4x oversampling suppresses preamp fold-back that 1x leaves in the band");
+    // A hard corner folds harder than a rounded one, which is why the voicings that clip with
+    // `hardClip` ask for the highest factors in the table.
+    tests.expect(worstFoldbackDb(clipShape, 4, false) > worstFoldbackDb(tanhShape, 4, false),
+                 "a hard clipper folds back harder than a valve curve at the same factor");
 }
 
 /** Track B: the amplifier can clip with something other than a valve.
@@ -753,6 +900,129 @@ void testVoicingBoundsAndLevels(TestHarness& tests)
                      "factory voicings sit within a usable level range of each other");
     }
 
+    /* What loudness matching does to *playing dynamics*, which is a different question from what
+       it does to a level control and is the one a player actually hears.
+
+       The feature is documented as "a slow compressor across the output that normalises the
+       amplifier's RMS back to the dry input's, so raising drive or master stops getting louder".
+       Two separate things were measured here, and only one of them was fixed:
+
+       - **Onset swell -- a defect, and fixed.** The energies were compared across the amplifier's
+         own reported latency, so at an attack the input side had a note and the output side still
+         had silence. The ratio ran toward its 4x ceiling and the gain swelled into the front of
+         every phrase after a rest: measured at **10.9 dB** against a 0.9 dB bypass baseline. With
+         the dry reference latency-aligned and the control held until both followers have settled
+         on the same passage, that is 0.8 dB -- inside the bypass baseline's own movement.
+
+       - **Expansion -- pre-existing, measured, and deliberately left alone.** `sqrt(input/output)`
+         drives output RMS towards input RMS, and an amplifier compresses, so a settled control
+         *undoes* that compression: it boosts the loud passage. Measured at +1.87 dB against a
+         +0.26 dB bypass baseline before any of this changed, and +1.99 dB after. That is the
+         feature's own target doing what it says, not a bug introduced here, and turning it into a
+         genuine compressor means changing what it aims at rather than how fast it gets there.
+         The bound below pins it where it has always been so that a future change to it is a
+         decision somebody makes rather than a side effect.
+
+       **Both measurements prime the processor before measuring, and that is not a detail.** The
+       gain smoother starts at unity and converges over its own time constant, so a measurement
+       taken from reset reads that convergence rather than the behaviour being asked about --  an
+       earlier version of this test did exactly that and reported the loud passage as *quieter*
+       than the quiet one, which is an artifact and not an amplifier.
+    */
+    {
+        const auto sustained = [](std::vector<float>& out, std::size_t begin, std::size_t end,
+                                   float amplitude)
+        {
+            for (auto n = begin; n < end && n < out.size(); ++n)
+            {
+                auto value = 0.0;
+                for (int harmonic = 1; harmonic <= 6; ++harmonic)
+                    value += std::sin(2.0 * std::numbers::pi * 110.0 * harmonic
+                                      * static_cast<double>(n - begin) / sampleRate) / harmonic;
+                out[n] = amplitude * static_cast<float>(value);
+            }
+        };
+        const auto render = [](bool loudnessMatch, const std::vector<float>& input)
+        {
+            auto preset = nts::amp::makeOriginalPreset(nts::amp::Topology::britishCrunch,
+                                                        nts::amp::Instrument::guitar);
+            preset.parameters.loudnessMatch = loudnessMatch;
+            // Off, or the quiet passage and the silence are gated and the measurement reads the
+            // gate's envelope instead of the one under test.
+            preset.parameters.gateEnabled = false;
+            nts::amp::TraditionalAmpProcessor processor;
+            processor.prepare({ sampleRate, blockSize, 1 });
+            processor.loadPreset(preset, 0);
+            return nts::amp::renderOffline(processor, input, blockSize);
+        };
+        const auto rmsOver = [](const std::vector<float>& audio, std::size_t begin, std::size_t end)
+        {
+            auto sum = 0.0;
+            for (auto n = begin; n < end && n < audio.size(); ++n)
+                sum += static_cast<double>(audio[n]) * audio[n];
+            return std::sqrt(sum / static_cast<double>(std::max<std::size_t>(1, end - begin)));
+        };
+
+        // ---- Dynamics. Two seconds at each level, measured over the last 400 ms of each, so the
+        // gain smoother has settled on that level before anything is read.
+        const auto passage = static_cast<std::size_t>(sampleRate * 2.0);
+        const auto tail = static_cast<std::size_t>(sampleRate * 0.4);
+        std::vector<float> step(passage * 2, 0.0f);
+        sustained(step, 0, passage, 0.07f);
+        sustained(step, passage, step.size(), 0.28f);
+
+        const auto stepDb = [&](bool loudnessMatch)
+        {
+            const auto audio = render(loudnessMatch, step);
+            const auto quiet = rmsOver(audio, passage - tail, passage);
+            const auto loud = rmsOver(audio, audio.size() - tail, audio.size());
+            return 20.0 * std::log10(std::max(loud, 1.0e-12) / std::max(quiet, 1.0e-12));
+        };
+        const auto appliedDb = 20.0 * std::log10(4.0);
+        const auto without = stepDb(false);
+        const auto with = stepDb(true);
+        std::cout << "  loudness match, dynamics: a " << appliedDb << " dB step arrives as "
+                  << without << " dB off / " << with << " dB on" << std::endl;
+        /* Bounded where the shipped behaviour already sat (+1.87 dB over bypass), not at zero.
+           Asserting no expansion at all would be asserting a feature nobody has built yet, and
+           would fail on the code as it shipped. */
+        tests.expect(with <= without + 2.5,
+                     "loudness matching does not expand dynamics further than it always has");
+
+        /* ---- Onset. A primed note, a gap, then the note under test.
+
+           The *second* note is the one that matters, and measuring the first would be measuring
+           something else. From reset the gain sits at unity and has never seen the amplifier, so
+           the first note of a session is uncompensated and settles -- unavoidable, once, and not
+           what a player calls a spike. What they hear is every phrase after a rest starting hot,
+           and that is this measurement. */
+        const auto note = static_cast<std::size_t>(sampleRate * 1.5);
+        const auto gap = static_cast<std::size_t>(sampleRate * 2.0);
+        std::vector<float> phrase(note + gap + note, 0.0f);
+        sustained(phrase, 0, note, 0.20f);
+        sustained(phrase, note + gap, phrase.size(), 0.20f);
+
+        const auto swellDb = [&](bool loudnessMatch)
+        {
+            const auto audio = render(loudnessMatch, phrase);
+            const auto window = static_cast<std::size_t>(sampleRate * 0.010);
+            const auto second = note + gap;
+            const auto steady = rmsOver(audio, audio.size() - window, audio.size());
+            auto peak = 0.0;
+            // From 20 ms in, so the genuine attack edge of a step into a resonant amplifier is
+            // excluded. Anything after that is the gain control moving.
+            for (auto n = second + window * 2; n + window < audio.size(); n += window)
+                peak = std::max(peak, rmsOver(audio, n, n + window));
+            return 20.0 * std::log10(std::max(peak, 1.0e-12) / std::max(steady, 1.0e-12));
+        };
+        const auto swellOff = swellDb(false);
+        const auto swellOn = swellDb(true);
+        std::cout << "  loudness match, onset:    second note swells " << swellOff << " dB off / "
+                  << swellOn << " dB on" << std::endl;
+        tests.expect(swellOn <= swellOff + 1.5,
+                     "loudness matching does not swell a phrase that follows a rest");
+    }
+
     /* On calibration, which the plan asked for and does not apply.
 
        F4 called for a per-voicing review of `CalibrationProfile`, on the reasoning that CMOS
@@ -1041,8 +1311,6 @@ void testCabinetSlotControls(TestHarness& tests)
         cabinet.loadImpulseA(responseA, {}, {}, 0);
         cabinet.loadImpulseB(responseB, {}, {}, 0);
         auto parameters = settings;
-        // The two cuts are pushed out of the way throughout: they are biquads either side of the
-        // audio band and they would smear the spikes these assertions read positions off.
         parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
         cabinet.setParameters(parameters, 0);
         cabinet.reset();
@@ -1054,6 +1322,35 @@ void testCabinetSlotControls(TestHarness& tests)
         return Result { left, right };
     };
 
+    /* Each slot's response **as this section actually delivers it**, measured rather than assumed.
+
+       This is the correction that made the rest of the file mean anything. These assertions used
+       to compare against the bare impulses -- 1.0 at index 0, 0.5 at index 2 -- on the stated
+       grounds that pushing the two cuts to 20 Hz and 20 kHz put them "out of the way". It does
+       not: a 20 kHz one-pole-pair low-pass at a 48 kHz rate sits at 0.42 of the sample rate, and
+       what it does to a unit impulse is turn it into 0.688 followed by a ringing tail. Every
+       positional assertion below was therefore comparing a filtered impulse against an unfiltered
+       one and failing by 30%, and none of it was noticed because the whole function was never
+       called from `main`.
+
+       Taking the reference from the section itself removes the assumption entirely. The cuts,
+       the convolution and the block boundary are common to reference and case alike, so what the
+       comparisons isolate is exactly the control under test and nothing else -- which is what they
+       were always meant to isolate. It also means these keep working if the cut defaults ever
+       move, which the old form did not.
+
+       Blend 0 weights slot A by one and slot B by zero, and blend 1 does the reverse, so these two
+       renders are the slots' unit responses through the whole chain. */
+    nts::amp::CabinetParameters slotAOnly; slotAOnly.blend = 0.0f;
+    nts::amp::CabinetParameters slotBOnly; slotBOnly.blend = 1.0f;
+    const auto slotA = render(slotAOnly).left;
+    const auto slotB = render(slotBOnly).left;
+
+    /* Every control below is a gain, a delay or a routing decision applied *before* the two cuts,
+       and all three commute with a linear time-invariant filter -- so the expected output is the
+       same combination applied to the measured responses. That is why these are exact to 1e-6
+       rather than approximate. See `expectSeriesNear`. */
+
     /* The compatibility case. Full width with the pans left alone must put slot A alone on the
        left and slot B alone on the right -- which is the rule the loop had hard-coded before a
        slot could be panned, and therefore the sound every saved project with width up expects. */
@@ -1061,10 +1358,8 @@ void testCabinetSlotControls(TestHarness& tests)
         nts::amp::CabinetParameters parameters;
         parameters.blend = 0.5f; parameters.width = 1.0f;
         const auto result = render(parameters);
-        tests.expectNear(result.left[0], 1.0, 1.0e-6, "full width puts slot A alone on the left");
-        tests.expectNear(result.left[2], 0.0, 1.0e-6, "slot B does not reach the left channel");
-        tests.expectNear(result.right[2], 0.5, 1.0e-6, "full width puts slot B alone on the right");
-        tests.expectNear(result.right[0], 0.0, 1.0e-6, "slot A does not reach the right channel");
+        expectSeriesNear(tests, result.left, slotA, "full width puts slot A alone on the left");
+        expectSeriesNear(tests, result.right, slotB, "full width puts slot B alone on the right");
     }
 
     // Unity level and no trim: the summed default has to be the plain blend, unscaled.
@@ -1072,8 +1367,8 @@ void testCabinetSlotControls(TestHarness& tests)
         nts::amp::CabinetParameters parameters;
         parameters.blend = 0.5f;
         const auto result = render(parameters);
-        tests.expectNear(result.left[0], 0.5, 1.0e-6, "slot A defaults to unity level");
-        tests.expectNear(result.left[2], 0.25, 1.0e-6, "slot B defaults to unity level");
+        expectSeriesNear(tests, result.left, sumOf({ scaledBy(slotA, 0.5f), scaledBy(slotB, 0.5f) }),
+                         "both slots default to unity level and sum at the blend weights");
     }
 
     // A slot's own delay moves that slot and nothing else. Slot A's is the new one; before it,
@@ -1083,9 +1378,8 @@ void testCabinetSlotControls(TestHarness& tests)
         parameters.blend = 0.5f;
         parameters.slots[0].delaySamples = 5;
         const auto result = render(parameters);
-        tests.expectNear(result.left[0], 0.0, 1.0e-6, "delaying slot A clears its original position");
-        tests.expectNear(result.left[5], 0.5, 1.0e-6, "slot A arrives exactly its delay later");
-        tests.expectNear(result.left[2], 0.25, 1.0e-6, "slot B is untouched by slot A's delay");
+        expectSeriesNear(tests, result.left, sumOf({ scaledBy(slotA, 0.5f, 5), scaledBy(slotB, 0.5f) }),
+                         "slot A arrives exactly its delay later and slot B is untouched");
     }
 
     // Mute is silence, not attenuation, and the section must stop paying for the slot as well.
@@ -1094,8 +1388,8 @@ void testCabinetSlotControls(TestHarness& tests)
         parameters.blend = 0.5f;
         parameters.slots[1].mute = true;
         const auto result = render(parameters);
-        tests.expectNear(result.left[2], 0.0, 1.0e-6, "a muted slot contributes nothing");
-        tests.expectNear(result.left[0], 0.5, 1.0e-6, "muting one slot leaves the other alone");
+        expectSeriesNear(tests, result.left, scaledBy(slotA, 0.5f),
+                         "a muted slot contributes nothing and leaves the other alone");
     }
 
     // Polarity on slot A, which had none: inverting one side of a two-microphone blend is the
@@ -1105,8 +1399,8 @@ void testCabinetSlotControls(TestHarness& tests)
         parameters.blend = 0.5f;
         parameters.slots[0].phaseInvert = true;
         const auto result = render(parameters);
-        tests.expectNear(result.left[0], -0.5, 1.0e-6, "slot A polarity inverts slot A");
-        tests.expectNear(result.left[2], 0.25, 1.0e-6, "slot A polarity leaves slot B alone");
+        expectSeriesNear(tests, result.left, sumOf({ scaledBy(slotA, -0.5f), scaledBy(slotB, 0.5f) }),
+                         "slot A polarity inverts slot A and leaves slot B alone");
     }
 
     // The output trim scales everything after the blend, and -6.0206 dB is exactly a half.
@@ -1115,8 +1409,8 @@ void testCabinetSlotControls(TestHarness& tests)
         parameters.blend = 0.5f;
         parameters.outputTrimDb = -6.0205999f;
         const auto result = render(parameters);
-        tests.expectNear(result.left[0], 0.25, 1.0e-5, "the output trim scales the summed cabinet");
-        tests.expectNear(result.left[2], 0.125, 1.0e-5, "the output trim scales both slots alike");
+        expectSeriesNear(tests, result.left, sumOf({ scaledBy(slotA, 0.25f), scaledBy(slotB, 0.25f) }),
+                         "the output trim scales both slots alike");
     }
 
     // Centring both pans is the thing width could not previously express: a placement that
@@ -1126,9 +1420,9 @@ void testCabinetSlotControls(TestHarness& tests)
         parameters.blend = 0.5f; parameters.width = 1.0f;
         parameters.slots[0].pan = 0.0f; parameters.slots[1].pan = 0.0f;
         const auto result = render(parameters);
-        tests.expectNear(result.left[0], 0.5, 1.0e-6, "two centred slots place slot A on both sides");
-        tests.expectNear(result.right[0], 0.5, 1.0e-6, "and identically on the right");
-        tests.expectNear(result.left[2], 0.25, 1.0e-6, "with slot B placed alongside it");
+        const auto centred = sumOf({ scaledBy(slotA, 0.5f), scaledBy(slotB, 0.5f) });
+        expectSeriesNear(tests, result.left, centred, "two centred slots collapse width back onto the sum");
+        expectSeriesNear(tests, result.right, centred, "and identically on the right");
     }
 }
 
@@ -1176,23 +1470,50 @@ void testCabinetTrueStereo(TestHarness& tests)
         return Result { left, right };
     };
 
+    /* The chain's response to a single unit tap, measured the same way the cases below are.
+
+       Each of the four terms is one spike, so with the cuts in the path every term arrives as this
+       shape scaled by its height and delayed by its position. Reading sample 0, 1, 2 and 3
+       directly -- which is what these assertions used to do -- reads each term plus the ringing
+       tails of the other three, which is why "does not trigger the RL term" was failing against
+       energy that belonged to LL. */
+    const std::array<float, 8> unitTap { 1.0f, 0, 0, 0, 0, 0, 0, 0 };
+    const auto unit = [&]
+    {
+        nts::amp::CabinetSection reference;
+        reference.prepare(stereoSpec);
+        reference.loadImpulseA(unitTap, unitTap, {}, 0);
+        const std::array<float, 8> silence {};
+        reference.loadImpulseB(silence, silence, {}, 0);
+        nts::amp::CabinetParameters parameters;
+        parameters.blend = 0.0f;
+        parameters.lowCutHz = 20.0f; parameters.highCutHz = 20000.0f;
+        reference.setParameters(parameters, 0);
+        reference.reset();
+        Block left {}, right {};
+        left[0] = 1.0f;
+        float* channels[] { left.data(), right.data() };
+        reference.process(channels, 2, blockSize);
+        return left;
+    }();
+
     /* An impulse on the left input only. With true stereo engaged the left output carries LL and
        the right output carries LR; nothing should appear where RL and RR live. */
     {
         const auto result = render(true, 1.0f, 0.0f);
-        tests.expectNear(result.left[0], 1.0, 1.0e-6, "left in reaches left out through LL");
-        tests.expectNear(result.right[2], 0.5, 1.0e-6, "left in reaches right out through LR");
-        tests.expectNear(result.left[3], 0.0, 1.0e-6, "left in does not trigger the RL term");
-        tests.expectNear(result.right[1], 0.0, 1.0e-6, "left in does not trigger the RR term");
+        expectSeriesNear(tests, result.left, scaledBy(unit, 1.0f, 0),
+                         "left in reaches left out through LL and nothing else");
+        expectSeriesNear(tests, result.right, scaledBy(unit, 0.5f, 2),
+                         "left in reaches right out through LR alone");
     }
 
     // And the mirror: an impulse on the right input takes RR and RL.
     {
         const auto result = render(true, 0.0f, 1.0f);
-        tests.expectNear(result.right[1], 0.8, 1.0e-6, "right in reaches right out through RR");
-        tests.expectNear(result.left[3], 0.25, 1.0e-6, "right in reaches left out through RL");
-        tests.expectNear(result.left[0], 0.0, 1.0e-6, "right in does not trigger the LL term");
-        tests.expectNear(result.right[2], 0.0, 1.0e-6, "right in does not trigger the LR term");
+        expectSeriesNear(tests, result.right, scaledBy(unit, 0.8f, 1),
+                         "right in reaches right out through RR alone");
+        expectSeriesNear(tests, result.left, scaledBy(unit, 0.25f, 3),
+                         "right in reaches left out through RL alone");
     }
 
     /* Without the cross terms the slot must behave exactly as it always has: the two direct
@@ -1200,8 +1521,9 @@ void testCabinetTrueStereo(TestHarness& tests)
        is in, so it is the one that must not have moved. */
     {
         const auto result = render(false, 1.0f, 0.0f);
-        tests.expectNear(result.left[0], 1.0, 1.0e-6, "an ordinary stereo response still passes LL");
-        tests.expectNear(result.right[2], 0.0, 1.0e-6,
+        expectSeriesNear(tests, result.left, scaledBy(unit, 1.0f, 0),
+                         "an ordinary stereo response still passes LL");
+        expectSeriesNear(tests, result.right, Block {},
                          "and nothing crosses between the channels without cross terms");
     }
 }
@@ -1761,6 +2083,35 @@ void testAudioRegressionAndRealtime(TestHarness& tests)
     bass voicings leans on it as the precondition for touching the shared saturator, the bass path
     and the dry blend at all.
 
+    ---
+
+    **They were regenerated once, deliberately, and this is the decision.**
+
+    The loudness matcher put an ~11 dB gain surge on the front of any phrase that followed a rest
+    of more than about a second. Its two energy followers decayed below their update floor during
+    the rest, the gain drifted back to unity, and the next note arrived uncompensated and then
+    ramped down over the following tenth of a second. Measured against a bypassed baseline of
+    0.9 dB, in `nts_amp_tests`, before and after:
+
+        after a 2 s rest, the next phrase swelled   11.0 dB  ->  0.9 dB
+        a 12 dB dynamic step arrived as              2.2 dB  ->  2.0 dB
+
+    **The amplifier itself did not change, and that is why this was allowed.** `matchGain` is a
+    scalar multiply on the very last line of `AmpVoice::process`, downstream of every non-linear
+    stage and fed back into none of them. The saturators, the tone stack, the power amp, the
+    cabinet and the bass path all render the same samples they always did. What moved is the
+    trajectory of one output gain during the first ~300 ms after silence, and it converges to the
+    same settled value it always converged to -- so a sustained note is unchanged and only its
+    attack differs.
+
+    Over this test's own stimulus -- 85 ms of continuous sine from reset, which sits entirely
+    inside that attack window -- the renders differ by -2.4 to +1.6 dB RMS. That is the whole of
+    the compatibility cost, and it is the sound of the defect being removed rather than of a
+    voicing being revoiced.
+
+    To reject this decision, restore the hashes from git history and revert the loudness matcher in
+    `AmpVoice::process` and `AmpVoice::prepare`; the two changes are inseparable.
+
     A hash rather than stored audio because the failure is binary. There is no useful notion of
     "nearly the right amplifier" here, and 14 renders of stored float would be half a megabyte in
     the repository to say the same thing.
@@ -1768,22 +2119,23 @@ void testAudioRegressionAndRealtime(TestHarness& tests)
 void testOriginalVoicingRegression(TestHarness& tests)
 {
     struct Golden { std::string_view name; std::uint64_t hash; };
-    // Captured from the pre-bass-topology build. See the note above before touching them.
+    /* Captured from the pre-bass-topology build, then re-captured once when the loudness matcher's
+       onset surge was removed. See the note above -- both halves of it -- before touching them. */
     constexpr std::array<Golden, 14> goldens { {
-        { "tightModern/guitar", 13736008448498962631ull },
-        { "tightModern/bass", 6352694481359901093ull },
-        { "vintageBloom/guitar", 17866495747281218636ull },
-        { "vintageBloom/bass", 9071400359841382050ull },
-        { "americanClean/guitar", 8115985061413987186ull },
-        { "americanClean/bass", 17103613497921938587ull },
-        { "britishCrunch/guitar", 15760522335369434937ull },
-        { "britishCrunch/bass", 2360016342175368192ull },
-        { "classAChime/guitar", 1197813929854403933ull },
-        { "classAChime/bass", 14523401880314385465ull },
-        { "saggingRectifier/guitar", 13373013645590942393ull },
-        { "saggingRectifier/bass", 7667099778163236981ull },
-        { "studioDirect/guitar", 18071372094858142022ull },
-        { "studioDirect/bass", 3514709347172934587ull }
+        { "tightModern/guitar", 9917902844456241026ull },
+        { "tightModern/bass", 8013360849852872075ull },
+        { "vintageBloom/guitar", 12079148678998029657ull },
+        { "vintageBloom/bass", 16030192688957640349ull },
+        { "americanClean/guitar", 3555341865197542410ull },
+        { "americanClean/bass", 4886453119213937882ull },
+        { "britishCrunch/guitar", 3625943279486084837ull },
+        { "britishCrunch/bass", 5978338663692938712ull },
+        { "classAChime/guitar", 11950951919787376174ull },
+        { "classAChime/bass", 8477083490650316800ull },
+        { "saggingRectifier/guitar", 1313623463481672072ull },
+        { "saggingRectifier/bass", 918383551572355192ull },
+        { "studioDirect/guitar", 4441757232371733162ull },
+        { "studioDirect/bass", 5626360615311614299ull }
     } };
 
     // An A at 110 Hz: low enough that the bass path's crossover and the supply sag both engage,
@@ -1814,6 +2166,15 @@ void testOriginalVoicingRegression(TestHarness& tests)
             if (hash != goldens[golden].hash)
             {
                 allMatch = false;
+                /* Printed as well as failed, because "the hash differs" is true of a rounding
+                   change and of a wholly different amplifier alike, and the decision this guard
+                   demands cannot be made from a boolean. Peak and RMS say how far. */
+                auto peak = 0.0f; auto sum = 0.0;
+                for (const auto sample : rendered)
+                { peak = std::max(peak, std::abs(sample)); sum += static_cast<double>(sample) * sample; }
+                std::cout << "  " << goldens[golden].name << ": peak " << peak << " rms "
+                          << std::sqrt(sum / static_cast<double>(std::max<std::size_t>(1, rendered.size())))
+                          << "  hash " << hash << "ull" << std::endl;
                 tests.expect(false, std::string { "voicing changed sound: " }
                                         + std::string { goldens[golden].name });
             }
@@ -1863,5 +2224,16 @@ int main()
     testCalibrationAndPreEq(tests); testPreampStages(tests); testWaveshapeSelection(tests);
     testBiAmpPath(tests); testDryBlendAlignment(tests); testVoicingBoundsAndLevels(tests);
     testPanelSwitches(tests); testTonePhaseAndPower(tests);
+    /* These five were defined and never called, so the binary reported success without running
+       them -- and one of them is `testOriginalVoicingRegression`, the guard the bass-topology
+       notes cite as proof that the seven shipped voicings are unchanged. It was proving nothing.
+       `testCabinetAndPresets` is the worst of it by volume: it is the only caller of six further
+       cabinet tests, so the whole cabinet section of this file was dead too.
+
+       A test that is not in this list does not exist. There is no registration mechanism here to
+       forget to use -- the list *is* the mechanism -- so the only defence is that adding a test
+       function and not adding it here has to be noticed in review. */
+    testTopologyTable(tests); testCabinetAndPresets(tests); testCompleteGraphs(tests);
+    testAudioRegressionAndRealtime(tests); testOriginalVoicingRegression(tests);
     return tests.result();
 }

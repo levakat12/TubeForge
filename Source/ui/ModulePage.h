@@ -21,9 +21,9 @@ public:
     /// but only while the page is showing, and once immediately when the page is opened.
     ///
     /// This is for *display* only. Engine work that has to happen whether or not anyone is
-    /// looking -- recompiling the physical circuit, draining the assistant's audio-thread
-    /// queue -- stays in the shell's tick, because gating it on visibility would silently
-    /// stop it when the user switched pages.
+    /// looking -- draining the assistant's audio-thread queue, say -- stays in the shell's
+    /// tick, because gating it on visibility would silently stop it when the user switched
+    /// pages.
     virtual void refresh() {}
 
     /** Tells a page which of its controls the performance tier has taken over.
@@ -57,8 +57,6 @@ public:
         veilReason = std::move(reason);
         repaint();
     }
-
-    [[nodiscard]] bool songMatchVeilShown() const noexcept { return veilShown; }
 
     /** A standing note that Auto Match is holding the controls on this page.
 

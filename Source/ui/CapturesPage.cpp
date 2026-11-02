@@ -12,7 +12,7 @@ namespace
 constexpr int rowHeight = 42;
 /// The pedal Kind choice is built from PedalKind, so this cannot drift from it.
 constexpr int neuralPedalKind = static_cast<int>(nts::pedals::PedalKind::neuralCapture);
-/// "Neural capture" in the engine-mode choice list: Traditional, Neural capture, Physical circuit.
+/// "Neural capture" in the engine-mode choice list: Traditional, Neural capture.
 constexpr int neuralEngineMode = 1;
 } // namespace
 

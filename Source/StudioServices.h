@@ -6,6 +6,7 @@
 
 #include <juce_core/juce_core.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +29,28 @@
     the host parameters, which arrives as a callback rather than a back-reference so the
     dependency runs one way.
 */
+/** What applying a matched candidate is allowed to do to the rest of the rig.
+
+    This was a `bool isolateChain`, and two states are one short. Bypassing the board and closing
+    the sends is the right default because it plays back the candidate that was actually ranked,
+    and leaving them alone is the right answer for a player who set them up on purpose -- but
+    neither of those *reproduces the record*, which is a third thing and the only one that uses
+    what the match measured about the mix.
+
+    `matchRecord` is deliberately not the default and never inherited: it can double-process a
+    part that already carries its own room, and it overwrites effect settings the player made. It
+    has to be chosen.
+*/
+enum class ChainMode
+{
+    /// Pedals bypassed, sends closed. The candidate as it was ranked.
+    bypass,
+    /// Untouched.
+    leaveAlone,
+    /// Written from the match's `ProductionProfile`.
+    matchRecord
+};
+
 class StudioServices
 {
 public:
@@ -36,16 +59,23 @@ public:
         Called on the message thread. Supplied by the owner because parameter objects belong
         to the processor, and reaching back for them is what this separation exists to avoid.
 
-        `isolateChain` asks for the parts of the live rig the offline render never contained --
-        the pedals in front and the time effects behind -- to be taken out of the way, so what
-        is heard is the amplifier that was actually scored rather than that amplifier through
-        whatever else happened to be set up.
+        `mode` decides what happens to the parts of the live rig the offline render never
+        contained -- the pedals in front and the time effects behind. `bypass` takes them out of
+        the way, so what is heard is the amplifier that was actually scored rather than that
+        amplifier through whatever else happened to be set up. `leaveAlone` keeps them.
+        `matchRecord` writes them from `profile`.
+
+        `profile` is passed on every call and ignored unless `mode` is `matchRecord`, so the
+        decision lives in one place rather than being split between a flag here and a lookup
+        there. It may be invalid -- a match whose production could not be estimated -- and the
+        owner is expected to fall back to `bypass` rather than write zeros.
 
         Reporting what is still in the chain afterwards belongs to the owner as well, for the
         same reason: it means reading the live parameters, which this class deliberately
         cannot do.
     */
-    using ApplyRig = std::function<void(const nts::amp::AmpParameters&, bool isolateChain)>;
+    using ApplyRig = std::function<void(const nts::amp::AmpParameters&, ChainMode mode,
+                                        const nts::reconstruction::ProductionProfile& profile)>;
 
     explicit StudioServices(ApplyRig applyRig);
     ~StudioServices();
@@ -98,8 +128,28 @@ public:
         False when there is no song to re-run against, or when the target has not changed.
     */
     [[nodiscard]] bool requestReconstructionInstrument(nts::reconstruction::TargetInstrument target);
-    [[nodiscard]] bool applyReconstructionCandidate(std::size_t index, bool isolateChain);
+    [[nodiscard]] bool applyReconstructionCandidate(std::size_t index, ChainMode mode);
     [[nodiscard]] juce::Result exportReconstruction(const juce::File& file) const;
+
+    /** What the record did to the guitar after the amplifier, if a match measured it.
+
+        A narrow accessor for the same reason `reconstructionReferenceTone` is one: the page that
+        labels the "Match the record" setting wants to know whether there is anything to apply and
+        how much of it to believe, several times a second, and does not want the candidates and
+        regions that come with the whole result.
+    */
+    [[nodiscard]] nts::reconstruction::ProductionProfile productionProfile() const;
+
+    /** Which estimator produced the last profile, named for the interface.
+
+        "built-in mapping" or the installed model's directory name. Reported rather than inferred
+        from `ProductionProfile::learned` at the call site, because a user comparing two machines
+        needs to know *which* model, not merely that there was one.
+    */
+    [[nodiscard]] juce::String productionEstimatorName() const;
+
+    /// Which instrument the last match was made against. Defaults to guitar before any match.
+    [[nodiscard]] nts::reconstruction::TargetInstrument reconstructionTarget() const;
 
     /** The tone of the song a reconstruction was matched against, if there is one.
 
@@ -148,6 +198,41 @@ private:
     nts::reconstruction::StemSeparator stemSeparator;
     nts::reconstruction::RigReconstructor rigReconstructor;
     mutable std::mutex reconstructionMutex;
+    /** The installed production estimator, or an unloaded one when there is none.
+
+        Loaded once on the first match rather than in the constructor: the file may appear while
+        the plug-in is running -- somebody installs it between two matches -- and a constructor
+        read would mean a restart before it took effect, which is the behaviour the neural
+        separator's runtime manifest was deliberately given and not the one it wants.
+
+        Never a reason to fail a match. An absent, corrupt or wrongly shaped model leaves this
+        unloaded and `estimateProductionProfile` produces the built-in answer, which is the whole
+        point of the fallback.
+    */
+    /** One estimator per target, because the two do not read the same features.
+
+        **Not one model with an instrument flag.** The spectral residual's 41 bands span 70 Hz to
+        8 kHz for guitar and 30 Hz to 8 kHz for bass -- the floor moves so a bass's fundamental
+        octave is inside the measurement at all -- so column 20 stands for a different frequency
+        on each target. A single model handed both would be reading two different feature sets
+        through one set of weights, and would not fail: it would produce plausible numbers.
+
+        Each is checked once and separately, so installing a bass estimator does not require a
+        guitar one to exist, and a broken one of either kind leaves the other working.
+    */
+    struct ProductionEstimator
+    {
+        nts::ml::PackedFeatureRegressor model;
+        bool checked {};
+        std::string status { "built-in mapping" };
+    };
+    std::array<ProductionEstimator, 2> productionEstimators;
+    /// What the *last completed match* used, which is what the interface reports.
+    std::string productionModelStatus { "built-in mapping" };
+    /// Loads this target's estimator if it has not been looked for yet. Null when there is none.
+    [[nodiscard]] const nts::ml::PackedFeatureRegressor* loadProductionModel(
+        nts::reconstruction::TargetInstrument target);
+
     std::optional<nts::reconstruction::ReconstructionResult> latestReconstruction;
     /** The normalised reference audio the last reconstruction was fitted from, mono.
 

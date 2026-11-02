@@ -155,6 +155,76 @@ juce::var migrateV5ToV6(const juce::var& source)
     return migrated;
 }
 
+/** Where the six physical-circuit selectors sat in the plug-in's `ampControlIds`, and where its
+    engine-mode choice sits.
+
+    This library is the project format and deliberately knows nothing about parameters -- which is
+    exactly why these three numbers are stated here rather than inferred. A migration that drops
+    controls out of a positional list cannot be written without knowing which positions, and the
+    honest place for that knowledge is next to the migration that uses it, frozen at the values
+    the version-6 format had. They describe a format that no longer changes, so unlike the
+    plug-in's live table they can never drift.
+*/
+constexpr int removedCircuitControlsFirst = 28;
+constexpr int removedCircuitControlsCount = 6;
+constexpr int engineModeControlIndex = 25;
+/// "Physical circuit" in the version-6 engine-mode choice list: Traditional, Neural capture,
+/// Physical circuit. The engine it named is gone, so a project holding it comes back Traditional.
+constexpr double removedEngineModeChoice = 2.0;
+
+juce::var migrateV6ToV7(const juce::var& source)
+{
+    /* Version 7 removes the physical circuit engine.
+
+       Two things travel with it, and both have to be undone here rather than left for `fromVar`
+       to shrug at. The graph's `physicalCircuitJson` simply goes: nothing reads a circuit graph
+       any more, and leaving the property would preserve a description of an engine that cannot be
+       built. The harder one is `ampControls`, which the plug-in walks *positionally* -- the six
+       circuit selectors sat at indices 28 to 33, in the middle, so deleting them from the live
+       table without splicing them out of saved projects would shift every value after them by
+       six. That failure is silent and total: an old project's gate threshold would arrive as a
+       delay time, and nothing would warn, because a positional remap produces perfectly valid
+       numbers in the wrong fields.
+
+       A project holding "Physical circuit" as its engine mode is put back on Traditional. It is
+       the honest answer -- the engine that project asked for does not exist -- and it is the safe
+       direction: Traditional makes sound with the controls the project already carries, where
+       Neural capture would be silent until somebody loaded a model. */
+    auto migrated = source.clone();
+    auto* root = migrated.getDynamicObject();
+    root->setProperty("schemaVersion", 7);
+
+    auto graph = root->getProperty("graph");
+    if (auto* graphObject = graph.getDynamicObject())
+    {
+        graphObject->removeProperty("physicalCircuitJson");
+        // Never read by anything. See the note on GraphState.
+        graphObject->removeProperty("enabled");
+    }
+
+    auto engine = root->getProperty("engine");
+    if (auto* engineObject = engine.getDynamicObject())
+    {
+        if (const auto* controls = engineObject->getProperty("ampControls").getArray())
+        {
+            juce::Array<juce::var> remaining;
+            remaining.ensureStorageAllocated(controls->size());
+            for (int index = 0; index < controls->size(); ++index)
+            {
+                if (index >= removedCircuitControlsFirst
+                    && index < removedCircuitControlsFirst + removedCircuitControlsCount)
+                    continue;
+                // Compared with a tolerance because the value travels through JSON as a double.
+                const auto isRemovedEngineMode = index == engineModeControlIndex
+                    && std::abs(static_cast<double>((*controls)[index]) - removedEngineModeChoice) < 0.5;
+                remaining.add(isRemovedEngineMode ? juce::var(0.0) : (*controls)[index]);
+            }
+            engineObject->setProperty("ampControls", juce::var(remaining));
+        }
+    }
+    return migrated;
+}
+
 juce::var toVar(const ProjectState& state)
 {
     auto* root = new juce::DynamicObject();
@@ -180,8 +250,6 @@ juce::var toVar(const ProjectState& state)
 
     auto* graph = new juce::DynamicObject();
     graph->setProperty("latencySamples", state.graph.latencySamples);
-    graph->setProperty("enabled", state.graph.enabled);
-    graph->setProperty("physicalCircuitJson", juce::String::fromUTF8(state.graph.physicalCircuitJson.c_str()));
     root->setProperty("graph", juce::var(graph));
 
     auto* ui = new juce::DynamicObject();
@@ -220,6 +288,7 @@ juce::var toVar(const ProjectState& state)
     auto* autoMatch = new juce::DynamicObject();
     autoMatch->setProperty("holding", state.autoMatch.holding);
     autoMatch->setProperty("isolatedChain", state.autoMatch.isolatedChain);
+    autoMatch->setProperty("matchProduction", state.autoMatch.matchProduction);
     autoMatch->setProperty("heldValues", floatArray(state.autoMatch.heldValues));
     autoMatch->setProperty("releasedIndices", integerArray(state.autoMatch.releasedIndices));
     root->setProperty("autoMatch", juce::var(autoMatch));
@@ -253,8 +322,6 @@ ProjectState fromVar(const juce::var& root)
 
     const auto graph = root.getProperty("graph", {});
     state.graph.latencySamples = static_cast<int>(graph.getProperty("latencySamples", 0));
-    state.graph.enabled = static_cast<bool>(graph.getProperty("enabled", true));
-    state.graph.physicalCircuitJson = graph.getProperty("physicalCircuitJson", "").toString().toStdString();
 
     const auto ui = root.getProperty("ui", {});
     state.ui.width = static_cast<int>(ui.getProperty("width", 760));
@@ -293,6 +360,9 @@ ProjectState fromVar(const juce::var& root)
     const auto autoMatch = root.getProperty("autoMatch", {});
     state.autoMatch.holding = static_cast<bool>(autoMatch.getProperty("holding", false));
     state.autoMatch.isolatedChain = static_cast<bool>(autoMatch.getProperty("isolatedChain", false));
+    // Absent in everything written before the apply path went three-way, and false is exactly
+    // right for those: they were saved by a build that could not write production at all.
+    state.autoMatch.matchProduction = static_cast<bool>(autoMatch.getProperty("matchProduction", false));
     state.autoMatch.heldValues = readFloatArray(autoMatch.getProperty("heldValues", {}));
     state.autoMatch.releasedIndices = readIntegerArray(autoMatch.getProperty("releasedIndices", {}));
 
@@ -324,6 +394,7 @@ StateResult deserialize(std::string_view json)
     if (sourceVersion <= 3) parsed = migrateV3ToV4(parsed);
     if (sourceVersion <= 4) parsed = migrateV4ToV5(parsed);
     if (sourceVersion <= 5) parsed = migrateV5ToV6(parsed);
+    if (sourceVersion <= 6) parsed = migrateV6ToV7(parsed);
 
     auto state = fromVar(parsed);
     std::string error;
@@ -370,11 +441,6 @@ bool validate(const ProjectState& state, std::string& error) noexcept
     if (state.graph.latencySamples < 0)
     {
         error = "Graph latency cannot be negative";
-        return false;
-    }
-    if (state.graph.physicalCircuitJson.size() > 1024U * 1024U)
-    {
-        error = "Physical circuit state exceeds the 1 MiB safety limit";
         return false;
     }
     for (const auto& path : state.assets.relativePaths)

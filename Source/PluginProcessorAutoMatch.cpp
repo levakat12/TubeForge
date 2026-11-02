@@ -132,12 +132,15 @@ void TubeForgeAudioProcessor::parameterValueChanged(int parameterIndex, float ne
     autoExternalReleaseMask.fetch_or(mask, std::memory_order_acq_rel);
 }
 
-void TubeForgeAudioProcessor::captureAutoMatchSnapshot(bool isolatedChain)
+void TubeForgeAudioProcessor::captureAutoMatchSnapshot(ChainMode mode)
 {
     for (std::size_t owned = 0; owned < tf::automatch::ownedCount; ++owned)
         autoMatchValues[owned] = valueOf(parameterState,
                                          std::string(tf::automatch::owned[owned].id).c_str());
-    autoMatchIsolatedChain = isolatedChain;
+    autoMatchChainMode = mode;
+    // A new rig is a new starting point for tracking, so the envelope does not carry the previous
+    // match's loudest moment into the first bar played through this one.
+    autoMatchPeakEnvelope = 0.0f;
     {
         const std::scoped_lock lock(autoMatchMutex);
         autoMatchSource = studio.reconstructionSourceName().toStdString();
@@ -147,7 +150,11 @@ void TubeForgeAudioProcessor::captureAutoMatchSnapshot(bool isolatedChain)
     autoReleasedMask.store(0, std::memory_order_release);
     autoExternalReleaseMask.store(0, std::memory_order_release);
     autoWarningRequest.store(-1, std::memory_order_release);
-    autoHeldMask.store(tf::automatch::maskFor(isolatedChain), std::memory_order_release);
+    /* Held across the chain whenever the apply wrote it -- which is both "bypass them" and
+       "match the record", and neither is "leave mine alone". Passing `mode == bypass` here would
+       leave every control the production layer just wrote unguarded, so the first time the user
+       nudged one nothing would notice it had been the match's value. */
+    autoHeldMask.store(tf::automatch::maskFor(mode != ChainMode::leaveAlone), std::memory_order_release);
 }
 
 void TubeForgeAudioProcessor::clearAutoMatchHold() noexcept
@@ -162,7 +169,8 @@ void TubeForgeAudioProcessor::clearAutoMatchHold() noexcept
     cabinetHold.store(CabinetHold::none, std::memory_order_release);
 }
 
-void TubeForgeAudioProcessor::applyAutoMatchRig(const nts::amp::AmpParameters& rig, bool isolateChain)
+void TubeForgeAudioProcessor::applyAutoMatchRig(const nts::amp::AmpParameters& rig, ChainMode mode,
+                                                const nts::reconstruction::ProductionProfile& profile)
 {
     /* What the user has taken back has to survive the re-run.
 
@@ -180,7 +188,7 @@ void TubeForgeAudioProcessor::applyAutoMatchRig(const nts::amp::AmpParameters& r
                                   valueOf(parameterState,
                                           std::string(tf::automatch::owned[owned].id).c_str()) });
 
-    applyRecoveredRig(rig, isolateChain);
+    applyRecoveredRig(rig, mode, profile);
 
     {
         const AutoWriteScope scope(*this);
@@ -209,7 +217,15 @@ void TubeForgeAudioProcessor::refreshAutoMatch()
     const auto result = studio.reconstructionSnapshot();
     if (! result || ! result->success || result->candidates.empty()) return;
 
-    applyAutoMatchRig(result->candidates.front().rigPreset.parameters, autoMatchIsolatePreference);
+    /* The production estimate goes with the rig even on the automatic path, because the
+       preference the page pushed is what pressing Apply would have done and a re-derivation that
+       quietly did something else would be the surprise this whole guard exists to avoid. An
+       unmeasured profile falls back to bypassing the chain for the same reason it does on the
+       manual path -- `applyProductionProfile` refuses an invalid one outright. */
+    const auto production = studio.productionProfile();
+    const auto chainMode = autoMatchChainPreference == ChainMode::matchRecord && ! production.valid
+                         ? ChainMode::bypass : autoMatchChainPreference;
+    applyAutoMatchRig(result->candidates.front().rigPreset.parameters, chainMode, production);
 
     logger.log({ std::chrono::system_clock::now(), nts::diagnostics::LogSeverity::info,
                  "automatch", "rig-applied", "Auto Match applied a completed song match",
@@ -255,12 +271,23 @@ void TubeForgeAudioProcessor::updateAutoMatchTracking()
     // noise floor and leave it there for the first note.
     if (signal.inputPeak < 3.0e-4f) return;
 
+    /* The measurement this acts on, held rather than sampled.
+
+       0.944 per 500 ms tick is about a decibel a second. Rises are taken immediately, because a
+       hotter guitar is news; falls are taken slowly, because a quiet bar is not. Without this the
+       control was reading a peak-hold that decays in a tenth of a second, so it moved with the
+       playing rather than with the instrument -- and each move is a step in gain applied to
+       whatever is played next. */
+    autoMatchPeakEnvelope = std::max(signal.inputPeak, autoMatchPeakEnvelope * 0.944f);
+
     // Six either side of what the match set, and never further: this follows an instrument
     // change, not a different rig. Beyond that bound the answer is to re-run the match.
     constexpr auto rangeDb = 6.0f;
-    // A deadband wide enough that ordinary playing dynamics do not move the control, and narrow
-    // enough that swapping to a hotter guitar does.
-    constexpr auto deadbandDb = 0.75f;
+    /* A deadband wide enough that ordinary playing dynamics do not move the control, and narrow
+       enough that swapping to a hotter guitar does. Widened from 0.75 dB when the envelope above
+       was added: the two work together, and 0.75 dB against a measurement that moves is a control
+       that moves. Half a step of a typical pickup-output difference is still well inside it. */
+    constexpr auto deadbandDb = 1.5f;
 
     const AutoWriteScope scope(*this);
 
@@ -269,7 +296,7 @@ void TubeForgeAudioProcessor::updateAutoMatchTracking()
         {
             // Aims the incoming peak at -6 dBFS, which is the headroom the preamp stages expect
             // and what the calibrator assumes when it suggests a trim.
-            const auto desired = -6.0f - decibels(signal.inputPeak);
+            const auto desired = -6.0f - decibels(autoMatchPeakEnvelope);
             const auto target = std::clamp(desired, *matched - rangeDb, *matched + rangeDb);
             if (std::abs(target - valueOf(parameterState, ParameterIds::input)) > deadbandDb)
                 setParameterValue(parameterState, ParameterIds::input, target);
@@ -318,7 +345,12 @@ nts::state::AutoMatchState TubeForgeAudioProcessor::autoMatchProjectState() cons
     if (held == 0) return saved;
 
     saved.holding = true;
-    saved.isolatedChain = autoMatchIsolatedChain;
+    /* The three-way mode written back as the pair `ProjectState` stores. `isolatedChain` keeps
+       exactly the meaning it had, so a project written here still loads in a build that predates
+       "match the record" -- as "leave mine alone", which is the honest degradation: that build
+       cannot write production, and claiming it isolated the chain would be worse. */
+    saved.isolatedChain = autoMatchChainMode == ChainMode::bypass;
+    saved.matchProduction = autoMatchChainMode == ChainMode::matchRecord;
     saved.heldValues.assign(autoMatchValues.begin(), autoMatchValues.end());
     const auto released = autoReleasedMask.load(std::memory_order_acquire);
     for (std::size_t owned = 0; owned < tf::automatch::ownedCount; ++owned)
@@ -333,8 +365,11 @@ void TubeForgeAudioProcessor::restoreAutoMatchProjectState(const nts::state::Aut
     if (! saved.holding || saved.heldValues.size() != tf::automatch::ownedCount) return;
 
     std::copy(saved.heldValues.begin(), saved.heldValues.end(), autoMatchValues.begin());
-    autoMatchIsolatedChain = saved.isolatedChain;
-    autoHeldMask.store(tf::automatch::maskFor(saved.isolatedChain), std::memory_order_release);
+    autoMatchChainMode = saved.matchProduction ? ChainMode::matchRecord
+                       : saved.isolatedChain    ? ChainMode::bypass
+                                                : ChainMode::leaveAlone;
+    autoHeldMask.store(tf::automatch::maskFor(autoMatchChainMode != ChainMode::leaveAlone),
+                       std::memory_order_release);
 
     std::uint64_t released {};
     for (const auto index : saved.releasedIndices)

@@ -1,5 +1,7 @@
 ﻿#include <nts/reconstruction/SourceReconstruction.h>
 
+#include <nts/ir/CabinetMatch.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -213,24 +215,106 @@ std::string tuningFamily(int lowestMidi)
     }
 }
 
-std::pair<GainCharacter, float> estimateGainCharacter(const StereoAudio& audio,
-                                                       std::size_t begin, std::size_t end)
-{
-    end = std::min(end, audio.samples());
-    if (end <= begin) return { GainCharacter::clean, 0.0f };
+/** What distortion does that brightness does not: energy at integer multiples of the fundamental.
 
-    // Distortion is identified by how fast the waveform moves between *adjacent*
-    // samples, so the analysis has to stay on adjacent samples. Reading every
-    // stride'th sample instead, as this previously did once a region exceeded
-    // five seconds, decimates with no low-pass and aliases away precisely the
-    // high-frequency content that separates a distorted tone from a clean one.
-    // Long regions therefore scored lower than they should and high-gain parts
-    // were classified as crunch or clean. Cost is bounded by covering a long
-    // region with contiguous windows spread across it instead.
-    constexpr std::size_t analysisBudget = 240000;
-    const auto span = end - begin;
-    const auto windowCount = span <= analysisBudget ? std::size_t { 1 } : std::size_t { 64 };
-    const auto windowLength = std::min(span / windowCount, analysisBudget / windowCount);
+    The measure this replaces was adjacent-sample slew, and slew is a spectral-centroid detector
+    wearing a distortion label -- `2*sin(pi*f/fs)` for energy centred at f, so it needs roughly
+    3 kHz of centroid to saturate and reads about 0.16 of its 0.60 allowance for a guitar sitting
+    near 800 Hz. Measured against engine renders of every voicing at three drive settings, 19 of 21
+    classified clean, including high-gain voicings driven hot. It read cymbals, production and
+    separator artifacts as distortion, and an isolated guitar as clean however hard it was driven.
+
+    `harmonicity` is the share of measured energy that lands on multiples of the fundamental rather
+    than between them. It is the term that rejects what the old measure fell for: cymbals, hiss and
+    separation artifacts are inharmonic, so they raise the between-harmonic floor and push this
+    down rather than up.
+
+    `richness` is the share of *harmonic* energy above the third partial. This is the distortion
+    cue proper. A clean string's partials fall away steeply; clipping generates upper harmonics and
+    flattens that decay. Because it is a ratio within the harmonic series, it does not care how
+    bright the signal is overall -- a dark distorted amplifier still reads rich, which is precisely
+    the case the centroid measure could not see.
+
+    Windowed and averaged rather than measured once, because a region is a riff and not a note. Each
+    window gets its own fundamental from a decimated autocorrelation -- the same trick the tuner
+    uses to stay cheap -- and windows with no clear pitch are skipped rather than guessed at, so
+    percussive or silent stretches contribute nothing instead of contributing noise.
+*/
+struct HarmonicMeasurement
+{
+    /// Share of measured energy on harmonics rather than between them. Low means noise-like.
+    float harmonicity {};
+    /// Share of harmonic energy above the third partial. High means clipped.
+    float richness {};
+    /// Fraction of windows that had a usable pitch at all.
+    float coverage {};
+};
+
+/// Energy at one frequency, by Goertzel. Cheaper than a transform when a handful of bins is all
+/// that is wanted, and exact at the bin rather than smeared across one.
+double goertzelPower(std::span<const float> window, double frequency, double sampleRate) noexcept
+{
+    if (window.empty() || frequency <= 0.0 || frequency >= sampleRate * 0.5) return 0.0;
+    const auto omega = 2.0 * std::numbers::pi * frequency / sampleRate;
+    const auto coefficient = 2.0 * std::cos(omega);
+    double first {}, second {};
+    const auto count = static_cast<double>(window.size());
+    for (std::size_t index = 0; index < window.size(); ++index)
+    {
+        // Hann, applied here rather than into a scratch buffer: the harmonics of a low note sit
+        // close together, and an unwindowed probe leaks one partial into its neighbours badly
+        // enough to wash out the ratio being measured.
+        const auto taper = 0.5 - 0.5 * std::cos(2.0 * std::numbers::pi
+                                                * static_cast<double>(index) / count);
+        const auto sample = static_cast<double>(window[index]) * taper;
+        const auto current = sample + coefficient * first - second;
+        second = first;
+        first = current;
+    }
+    return std::max(0.0, first * first + second * second - coefficient * first * second);
+}
+
+/// Fundamental of one window, by autocorrelation on a decimated copy. Returns 0 when nothing in
+/// the searched range stands out, which is the answer for a percussive or silent window.
+double windowFundamental(std::span<const float> window, double sampleRate) noexcept
+{
+    constexpr int decimation = 6;
+    const auto reducedRate = sampleRate / decimation;
+    const auto reducedCount = window.size() / decimation;
+    if (reducedCount < 64) return 0.0;
+    std::vector<float> reduced(reducedCount);
+    for (std::size_t index = 0; index < reducedCount; ++index)
+    {
+        auto sum = 0.0f;
+        for (int tap = 0; tap < decimation; ++tap) sum += window[index * decimation + static_cast<std::size_t>(tap)];
+        reduced[index] = sum / static_cast<float>(decimation);
+    }
+    // 70 Hz to 800 Hz covers a detuned low string up to the top of where a riff's fundamental sits.
+    const auto shortestLag = static_cast<std::size_t>(reducedRate / 800.0);
+    const auto longestLag = std::min(reducedCount / 2, static_cast<std::size_t>(reducedRate / 70.0));
+    if (longestLag <= shortestLag) return 0.0;
+    double zeroLag {};
+    for (const auto sample : reduced) zeroLag += static_cast<double>(sample) * sample;
+    if (zeroLag <= 1.0e-12) return 0.0;
+    auto bestLag = std::size_t {};
+    double bestScore {};
+    for (auto lag = shortestLag; lag <= longestLag; ++lag)
+    {
+        double sum {};
+        for (std::size_t index = 0; index + lag < reducedCount; ++index)
+            sum += static_cast<double>(reduced[index]) * reduced[index + lag];
+        if (sum > bestScore) { bestScore = sum; bestLag = lag; }
+    }
+    // A periodic window correlates strongly with itself one period later; noise does not.
+    if (bestLag == 0 || bestScore < zeroLag * 0.30) return 0.0;
+    return reducedRate / static_cast<double>(bestLag);
+}
+
+HarmonicMeasurement measureHarmonicStructure(const StereoAudio& audio, std::size_t begin, std::size_t end)
+{
+    HarmonicMeasurement measurement;
+    end = std::min(end, audio.samples());
+    if (end <= begin) return measurement;
 
     const auto monoAt = [&audio](std::size_t index)
     {
@@ -238,39 +322,104 @@ std::pair<GainCharacter, float> estimateGainCharacter(const StereoAudio& audio,
         return 0.5f * (audio.left[index] + right);
     };
 
-    double energy {}, derivativeEnergy {};
-    float peak {};
-    std::size_t samples {}, crossings {};
-    for (std::size_t window = 0; window < windowCount; ++window)
+    // ~93 ms at 48 kHz: long enough to resolve the partials of a low note, short enough that one
+    // window holds one note of a riff rather than three.
+    const auto windowLength = std::min(end - begin, static_cast<std::size_t>(audio.sampleRate * 0.093));
+    if (windowLength < 512) return measurement;
+    const auto available = (end - begin) / windowLength;
+    // Bounded so a long region costs the same as a short one; spread rather than taken from the
+    // front, because the front of a region is often its quietest part.
+    const auto windowCount = std::max<std::size_t>(1, std::min<std::size_t>(available, 24));
+
+    std::vector<float> window(windowLength);
+    double harmonicTotal {}, interTotal {}, upperTotal {}, voiced {};
+    for (std::size_t index = 0; index < windowCount; ++index)
     {
-        const auto start = windowCount == 1
-            ? begin : begin + (span - windowLength) * window / (windowCount - 1);
-        const auto stop = std::min(end, start + windowLength);
-        auto previous = monoAt(start);
-        energy += static_cast<double>(previous) * previous;
-        peak = std::max(peak, std::abs(previous));
-        ++samples;
-        for (auto index = start + 1; index < stop; ++index)
+        const auto start = begin + (available <= 1 ? 0 : (available - 1) * index / windowCount * windowLength);
+        if (start + windowLength > end) break;
+        for (std::size_t sample = 0; sample < windowLength; ++sample) window[sample] = monoAt(start + sample);
+
+        const auto fundamental = windowFundamental(window, audio.sampleRate);
+        if (fundamental <= 0.0) continue;
+        ++voiced;
+
+        double harmonics {}, between {}, upper {};
+        for (int partial = 1; partial <= 12; ++partial)
         {
-            const auto value = monoAt(index);
-            energy += static_cast<double>(value) * value;
-            const auto difference = value - previous;
-            derivativeEnergy += static_cast<double>(difference) * difference;
-            if (std::signbit(value) != std::signbit(previous)) ++crossings;
-            peak = std::max(peak, std::abs(value)); previous = value; ++samples;
+            const auto frequency = fundamental * partial;
+            if (frequency >= audio.sampleRate * 0.45) break;
+            const auto power = goertzelPower(window, frequency, audio.sampleRate);
+            harmonics += power;
+            /* From the third partial up.
+
+               The third is not an arbitrary place to start: symmetric clipping -- which is what a
+               push-pull output stage and most pedals do -- generates odd harmonics, and the third
+               is by far the largest of them. Starting at the fourth, as this first did, discarded
+               the single strongest evidence of clipping there is and rated a hard-clipped sine as
+               clean, because a square wave's energy is still dominated by its fundamental. The
+               second is deliberately excluded: a plucked string has a strong second of its own, so
+               counting it would measure the instrument rather than the amplifier. */
+            if (partial >= 3) upper += power;
+            // Halfway to the next partial: nothing musical lives there, so whatever does is noise,
+            // leakage, another instrument, or a separation artifact.
+            const auto betweenFrequency = fundamental * (static_cast<double>(partial) + 0.5);
+            if (betweenFrequency < audio.sampleRate * 0.45)
+                between += goertzelPower(window, betweenFrequency, audio.sampleRate);
         }
+        const auto measured = harmonics + between;
+        if (measured <= 1.0e-12) continue;
+        harmonicTotal += harmonics;
+        interTotal += between;
+        upperTotal += harmonics > 0.0 ? upper / harmonics : 0.0;
     }
 
-    const auto rms = std::sqrt(static_cast<float>(energy / std::max<std::size_t>(1, samples)));
-    const auto crest = peak / std::max(rms, 1.0e-7f);
-    const auto derivativeRatio = std::sqrt(static_cast<float>(derivativeEnergy / std::max(energy, 1.0e-12)));
-    // Crossings and duration now come from the same adjacent-sample material, so
-    // the rate needs no stride extrapolation to undo the decimation.
-    const auto seconds = static_cast<float>(samples) / static_cast<float>(audio.sampleRate);
-    const auto crossingRate = static_cast<float>(crossings) / std::max(seconds, 1.0e-6f);
-    const auto score = clamp01(clamp01((derivativeRatio - 0.045f) / 0.22f) * 0.60f
-        + clamp01((crossingRate - 450.0f) / 2600.0f) * 0.25f
-        + clamp01((4.5f - crest) / 2.8f) * 0.15f);
+    if (voiced <= 0.0) return measurement;
+    measurement.coverage = static_cast<float>(voiced / static_cast<double>(windowCount));
+    const auto measured = harmonicTotal + interTotal;
+    measurement.harmonicity = measured > 0.0 ? static_cast<float>(harmonicTotal / measured) : 0.0f;
+    measurement.richness = static_cast<float>(upperTotal / voiced);
+    return measurement;
+}
+
+std::pair<GainCharacter, float> estimateGainCharacter(const StereoAudio& audio,
+                                                       std::size_t begin, std::size_t end)
+{
+    end = std::min(end, audio.samples());
+    if (end <= begin) return { GainCharacter::clean, 0.0f };
+
+    /* Distortion, measured from harmonic structure rather than from brightness.
+
+       The `richness` span below is calibrated against two measured distributions rather than
+       chosen: engine renders of every guitar voicing at three drive settings through a clean DI
+       are the anchors, all measured: an engine render of the cleanest voicing sits near 0.04, the
+       highest-gain voicing driven hard near 0.28, the genuinely clean intro of a metal track near
+       0.20, and its rhythm sections above 0.45. Mapping 0.03 to 0.61 across the term is the span
+       that keeps all four on the right side of the two thresholds, and it is tight -- the clean
+       intro and the driven render sit close together, because a real clean recording carries more
+       harmonic content than a synthetic driven one. Re-measure before moving these numbers; they
+       are a fit to data, not a derivation, and `nts_rig_recovery` and `nts_song_probe` produced
+       them.
+
+       `harmonicity` and `coverage` gate the term rather than adding to it. Both answer "should
+       this reading be trusted at all" -- inharmonic material has no harmonic series to be rich in,
+       and a region where no window held a pitch has nothing to measure. Untrusted collapses toward
+       clean, which is the safe direction: it declines to claim distortion rather than inventing
+       it from noise, and inventing it from noise is exactly what the previous measure did.
+
+       Crest was tried as corroborating evidence and removed after measurement. An undistorted
+       sine has a crest factor of 1.41, which a "low crest means compressed" term reads as heavily
+       driven -- it scored 0.18 on a pure tone before any harmonic content was considered. That is
+       the same mistake as the slew term in a different coat: a property of the waveform's shape
+       standing in for a property of the amplifier.
+
+       Zero-crossing rate and adjacent-sample slew are gone. Both were brightness measures: slew is
+       `2*sin(pi*f/fs)` for energy centred at f, so it needed roughly 3 kHz of centroid to saturate
+       and read a cabinet-filtered guitar as clean at any drive, while reading cymbals and
+       separation artifacts as heavy distortion. */
+    const auto harmonic = measureHarmonicStructure(audio, begin, end);
+    const auto harmonicTrust = clamp01((harmonic.harmonicity - 0.45f) / 0.25f);
+    const auto coverageTrust = clamp01(harmonic.coverage / 0.30f);
+    const auto score = clamp01((harmonic.richness - 0.03f) / 0.58f) * harmonicTrust * coverageTrust;
     return { score < 0.34f ? GainCharacter::clean : score < 0.62f ? GainCharacter::crunch
                                                                        : GainCharacter::distorted,
              score };
@@ -393,13 +542,34 @@ constexpr std::array<int, 5> centredGainSteps { 0, -1, 1, -2, 2 };
     guessed mapping, so its centre is already the best coarse answer and perturbing it here
     would cost pool slots that gain and brightness use better. Refinement explores it.
 */
+/** How many voicings the coarse grid actually samples.
+
+    **The bug this exists to stop was that the answer used to be one.** Topology was the slowest
+    digit -- `(variant / 45)` -- and the pool is twelve, so the coarse pass never advanced past
+    index 0 and the entire refinement budget was spent on whichever voicing happened to be first.
+    Every other voicing then met that refined point cold, in a parameter neighbourhood fitted for
+    a different amplifier. Combined with a gain classifier that answered "crunch" for nearly
+    everything, that produced the same amplifier for every song.
+
+    Three is a deliberate compromise, not a magic number. Topology is *not* a refinement axis --
+    `refinementNeighbours` leaves it alone, because stepping a discrete voicing restarts the
+    search rather than refining it -- so a voicing the coarse pass never samples cannot be
+    improved later, only compared cold. Brightness and tightness *are* refinement axes and can be
+    recovered, which is why they yield their coarse budget to topology here. Every voicing is
+    still rendered by the topology re-check afterwards; this decides only which few get a fitted
+    starting point.
+*/
+constexpr std::size_t coarseTopologySamples = 3;
+
 CandidatePoint coarsePoint(const nts::tone::ToneReport& report, float dynamics, std::size_t variant,
                            std::span<const nts::amp::Topology> eligible)
 {
+    const auto topologyChoices = eligible.empty()
+        ? std::size_t { 1 } : std::min(eligible.size(), coarseTopologySamples);
     const auto gainStep = centredGainSteps[variant % 5];
-    const auto brightnessStep = centredSteps[(variant / 5) % 3];
-    const auto tightnessStep = centredSteps[(variant / 15) % 3];
-    const auto topologyStep = eligible.empty() ? std::size_t {} : (variant / 45) % eligible.size();
+    const auto topologyStep = (variant / 5) % topologyChoices;
+    const auto brightnessStep = centredSteps[(variant / (5 * topologyChoices)) % 3];
+    const auto tightnessStep = centredSteps[(variant / (15 * topologyChoices)) % 3];
     const auto offset = static_cast<float>(gainStep) * 0.06f;
 
     CandidatePoint point;
@@ -550,6 +720,55 @@ std::vector<CandidatePoint> refinementNeighbours(const CandidatePoint& centre, f
 }
 } // namespace
 
+float topologyGainAffinity(nts::amp::Topology topology, GainCharacter character) noexcept
+{
+    /* One row per voicing in `Topology` order, one column per `GainCharacter`: clean, crunch,
+       distorted.
+
+       Read a row as "how much does this measurement argue for this amplifier". The rows are not
+       normalised and do not need to be -- only the spread within a column matters, because every
+       candidate in one search is scored against the same measured character.
+
+       Three columns rather than the five of `nts::tone::GainCategory`, and that is a correction
+       rather than a simplification. The five-way category is computed from a gain axis on which a
+       pure undistorted sine reads 0.475 against a `clean` threshold of 0.16 -- clean and
+       edge-of-breakup are unreachable, so it answered "crunch" for nearly everything and the
+       search collapsed onto the one voicing that wins the crunch column. Three columns measured
+       from something that discriminates beat five that do not.
+
+       The guitar block first. `studioDirect` and `americanClean` are the two with real headroom,
+       so they answer for clean and fall away fastest as the reference gets dirtier. `classAChime`
+       is cathode-biased with almost no negative feedback, so it is compressing before it is
+       distorting: it leans clean but stays useful into crunch. `vintageBloom` and `britishCrunch`
+       are the two that break up in the *power* section, which is what crunch is. `tightModern` and
+       `saggingRectifier` are the high-gain pair.
+
+       The bass-native block is read the same way from its own entries: `hybridMosfet` is the one
+       built to disappear, `cathodeVintage` compresses the moment it is played, `shortPathGrind`
+       fuzzes out early by design, and `cmosModern` is the high-gain one. */
+    constexpr std::size_t characterCount = 3;
+    constexpr std::array<std::array<float, characterCount>, nts::amp::topologyCount> affinity { {
+        //                    clean  crunch  distorted
+        /* tightModern      */ { -0.8f, +0.3f, +1.0f },
+        /* vintageBloom     */ { -0.3f, +0.9f, +0.1f },
+        /* americanClean    */ { +0.9f,  0.0f, -0.7f },
+        /* britishCrunch    */ { -0.4f, +1.0f, +0.4f },
+        /* classAChime      */ { +0.7f, +0.5f, -0.5f },
+        /* saggingRectifier */ { -0.9f, +0.4f, +1.0f },
+        /* studioDirect     */ { +1.0f, -0.4f, -0.9f },
+        /* valveFlagship    */ { +0.1f, +0.8f, +0.5f },
+        /* cathodeVintage   */ { +0.7f, +0.4f, -0.4f },
+        /* hybridMosfet     */ { +1.0f, -0.3f, -0.7f },
+        /* shortPathGrind   */ { -0.7f, +0.5f, +0.9f },
+        /* solidStateBiAmp  */ { +0.7f, +0.2f, -0.2f },
+        /* cmosModern       */ { -0.8f, +0.4f, +1.0f },
+    } };
+    const auto row = static_cast<std::size_t>(topology);
+    const auto column = static_cast<std::size_t>(character);
+    if (row >= affinity.size() || column >= characterCount) return 0.0f;
+    return affinity[row][column];
+}
+
 std::vector<nts::amp::Topology> searchableTopologies(nts::amp::Instrument instrument)
 {
     std::vector<nts::amp::Topology> eligible;
@@ -557,13 +776,66 @@ std::vector<nts::amp::Topology> searchableTopologies(nts::amp::Instrument instru
     for (std::size_t index = 0; index < nts::amp::topologyCount; ++index)
     {
         const auto topology = static_cast<nts::amp::Topology>(index);
+        const auto bassNative = nts::amp::topologyAffinity(topology) == nts::amp::TopologyAffinity::bass;
         // A bass-native voicing still answers for guitar -- `makeOriginalPreset` gives every one a
         // guitar reading -- so this decides what is *searched*, not what exists.
-        if (instrument == nts::amp::Instrument::guitar
-            && nts::amp::topologyAffinity(topology) == nts::amp::TopologyAffinity::bass)
+        if (instrument == nts::amp::Instrument::guitar && bassNative) continue;
+        // See the note above. Temporary, and deliberately the only line that reads the switch.
+        if (bassSearchesBassVoicingsOnly && instrument == nts::amp::Instrument::bass && ! bassNative)
             continue;
         eligible.push_back(topology);
     }
+    return eligible;
+}
+
+/** How much a voicing built for this instrument is preferred at equal gain fit.
+
+    **A bass reference used to search guitar amplifiers almost exclusively, and this is why.**
+    Instrument affinity filtered the pool and then never touched the order, so the sort ran on gain
+    character alone and ties broke on enum order -- where the seven guitar voicings occupy indices
+    0-6 and the six bass-native ones 7-12. A bass-native voicing could therefore never win a tie.
+    The measured consequence, at `poolSize` 12 and `coarseTopologySamples` 3, which give the top
+    three voicings five, five and two coarse fits:
+
+        clean      studioDirect  first, guitar  7/12 of the coarse pool
+        crunch     britishCrunch first, guitar 10/12
+        distorted  tightModern   first, guitar 10/12
+
+    In all three the *first* entry was a guitar voicing, and the first entry is where the whole
+    coordinate descent is spent -- the topology re-check afterwards only re-renders the point that
+    descent already fitted to something else, which the note at that re-check calls out as an
+    unfair comparison between voicings.
+
+    0.25 is a tie-break plus a modest prior, not an override. The affinity column spans -1 to +1
+    and the differences that mean anything are around 0.1 to 0.2, so a guitar voicing that fits the
+    measured gain character by more than a quarter still wins -- which is the intended outcome for
+    a bass part that genuinely sounds like a guitar amplifier. At 0.4 the clean column collapses to
+    bass-only and that choice stops being the measurement's to make; at 0.15 the crunch column does
+    not move at all. Both were computed against the table above before this landed on 0.25.
+*/
+constexpr float instrumentNativeBonus = 0.25f;
+
+std::vector<nts::amp::Topology> searchOrderForGain(nts::amp::Instrument instrument,
+                                                   GainCharacter character)
+{
+    auto eligible = searchableTopologies(instrument);
+    // Zero for guitar, because `searchableTopologies` has already removed every bass-native voicing
+    // from a guitar search -- there is nothing left for a bonus to reorder, and a guitar
+    // reconstruction therefore searches exactly the order it always did.
+    const auto nativeBonus = [instrument](nts::amp::Topology topology)
+    {
+        return instrument == nts::amp::Instrument::bass
+            && nts::amp::topologyAffinity(topology) == nts::amp::TopologyAffinity::bass
+                ? instrumentNativeBonus : 0.0f;
+    };
+    // Stable, so equal affinities keep enum order and the same reference always searches the
+    // same way. A reconstruction that reordered itself between runs would be untraceable.
+    std::stable_sort(eligible.begin(), eligible.end(),
+                     [character, &nativeBonus](nts::amp::Topology first, nts::amp::Topology second)
+                     {
+                         return topologyGainAffinity(first, character) + nativeBonus(first)
+                              > topologyGainAffinity(second, character) + nativeBonus(second);
+                     });
     return eligible;
 }
 
@@ -952,13 +1224,133 @@ ReferenceNormalization normalizeReference(const StereoAudio& audio, bool reduceR
             (*channel)[index] = std::clamp(value * scale, -2.0f, 2.0f);
         }
     result.roomTailReduced = reduceRoomTail;
-    const auto quarter = std::max<std::size_t>(1, result.audio.samples() / 4);
-    const auto low = rmsRange(result.audio.left, 0, quarter);
-    const auto middle = rmsRange(result.audio.left, quarter, quarter * 3);
-    const auto high = rmsRange(result.audio.left, quarter * 3, result.audio.samples());
-    const auto average = std::max((low + middle + high) / 3.0f, 1.0e-7f);
-    result.broadProductionEqDb = { db(low / average), db(middle / average), db(high / average) };
+    /* There was a `broadProductionEqDb` here, three numbers named as a spectral balance and
+       computed from `rmsRange(left, 0, quarter)`, `(quarter, quarter * 3)` and `(quarter * 3,
+       end)`. Those arguments are *sample indices*: it measured the first quarter, middle half and
+       last quarter of the region's duration -- an envelope, under a spectral name. Nothing ever
+       read it. `estimateProductionProfile` measures the real thing, in sixth-octave bands,
+       against a render of the chosen candidate. */
     return result;
+}
+
+std::vector<float> productionFeatures(const nts::tone::ToneAnalysisResult& tone,
+                                       const ProductionProfile& profile)
+{
+    if (profile.spectralResidualDb.size() != 41) return {};
+    std::vector<float> features;
+    features.reserve(productionFeatureCount);
+    const auto& spatial = tone.features.spatial;
+    const auto& dynamics = tone.features.dynamic;
+    for (const auto value : { spatial.stereoWidth, spatial.roomReverbEstimate,
+                              spatial.doubleTrackingLikelihood, spatial.panning,
+                              spatial.modulation, spatial.delayPresence,
+                              spatial.channelCorrelation })
+        features.push_back(value);
+    for (const auto value : { dynamics.crestFactorDb, dynamics.transientPreservation,
+                              dynamics.compressionAmount, dynamics.attackMilliseconds,
+                              dynamics.releaseMilliseconds, dynamics.sustain,
+                              dynamics.gainReductionEstimateDb, dynamics.loudnessRangeDb,
+                              dynamics.integratedLoudnessDb })
+        features.push_back(value);
+    for (const auto value : profile.spectralResidualDb) features.push_back(value);
+    return features;
+}
+
+nts::ir::CabinetMatchOptions productionResidualOptions(TargetInstrument target) noexcept
+{
+    nts::ir::CabinetMatchOptions options;
+    // See the header. 30 Hz reaches a five-string's low B; the guitar default stays at 70, where
+    // everything below is somebody else's instrument.
+    if (target == TargetInstrument::bass) options.lowLimitHz = 30.0f;
+    return options;
+}
+
+ProductionProfile estimateProductionProfile(const ReferenceNormalization& normalized,
+                                             const nts::tone::ToneAnalysisResult& tone,
+                                             std::span<const float> referenceMono,
+                                             std::span<const float> candidateRender,
+                                             double sampleRate,
+                                             TargetInstrument target,
+                                             const nts::ml::PackedFeatureRegressor* model)
+{
+    ProductionProfile profile;
+    /* The level the guitar actually sat at, relative to what normalisation forced it to. Not
+       folded into the amplifier's own output gain: that is a property of the voicing, and
+       overwriting it would make every matched rig of a loud part clip and every quiet one
+       disappear. The clamp matters -- a near-silent region gives `originalLoudnessDb` near
+       -120, and the difference would be an offset no output stage could survive. */
+    profile.levelOffsetDb = std::clamp(normalized.originalLoudnessDb - normalized.normalizedLoudnessDb,
+                                       -24.0f, 24.0f);
+
+    const auto& spatial = tone.features.spatial;
+    const auto& dynamics = tone.features.dynamic;
+    profile.roomAmount = clamp01(spatial.roomReverbEstimate);
+    profile.delayAmount = clamp01(spatial.delayPresence);
+    profile.doubling = clamp01(spatial.doubleTrackingLikelihood);
+    profile.stereoWidth = clamp01(spatial.stereoWidth);
+    profile.compression = clamp01(dynamics.compressionAmount);
+
+    /* The spectral half, when there is a render to compare against.
+
+       `measureCabinetResidual` levels each spectrum to its own mean before differencing, so what
+       comes back is a shape rather than a loudness -- which is exactly what is wanted here,
+       because the loudness is already `levelOffsetDb` and counting it twice would apply it
+       twice. The residual conflates mix EQ with cabinet error: if the matched cabinet is wrong,
+       that error lands here and would be re-applied as "production". `confidence` is how the
+       caller is told, and it is why the interface runs Cabinet Match first where it can. */
+    auto residualConfidence = 0.0f;
+    auto haveResidual = false;
+    if (! referenceMono.empty() && ! candidateRender.empty())
+    {
+        const auto residual = nts::ir::measureCabinetResidual(referenceMono, candidateRender, sampleRate,
+                                                               productionResidualOptions(target));
+        if (residual.valid)
+        {
+            profile.spectralResidualDb = residual.residualDb;
+            profile.residualFrequencies = residual.frequencies;
+            residualConfidence = clamp01(residual.confidence);
+            haveResidual = true;
+        }
+    }
+    /* Halved when there is no residual rather than left at the analysis confidence, because a
+       profile without a spectrum is a less complete answer and should not present as an equally
+       sure one. */
+    const auto analysis = clamp01(tone.report.confidence.aggregate);
+    profile.confidence = haveResidual ? clamp01(analysis * 0.5f + residualConfidence * 0.5f)
+                                      : clamp01(analysis * 0.5f);
+    profile.valid = tone.success;
+
+    /* The learned estimator, when one is installed and fits.
+
+       **Computed after the deterministic path rather than instead of it**, and that ordering is
+       the fallback: the built-in answer is always produced, so a model that is absent, the wrong
+       shape, or refuses the vector leaves a complete profile behind rather than an empty one.
+       There is no branch anywhere downstream -- `applyProductionProfile` reads the same four
+       fields either way and only the `learned` flag differs, which is what the interface reports.
+
+       It replaces only the four 0..1 amounts. `levelOffsetDb` and the residual are recovered
+       exactly by measurement, and a model in front of an exact answer can only lose.
+
+       Every precondition is checked rather than assumed. A model trained against a different
+       feature list would still load -- the weights are internally consistent -- and would then be
+       handed a vector whose columns mean something else, producing four plausible numbers from a
+       misaligned input. That is precisely the failure the packed format's shape checks exist for,
+       so the shape is checked here too rather than trusted from the file name. */
+    if (model != nullptr && model->isLoaded() && haveResidual
+        && model->inputCount() == productionFeatureCount && model->outputCount() == 4)
+    {
+        const auto features = productionFeatures(tone, profile);
+        std::array<float, 4> predicted {};
+        if (features.size() == productionFeatureCount && model->predict(features, predicted))
+        {
+            profile.roomAmount = clamp01(predicted[0]);
+            profile.delayAmount = clamp01(predicted[1]);
+            profile.doubling = clamp01(predicted[2]);
+            profile.compression = clamp01(predicted[3]);
+            profile.learned = true;
+        }
+    }
+    return profile;
 }
 
 ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference& reference,
@@ -982,12 +1374,36 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
     std::vector<RigCandidate> pool;
     std::vector<CandidatePoint> evaluatedPoints;
 
-    // Only the voicings this instrument can actually use. Guitar searches seven and bass
-    // thirteen, so a guitar reconstruction costs what it did before the bass voicings landed
-    // rather than paying six extra renders for amplifiers it will never offer.
-    const auto searchable = searchableTopologies(
+    /* What the chosen region measured as. Read once here because two separate things need it:
+       where the search starts looking, and how the results are weighed.
+
+       `reference.gainCharacter` rather than `reference.tone.report.context.gainCategory`, and the
+       difference is the whole reason this search stopped answering "British Crunch" for every
+       song. That tone-report category is derived from a 0..1 gain axis built as
+       `0.52*saturationOnset + 0.25*compressionAmount + 0.23*spectralFlatness`, and measured
+       against real signals it does not reach its own lower categories: a pure undistorted sine
+       reads 0.475 and a clean plucked note 0.341, where `clean` requires below 0.16 and
+       `edgeOfBreakup` below 0.34. Nearly everything therefore classified as crunch, the search
+       seeded on the voicing that wins the crunch column, and the refinement budget did the rest.
+
+       This one is measured by `estimateGainCharacter` from adjacent-sample slew, zero-crossing
+       rate and crest factor on the region audio -- and it discriminates, which is the only
+       property that matters here. It is also what the interface prints beside the region, so a
+       part labelled CLEAN is now a part the search treats as clean. */
+    const auto referenceGain = reference.gainCharacter;
+
+    /* Only the voicings this instrument can actually use, most-likely first. Guitar searches seven;
+       bass searches six or thirteen depending on `bassSearchesBassVoicingsOnly`. Either way a
+       guitar reconstruction costs what it did before the bass voicings landed rather than paying
+       extra renders for amplifiers it will never offer.
+
+       The ordering is load-bearing rather than tidy: the coarse pass never advances past the first
+       entry, so that entry is the voicing the whole refinement is spent on. See
+       `searchOrderForGain`. */
+    const auto searchable = searchOrderForGain(
         reference.target == TargetInstrument::bass ? nts::amp::Instrument::bass
-                                                   : nts::amp::Instrument::guitar);
+                                                   : nts::amp::Instrument::guitar,
+        referenceGain);
 
     // Two directions along each refinement axis per round, plus the topology re-check, which
     // renders the refined point under every voicing the coarse pool did not reach.
@@ -1063,9 +1479,21 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
         return candidate;
     };
 
-    const auto rank = [](const RigCandidate& value)
+    /* The prior is in `rank` rather than in the pool construction, and that is where it belongs.
+
+       Topology is the slowest coarse digit, so a small pool never samples more than the first
+       voicing; every other voicing reaches the comparison through the topology re-check, which
+       renders the refined winning point under each of them. That re-check is the one moment the
+       voicings are judged against each other on equal terms, and it is decided by `rank` -- so
+       adding the term here is adding it exactly where the choice is made, and nowhere else.
+
+       Deliberately not folded into `candidate.confidence`. Confidence answers "how sure is this
+       measurement", and a preference for a family of amplifiers is not evidence about that. */
+    const auto rank = [referenceGain](const RigCandidate& value)
     {
-        return value.toneSimilarity * 0.7f + value.recordingSimilarity * 0.3f - value.complexityPenalty;
+        return value.toneSimilarity * 0.7f + value.recordingSimilarity * 0.3f - value.complexityPenalty
+             + topologyGainPriorWeight
+                 * topologyGainAffinity(value.rigPreset.parameters.topology, referenceGain);
     };
 
     const auto record = [&](const CandidatePoint& point, std::string_view stage) -> bool
@@ -1094,47 +1522,62 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
 
     if (pool.empty()) { result.error = "candidate rendering did not produce a valid tone"; return result; }
 
-    // Refinement pass: coordinate descent around the coarse winner. The coarse
-    // grid is far too sparse to land on a good match by itself, so the best point
-    // is stepped along each axis and kept whenever the score improves.
+    // Coordinate descent around the coarse winner, then the topology re-check. See the note at
+    // the re-check for why that comparison is unfair between voicings and what has been measured
+    // about fixing it.
     {
         auto bestIndex = static_cast<std::size_t>(std::distance(pool.begin(),
             std::max_element(pool.begin(), pool.end(), [&](const auto& a, const auto& b)
             { return rank(a) < rank(b); })));
         auto bestPoint = evaluatedPoints[bestIndex];
         auto bestScore = rank(pool[bestIndex]);
+        auto cancelled = false;
 
-        for (const auto step : refinementSteps)
+        const auto refineAround = [&](CandidatePoint& point, float& score)
         {
-            auto improved = false;
-            for (const auto& neighbour : refinementNeighbours(bestPoint, step))
+            for (const auto step : refinementSteps)
             {
-                const auto before = pool.size();
-                if (! record(neighbour, "refining the closest rig"))
-                { result.error = "reconstruction cancelled"; return result; }
-                if (pool.size() > before && rank(pool.back()) > bestScore)
+                auto improved = false;
+                for (const auto& neighbour : refinementNeighbours(point, step))
                 {
-                    bestScore = rank(pool.back());
-                    bestPoint = neighbour;
-                    improved = true;
+                    const auto before = pool.size();
+                    if (! record(neighbour, "refining the closest rig")) { cancelled = true; return; }
+                    if (pool.size() > before && rank(pool.back()) > score)
+                    {
+                        score = rank(pool.back());
+                        point = neighbour;
+                        improved = true;
+                    }
                 }
+                // Nothing along any axis beat the centre, so a smaller step around the same point
+                // cannot either.
+                if (! improved) break;
             }
-            // Nothing along any axis beat the centre, so a smaller step around the
-            // same point cannot either.
-            if (! improved) break;
-        }
+        };
 
-        // Topology re-check. The descent above deliberately leaves topology alone -- stepping a
-        // discrete voicing restarts the search rather than refining it -- but it is the slowest
-        // coarse digit, so a default pool of twelve only ever sampled the first voicing. One
-        // render of the winning point under each of the others is what keeps them reachable at
-        // all, and it is a fairer comparison than the coarse pass gave: every voicing is judged
-        // at the refined position rather than at whichever grid corner it landed on.
-        //
-        // This is the whole reason a voicing added to the enum costs search time: it is
-        // `topologyCount - 1` extra offline renders on every reconstruction, not one. That is
-        // the price of the voicing being findable, and dropping to a sampled subset would mean
-        // some amplifiers could never win a match.
+        refineAround(bestPoint, bestScore);
+        if (cancelled) { result.error = "reconstruction cancelled"; return result; }
+
+        /* Every voicing the coarse grid did not reach, rendered at the refined point.
+
+           This is the whole reason a voicing added to the enum costs search time: it is
+           `topologyCount - 1` extra offline renders on every reconstruction, not one. That is the
+           price of the voicing being findable, and dropping to a sampled subset would mean some
+           amplifiers could never win a match.
+
+           **This comparison is not fair between voicings, and knowing exactly how it is unfair is
+           worth more than the two attempts that failed to fix it.** By this point the pool holds
+           roughly twenty-eight entries at the coarse winner's voicing -- twelve coarse points and
+           sixteen refinement neighbours -- and one at each of the others, so ranking the pool
+           compares the best of twenty-eight draws against the best of one.
+
+           Selecting from the re-check set alone was tried, on the theory that it puts every
+           voicing on one render of one point. It changed nothing, to the attempt: 33/140 top-1
+           before and after. The reason is that the shared point was *fitted for the coarse
+           winner*, so equal render counts do not make it an equal contest -- the coordinates
+           themselves favour one amplifier. Refining every voicing separately would, at seven times
+           the descent cost, and that is the experiment `nts_rig_recovery` should be pointed at
+           next. Do not re-try the cheap version; it is measured and it does not work. */
         for (const auto other : searchable)
         {
             if (other == bestPoint.topology) continue;
@@ -1149,14 +1592,26 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
     {
         return rank(first) > rank(second);
     });
-    // The shortlist is something the user auditions and edits, so near-identical
-    // entries waste its slots. Refinement deliberately produces points close to
-    // the winner, so take the best first and then only entries that actually
-    // sound like a different rig, falling back to rank order if too few qualify.
-    // Topology is deliberately not one of the tests. It is a discrete flag, so including it
-    // guaranteed that flipping it alone qualified as a different rig, and the shortlist filled
-    // with pairs that differed by little else -- which is why topology read as the axis the
-    // match cared most about. Judge difference on what a listener hears instead.
+    /* The shortlist is something the user auditions and edits, so it has to contain choices.
+
+       **Topology is a uniqueness key here, not a difference test, and conflating the two produced
+       a shortlist of seven copies of one amplifier.** Including it in `audiblyDifferent` was tried
+       and rightly removed: flipping a discrete flag alone qualified as a different rig, so the
+       list filled with pairs that differed by nothing else and topology read as the axis the match
+       cared most about. But leaving it out entirely is the opposite failure. Refinement produces
+       sixteen neighbours of the coarse winner and every other voicing gets exactly one render, so
+       the pool is dominated by one amplifier -- and those neighbours differ by more than the
+       thresholds below, so they all pass as "audibly different" while being the same amp at
+       slightly different settings. Measured on a Vintage Bloom reference, a seven-entry shortlist
+       came back as seven British Crunches.
+
+       So: one entry per voicing first, in rank order, which guarantees the list is a set of
+       different amplifiers. Then audibly different variants if slots remain, which is what the
+       original test was for and is still worth having when there are more slots than voicings.
+       Then rank order, so a short pool still fills the list.
+
+       The top entry is unaffected by all of this -- the pool is already sorted, and the
+       highest-ranked candidate's voicing is by definition unseen when the first pass starts. */
     const auto audiblyDifferent = [](const nts::amp::AmpParameters& first,
                                      const nts::amp::AmpParameters& second)
     {
@@ -1168,8 +1623,18 @@ ReconstructionResult RigReconstructor::reconstruct(const ReconstructionReference
     };
 
     std::vector<std::size_t> chosen;
+    std::vector<nts::amp::Topology> seenVoicings;
     for (std::size_t index = 0; index < pool.size() && chosen.size() < candidateCount; ++index)
     {
+        const auto topology = pool[index].rigPreset.parameters.topology;
+        if (std::find(seenVoicings.begin(), seenVoicings.end(), topology) != seenVoicings.end())
+            continue;
+        seenVoicings.push_back(topology);
+        chosen.push_back(index);
+    }
+    for (std::size_t index = 0; index < pool.size() && chosen.size() < candidateCount; ++index)
+    {
+        if (std::find(chosen.begin(), chosen.end(), index) != chosen.end()) continue;
         const auto distinct = std::all_of(chosen.begin(), chosen.end(), [&](std::size_t existing)
         { return audiblyDifferent(pool[existing].rigPreset.parameters, pool[index].rigPreset.parameters); });
         if (distinct) chosen.push_back(index);
@@ -1207,10 +1672,36 @@ std::string serializeResult(const ReconstructionResult& result, bool pretty)
            << "\"analysisConfidence\":" << result.reference.analysisConfidence << ','
            << "\"dominantPitch\":\"" << result.reference.dominantPitch << "\","
            << "\"estimatedTuning\":\"" << result.reference.estimatedTuning << "\","
-           << "\"gainCharacter\":\"" << result.reference.gainCharacter << "\","
+           << "\"gainCharacter\":\"" << toString(result.reference.gainCharacter) << "\","
            << "\"pitchConfidence\":" << result.reference.pitchConfidence << ','
            << "\"tuningOffsetCents\":" << result.reference.tuningOffsetCents << "},"
-           << newline << indent << "\"candidates\":[";
+           << newline << indent << "\"production\":";
+    /* Written only when it was measured. A reader that finds no `production` key has a v1 file,
+       or a v2 one whose match could not measure production, and either way the honest reading is
+       "no estimate" -- which is a different statement from a block full of zeros, and the reason
+       this is `null` rather than a default-constructed object. */
+    if (! result.reference.production.valid) stream << "null,";
+    else
+    {
+        const auto& production = result.reference.production;
+        stream << '{'
+               << "\"levelOffsetDb\":" << production.levelOffsetDb << ','
+               << "\"roomAmount\":" << production.roomAmount << ','
+               << "\"delayAmount\":" << production.delayAmount << ','
+               << "\"doubling\":" << production.doubling << ','
+               << "\"stereoWidth\":" << production.stereoWidth << ','
+               << "\"compression\":" << production.compression << ','
+               << "\"confidence\":" << production.confidence << ','
+               << "\"learned\":" << (production.learned ? "true" : "false") << ','
+               << "\"residualFrequencies\":[";
+        for (std::size_t index = 0; index < production.residualFrequencies.size(); ++index)
+            stream << (index > 0 ? "," : "") << production.residualFrequencies[index];
+        stream << "],\"spectralResidualDb\":[";
+        for (std::size_t index = 0; index < production.spectralResidualDb.size(); ++index)
+            stream << (index > 0 ? "," : "") << production.spectralResidualDb[index];
+        stream << "]},";
+    }
+    stream << newline << indent << "\"candidates\":[";
     for (std::size_t index = 0; index < result.candidates.size(); ++index)
     {
         if (index > 0) stream << ',';

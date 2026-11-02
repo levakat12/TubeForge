@@ -35,9 +35,9 @@ private:
 /// placement, polarity and delay a microphone in front of a cabinet actually has. Loading happens
 /// off the message thread and fades in, so a response can be swapped while playing.
 ///
-/// The stage this drives sits after whichever engine is selected -- traditional, neural capture or
-/// physical circuit -- so everything on this page applies to all three. That was not true while the
-/// cabinet was a member of the traditional amplifier.
+/// The stage this drives sits after whichever engine is selected -- traditional or neural capture
+/// -- so everything on this page applies to both. That was not true while the cabinet was a member
+/// of the traditional amplifier.
 class CabinetPage final : public ModulePage,
                           private juce::FileDragAndDropTarget
 {

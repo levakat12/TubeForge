@@ -14,13 +14,14 @@ enum class Glyph
     pedalboard,
     toneShaping,
     cabinet,
+    tuner,
     neuralCapture,
     captures,
     toneAssistant,
     profileLibrary,
-    circuit,
-    toneAnalyzer,
-    songMatch,
+    /// The merged Tone Match page: a lens with a note inside it, because the page both
+    /// measures a tone and rebuilds one from a song.
+    toneMatch,
     save,
     open,
     browse,
@@ -48,16 +49,19 @@ private:
     bool underlinesActive;
 };
 
-/// The status-bar breadcrumb showing where the signal goes. The three stages the engine mode
-/// actually swaps out are lit; the fixed ones stay quiet.
+/** The status-bar breadcrumb showing where the signal goes. The three stages an engine supplies
+    are lit; the fixed ones stay quiet.
+
+    It carried a `setEngineMode` and an `activeEngineMode` member which `paint` never read -- the
+    shell pushed the mode in every timer tick and the only effect was a repaint of an identical
+    picture. Removed rather than wired up, because "which stages this engine actually supplies" is
+    a display question nobody had answered: a neural capture is one opaque block where the
+    traditional amp is a preamp, a tone stack and a power section, and lighting the same three for
+    both would be the wrong answer stated confidently. */
 class StudioSignalChain final : public juce::Component
 {
 public:
-    void setEngineMode(int mode);
     void paint(juce::Graphics& graphics) override;
-
-private:
-    int activeEngineMode {};
 };
 
 /// A thin horizontal peak bar that sits under the input or output trim.

@@ -393,7 +393,7 @@ void StudioServices::reconstructSongFile(
     reference.target = target;
     reference.dominantPitch = regionAnalysis.dominantPitch;
     reference.estimatedTuning = regionAnalysis.estimatedTuning;
-    reference.gainCharacter = std::string(nts::reconstruction::toString(regionAnalysis.gainCharacter));
+    reference.gainCharacter = regionAnalysis.gainCharacter;
     reference.pitchConfidence = regionAnalysis.pitchConfidence;
     reference.tuningOffsetCents = regionAnalysis.tuningOffsetCents;
     reference.tone = std::move(tone);
@@ -407,6 +407,34 @@ void StudioServices::reconstructSongFile(
             return true;
         }, stopToken);
     if (! result.success) { fail(result.error); return; }
+
+    /* What the record did after the amplifier, measured now that a candidate exists.
+
+       **After the search and outside it, which is the whole design.** Letting any of this into
+       the ranking would make the amplifier fit to compensate for reverb and mix EQ, producing a
+       rig that is right inside this one mix and wrong everywhere else -- so `reconstruct()` never
+       sees it, and a test in `nts_reconstruction_tests` pins that boundary rather than trusting
+       it. Here the search is already over and the winner is fixed.
+
+       Measured against the winning candidate specifically: the spectral residual is "what the
+       reference does that this rig does not", so it is only meaningful beside the rig it will be
+       applied with. The render costs one more pass over a few seconds of audio, against a
+       separation that took orders of magnitude longer. */
+    const auto* model = loadProductionModel(target);
+    if (! result.candidates.empty())
+    {
+        nts::amp::TraditionalAmpProcessor renderer;
+        renderer.prepare({ workingSampleRate, 512, 1 });
+        renderer.loadPreset(result.candidates.front().rigPreset, 0);
+        const auto render = nts::amp::renderOffline(renderer, normalized.audio.left, 256);
+        result.reference.production = nts::reconstruction::estimateProductionProfile(
+            normalized, result.reference.tone, normalized.audio.left, render, workingSampleRate,
+            target, model);
+    }
+    else
+        result.reference.production = nts::reconstruction::estimateProductionProfile(
+            normalized, result.reference.tone, {}, {}, workingSampleRate, target, model);
+
     for (const auto& warning : stems.warnings) result.warnings.push_back(warning);
     result.warnings.emplace_back("user DI adaptation uses the selected reference until a dedicated DI is supplied");
     {
@@ -419,9 +447,11 @@ void StudioServices::reconstructSongFile(
         // Bumped inside the lock, with the result it describes. A poller comparing generations
         // can then never see a new number beside the previous run's candidates.
         reconstructionGenerationValue.fetch_add(1, std::memory_order_acq_rel);
-        reconstructionStatus = "Ready: " + reference.gainCharacter + " part, " + reference.dominantPitch
+        reconstructionStatus = "Ready: " + std::string(nts::reconstruction::toString(reference.gainCharacter))
+                             + " part, " + reference.dominantPitch
             + ", " + reference.estimatedTuning + "; " + std::to_string(
-            latestReconstruction->candidates.size()) + " playable candidates";
+            latestReconstruction->candidates.size()) + " playable candidates; production by "
+            + productionModelStatus;
     }
     reconstructionProgressValue.store(1.0f, std::memory_order_relaxed);
 }
@@ -447,7 +477,7 @@ std::optional<nts::reconstruction::StemSet> StudioServices::runMlStemSeparation(
     }
     const juce::File python(runtime.getProperty("python", "").toString());
     const juce::File worker(runtime.getProperty("worker", "").toString());
-    const auto model = runtime.getProperty("model", "htdemucs_6s").toString();
+    const auto configuredModel = runtime.getProperty("model", "htdemucs_6s").toString();
     const auto device = runtime.getProperty("device", "auto").toString();
     if (! python.existsAsFile() || ! worker.existsAsFile())
     {
@@ -456,21 +486,57 @@ std::optional<nts::reconstruction::StemSet> StudioServices::runMlStemSeparation(
     }
 
     const auto sourceHash = juce::MD5(songFile).toHexString();
-    const auto cacheKey = sourceHash + "-" + model.replaceCharacter(':', '_');
-    const auto outputDirectory = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+    const auto requiredTarget = target == nts::reconstruction::TargetInstrument::guitar ? "guitar.wav" : "bass.wav";
+    const auto cacheRoot = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
         .getChildFile("TubeForge").getChildFile("cache").getChildFile("source-reconstruction")
-        .getChildFile("ml").getChildFile(cacheKey);
+        .getChildFile("ml");
+    const auto directoryFor = [&](const juce::String& forModel)
+    { return cacheRoot.getChildFile(sourceHash + "-" + forModel.replaceCharacter(':', '_')); };
+    const auto isReady = [&](const juce::File& directory)
+    {
+        return directory.getChildFile("manifest.json").existsAsFile()
+            && directory.getChildFile("vocals.wav").existsAsFile()
+            && directory.getChildFile("drums.wav").existsAsFile()
+            && directory.getChildFile(requiredTarget).existsAsFile();
+    };
+
+    /* Which Demucs model to spend the user's afternoon on.
+
+       **The six-source model exists to produce a guitar stem, and a bass target does not need
+       one.** `htdemucs_6s` splits `other` into guitar and piano, which is the only reason it is
+       the default -- and it is the slowest model in the family. Plain `htdemucs` returns vocals,
+       drums, bass and other, which is everything a bass reconstruction reads, in appreciably less
+       time and with a bass stem that is if anything cleaner: the six-source split spends capacity
+       separating two instruments this path then throws away.
+
+       Cache first, preference second, and that order is the point. A player who matched a guitar
+       part in this song already has a six-source separation sitting on disk with a perfectly good
+       `bass.wav` in it, and re-running a four-minute separation to save time would be a strange
+       way to save time. So an existing cache for *any* model that can answer for this target wins,
+       and the cheaper model is only chosen when nothing is cached at all.
+
+       A `model` explicitly set in runtime.json is always honoured -- that is somebody who has
+       decided, and this is not the place to overrule them.
+    */
+    const auto explicitlyConfigured = runtime.hasProperty("model");
+    auto model = configuredModel;
+    auto outputDirectory = directoryFor(model);
+    if (! isReady(outputDirectory) && ! explicitlyConfigured
+        && target == nts::reconstruction::TargetInstrument::bass)
+    {
+        // Either a previous bass run already left one here, in which case this costs nothing, or
+        // nothing is cached at all and this is the model that takes less time to build one.
+        model = "htdemucs";
+        outputDirectory = directoryFor(model);
+    }
+
     if (outputDirectory.createDirectory().failed())
     {
         failureReason = "could not create the local neural-stem cache";
         return std::nullopt;
     }
     const auto outputManifest = outputDirectory.getChildFile("manifest.json");
-    const auto requiredTarget = target == nts::reconstruction::TargetInstrument::guitar ? "guitar.wav" : "bass.wav";
-    const auto cacheReady = outputManifest.existsAsFile()
-        && outputDirectory.getChildFile("vocals.wav").existsAsFile()
-        && outputDirectory.getChildFile("drums.wav").existsAsFile()
-        && outputDirectory.getChildFile(requiredTarget).existsAsFile();
+    const auto cacheReady = isReady(outputDirectory);
     if (! cacheReady)
     {
         {
@@ -531,7 +597,9 @@ std::optional<nts::reconstruction::StemSet> StudioServices::runMlStemSeparation(
     }
     nts::reconstruction::StemSet result;
     result.success = true;
-    result.cacheKey = cacheKey.toStdString();
+    // Taken from the directory actually used rather than rebuilt from the configured model: the
+    // two differ whenever a bass target reused a six-source separation or chose the cheaper model.
+    result.cacheKey = outputDirectory.getFileName().toStdString();
     result.modelVersion = manifest.getProperty("modelVersion", "demucs:unknown").toString().toStdString();
     result.usedGpu = manifest.getProperty("device", "cpu").toString().containsIgnoreCase("cuda");
     result.reconstructionError = static_cast<float>(manifest.getProperty("reconstructionError", 0.0));
@@ -621,23 +689,103 @@ bool StudioServices::requestReconstructionInstrument(nts::reconstruction::Target
     return true;
 }
 
-bool StudioServices::applyReconstructionCandidate(std::size_t index, bool isolateChain)
+bool StudioServices::applyReconstructionCandidate(std::size_t index, ChainMode mode)
 {
     nts::reconstruction::RigCandidate candidate;
+    nts::reconstruction::ProductionProfile profile;
     {
         const std::scoped_lock lock(reconstructionMutex);
         if (! latestReconstruction || index >= latestReconstruction->candidates.size()) return false;
         candidate = latestReconstruction->candidates[index];
+        profile = latestReconstruction->reference.production;
         reconstructionStatus = "Applied " + candidate.rigPreset.name + " for live DI playing";
     }
+    /* Asking for the record's production when the match could not measure it is a request that
+       cannot be honoured, and the honest answer is the ranked candidate rather than a chain
+       written from a default-constructed profile -- which would read as "the record had no room
+       and no compression", a claim nothing measured. */
+    if (mode == ChainMode::matchRecord && ! profile.valid) mode = ChainMode::bypass;
     const auto& p = candidate.rigPreset.parameters;
     // Handed back to the owner rather than written directly: the parameter objects belong
     // to the processor, and reaching for them from here is what this split removes. Called
     // outside the lock, because it writes host parameters and those can call back into
     // anything.
-    if (applyRig) applyRig(p, isolateChain);
+    if (applyRig) applyRig(p, mode, profile);
 
     return true;
+}
+
+const nts::ml::PackedFeatureRegressor* StudioServices::loadProductionModel(
+    nts::reconstruction::TargetInstrument target)
+{
+    const auto bass = target == nts::reconstruction::TargetInstrument::bass;
+    auto& estimator = productionEstimators[bass ? 1 : 0];
+    const auto publish = [this, &estimator](std::string status)
+    {
+        const std::scoped_lock lock(reconstructionMutex);
+        estimator.status = std::move(status);
+        productionModelStatus = estimator.status;
+    };
+    if (estimator.checked)
+    {
+        publish(estimator.status);
+        return estimator.model.isLoaded() ? &estimator.model : nullptr;
+    }
+    estimator.checked = true;
+
+    /* Beside the separator's runtime, under the same TubeForge application-data root, because a
+       user who has installed one optional component should find the next one in the same place.
+       A directory per target under it, because the two artifacts are not interchangeable and a
+       single path would make installing the wrong one silently produce plausible nonsense.
+
+       Absent is the normal case and is silent -- an installation with no model is not a fault, it
+       is the configuration the deterministic path exists for. */
+    const auto artifact = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("TubeForge").getChildFile("production-estimator")
+        .getChildFile(bass ? "bass" : "guitar");
+    const auto packed = artifact.getChildFile("model.bin");
+    if (! packed.existsAsFile()) { publish("built-in mapping"); return nullptr; }
+
+    std::string error;
+    if (! estimator.model.loadFile(packed.getFullPathName().toStdString(), error))
+    {
+        publish("built-in mapping (installed model rejected: " + error + ")");
+        return nullptr;
+    }
+    /* Shape checked here as well as inside `estimateProductionProfile`. There it is a guard; here
+       it is a *message*, because a model of the wrong shape is the one failure a user can act on
+       -- it means the artifact and this build disagree about the feature list, and silently
+       running the built-in mapping would leave them wondering why installing it changed nothing. */
+    if (estimator.model.inputCount() != nts::reconstruction::productionFeatureCount
+        || estimator.model.outputCount() != 4)
+    {
+        publish("built-in mapping (installed model expects "
+                + std::to_string(estimator.model.inputCount()) + " features, this build measures "
+                + std::to_string(nts::reconstruction::productionFeatureCount) + ")");
+        estimator.model = {};
+        return nullptr;
+    }
+    publish(std::string(bass ? "bass" : "guitar") + " estimator");
+    return &estimator.model;
+}
+
+nts::reconstruction::TargetInstrument StudioServices::reconstructionTarget() const
+{
+    const std::scoped_lock lock(reconstructionMutex);
+    return lastReconstructionTarget;
+}
+
+juce::String StudioServices::productionEstimatorName() const
+{
+    const std::scoped_lock lock(reconstructionMutex);
+    return juce::String(productionModelStatus);
+}
+
+nts::reconstruction::ProductionProfile StudioServices::productionProfile() const
+{
+    const std::scoped_lock lock(reconstructionMutex);
+    if (! latestReconstruction) return {};
+    return latestReconstruction->reference.production;
 }
 
 juce::String StudioServices::reconstructionSourceName() const

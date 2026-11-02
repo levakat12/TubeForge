@@ -111,8 +111,8 @@ void run(double sampleRate, std::size_t blockSize, int oversampling, std::size_t
 /** The cabinet on its own, which is the number the shared stage made everybody's business.
 
     While the cabinet lived inside `AmpVoice`, only the traditional engine paid for it. It is a
-    stage after all three engines now, so a neural capture and the physical circuit are buying a
-    convolution they did not buy before -- and there is no honest way to talk about that trade
+    stage after both engines now, so a neural capture is buying a convolution it did not buy
+    before -- and there is no honest way to talk about that trade
     without measuring it. Reported per slot arrangement, because the whole point of the idle-slot
     skip is that one engaged slot costs about half of two, and of the mute that a slot switched
     off costs nothing at all.

@@ -186,6 +186,56 @@ void testStateMigrationAndValidation(TestHarness& tests)
                      "migrating from schema 3 leaves the pedalboard empty");
     }
 
+    /* A schema 6 project is the last one written while the physical circuit engine existed, and
+       it is the migration that can corrupt a rig rather than merely under-describe one.
+
+       `ampControls` is walked positionally, and the six circuit selectors sat at indices 28 to 33.
+       The values below are deliberately distinguishable -- index i holds i -- so the assertions
+       can say *which* value landed where rather than only that the length changed. Getting this
+       wrong shifts everything after the gate block by six and produces a project that loads
+       cleanly with every knob in the wrong place, which is precisely why it is asserted here. */
+    constexpr int schemaSixControlCount = 40;
+    const auto schemaSixProject = [](const std::string& graphBlock, int engineModeChoice)
+    {
+        std::string json = R"({"schemaVersion":6,"applicationVersion":"0.10.0",)"
+                           R"("engine":{"inputGainDb":0.0,"outputGainDb":0.0,"bypass":false,"ampControls":[)";
+        for (int index = 0; index < schemaSixControlCount; ++index)
+        {
+            if (index > 0) json += ',';
+            json += std::to_string(index == 25 && engineModeChoice >= 0 ? engineModeChoice : index);
+        }
+        json += R"(]},"device":{},"graph":)" + graphBlock + R"(,"ui":{},)"
+                R"("assets":{"relativePaths":[]},"pedalboard":{"slots":[]},)"
+                R"("autoMatch":{},"cabinet":{}})";
+        return json;
+    };
+    const auto fromV6 = nts::state::deserialize(schemaSixProject(R"({"physicalCircuitJson":"{}"})", -1));
+    tests.expect(static_cast<bool>(fromV6), "a schema 6 project still loads");
+    if (fromV6)
+    {
+        const auto& controls = fromV6.state->engine.ampControls;
+        tests.expectEqual(static_cast<int>(controls.size()), schemaSixControlCount - 6,
+                          "migrating from schema 6 drops the six physical-circuit controls");
+        if (controls.size() == static_cast<std::size_t>(schemaSixControlCount - 6))
+        {
+            tests.expectNear(controls[27], 27.0, 1.0e-6,
+                             "the control before the removed block keeps its position");
+            tests.expectNear(controls[28], 34.0, 1.0e-6,
+                             "the control after the removed block moves up by exactly six");
+            tests.expectNear(controls.back(), static_cast<double>(schemaSixControlCount - 1), 1.0e-6,
+                             "the last control survives the splice");
+        }
+    }
+
+    /* And the engine mode itself. A project saved on "Physical circuit" -- choice 2, at index 25 --
+       names an engine that no longer exists, so it comes back Traditional rather than being left
+       pointing past the end of a two-entry list. */
+    const auto fromCircuitMode = nts::state::deserialize(schemaSixProject("{}", 2));
+    tests.expect(static_cast<bool>(fromCircuitMode), "a project saved on the circuit engine still loads");
+    if (fromCircuitMode && fromCircuitMode.state->engine.ampControls.size() > 25)
+        tests.expectNear(fromCircuitMode.state->engine.ampControls[25], 0.0, 1.0e-6,
+                         "a project saved on the removed engine comes back on Traditional");
+
     nts::state::ProjectState tooManySlots;
     tooManySlots.pedalboard.slots.assign(nts::state::maximumPedalSlots + 1, {});
     tests.expect(! nts::state::validate(tooManySlots, error),
@@ -202,7 +252,6 @@ void testStateRoundTrip(TestHarness& tests)
     original.engine = { 4.5f, -3.0f, true };
     original.device = { "ASIO", "Input", "Output", 96000.0, 32, { 0 }, { 0, 1 } };
     original.graph.latencySamples = 48;
-    original.graph.physicalCircuitJson = R"({"schemaVersion":1,"id":"test-circuit"})";
     original.ui = { 900, 640, false };
     original.assets.relativePaths = { "irs/cab.wav", "models/amp.ntm" };
     original.assets.cabinetIrPathA = "irs/greenback-57.wav";

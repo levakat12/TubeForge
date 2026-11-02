@@ -5,10 +5,9 @@
 TubeForgeAudioProcessor::~TubeForgeAudioProcessor()
 {
     // The tone-analysis and reconstruction workers now belong to StudioServices, whose own
-    // destructor stops them. What remains here is the two that stage into the real-time
+    // destructor stops them. What remains here is the one that stages into the real-time
     // engine and so cannot move out of the processor.
     if (neuralLoader.joinable()) neuralLoader.request_stop();
-    if (circuitCompiler.joinable()) circuitCompiler.request_stop();
     // Before the value tree state goes: a parameter outliving a listener that points at a
     // half-destroyed processor is the shape of crash that only shows up in a host.
     detachAutoMatchGuard();
@@ -23,8 +22,9 @@ TubeForgeAudioProcessor::TubeForgeAudioProcessor()
       logger(logPath(), &diagnostics),
       cabinets(cabinetLibraryPreferencesPath()),
       captures(captureLibraryPath()),
-      studio([this](const nts::amp::AmpParameters& rig, bool isolateChain)
-             { applyRecoveredRig(rig, isolateChain); }),
+      studio([this](const nts::amp::AmpParameters& rig, ChainMode mode,
+                    const nts::reconstruction::ProductionProfile& profile)
+             { applyRecoveredRig(rig, mode, profile); }),
       tonePackageLibrary(tonePackageLibraryPath())
 {
     // Resolved once: these stay valid for the lifetime of the value tree state, and
@@ -97,8 +97,8 @@ juce::String TubeForgeAudioProcessor::reconstructionStatusText() const
 bool TubeForgeAudioProcessor::requestReconstructionRegion(std::size_t index)
 { return studio.requestReconstructionRegion(index); }
 
-bool TubeForgeAudioProcessor::applyReconstructionCandidate(std::size_t index, bool isolateChain)
-{ return studio.applyReconstructionCandidate(index, isolateChain); }
+bool TubeForgeAudioProcessor::applyReconstructionCandidate(std::size_t index, ChainMode mode)
+{ return studio.applyReconstructionCandidate(index, mode); }
 
 juce::Result TubeForgeAudioProcessor::exportReconstruction(const juce::File& file) const
 { return studio.exportReconstruction(file); }

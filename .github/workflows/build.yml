@@ -127,13 +127,13 @@ jobs:
       - name: Build sanitized suites
         run: >
           cmake --build build-asan --config Release --parallel
-          --target nts_unit_tests nts_dsp_tests nts_amp_tests nts_circuit_tests
+          --target nts_unit_tests nts_dsp_tests nts_amp_tests
           nts_ml_runtime_tests nts_tone_analysis_tests nts_reconstruction_tests
           nts_assistant_tests nts_ecosystem_tests
       - name: Run sanitized suites
         run: >
           ctest --test-dir build-asan -C Release --output-on-failure
-          -R "nts_unit_tests|nts_dsp_tests|nts_amp_tests|nts_circuit_tests|nts_ml_runtime_tests|nts_tone_analysis_tests|nts_reconstruction_tests|nts_assistant_tests|nts_ecosystem_tests"
+          -R "nts_unit_tests|nts_dsp_tests|nts_amp_tests|nts_ml_runtime_tests|nts_tone_analysis_tests|nts_reconstruction_tests|nts_assistant_tests|nts_ecosystem_tests"
 
   windows-hour-soak:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

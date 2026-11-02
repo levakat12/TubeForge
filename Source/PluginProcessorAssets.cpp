@@ -1,5 +1,5 @@
-// Loading things from disk into the engine: cabinet responses, neural artifacts,
-// the physical circuit and tone packages. All of it staged off the message thread.
+// Loading things from disk into the engine: cabinet responses, neural artifacts and
+// tone packages. All of it staged off the message thread.
 
 #include "PluginProcessorInternal.h"
 
@@ -278,9 +278,9 @@ void TubeForgeAudioProcessor::applyCabinetIr(int slot)
     nts::amp::CabinetMetadata metadata;
     metadata.name = source.getFileNameWithoutExtension().toStdString();
     metadata.microphone = "User impulse";
-    // Into the stage, not the amplifier: the cabinet is downstream of all three engines now,
-    // so a response loaded into `traditionalAmp` would be heard by neither the neural nor the
-    // circuit path -- and by the traditional one only if its internal copy were still running.
+    // Into the stage, not the amplifier: the cabinet is downstream of both engines now, so a
+    // response loaded into `traditionalAmp` would not be heard by the neural path -- and by the
+    // traditional one only if its internal copy were still running.
     const nts::amp::CabinetSection::TrueStereoImpulse cross {
         trueStereo ? std::span<const float>(leftToRight) : std::span<const float> {},
         trueStereo ? std::span<const float>(rightToLeft) : std::span<const float> {} };
@@ -1036,57 +1036,6 @@ juce::String TubeForgeAudioProcessor::neuralModelStatusText() const
     return juce::String::fromUTF8(neuralStatusDetail.c_str());
 }
 
-void TubeForgeAudioProcessor::refreshPhysicalCircuit()
-{
-    if (currentBlockSize <= 0) return;
-    const auto graph = currentCircuitGraph();
-    const auto hash = circuitHash(graph);
-    if (hash == physicalCircuitControlHash.load(std::memory_order_acquire)
-        || hash == physicalCircuitRequestedHash.load(std::memory_order_acquire)) return;
-    physicalCircuitRequestedHash.store(hash, std::memory_order_release);
-    if (circuitCompiler.joinable()) circuitCompiler.request_stop();
-    circuitCompiler = std::jthread([this, graph, hash](std::stop_token stopToken)
-    {
-        if (stopToken.stop_requested()) return;
-        const auto report = physicalCircuit.stageGraph(graph);
-        if (stopToken.stop_requested()) return;
-        const auto publicationBusy = std::any_of(report.messages.begin(), report.messages.end(), [](const auto& message)
-        {
-            return message.message == "A graph publication is already pending";
-        });
-        if (!report.isValid() || publicationBusy)
-        {
-            const std::scoped_lock lock(circuitStatusMutex);
-            circuitStatusDetail = report.messages.empty() ? "Physical circuit validation failed" : report.messages.front().message;
-            physicalCircuitRequestedHash.store(0, std::memory_order_release);
-            return;
-        }
-        physicalCircuitControlHash.store(hash, std::memory_order_release);
-        physicalCircuitRequestedHash.store(0, std::memory_order_release);
-        {
-            const std::scoped_lock graphLock(circuitGraphMutex);
-            desiredCircuitGraph = graph;
-        }
-        const std::scoped_lock lock(circuitStatusMutex);
-        circuitStatusDetail = report.messages.empty()
-            ? "Compiled on worker: " + std::to_string(graph.nodes.size()) + " immutable nodes, zero added latency"
-            : "Compiled with bounded virtual-model warning: " + report.messages.front().message;
-    });
-}
-
-nts::circuit::CircuitGraphDescription TubeForgeAudioProcessor::circuitGraphSnapshot() const
-{
-    // Parameter reads are atomic; returning the requested graph makes the editor
-    // respond immediately while the immutable runtime copy compiles off-thread.
-    return currentCircuitGraph();
-}
-
-juce::String TubeForgeAudioProcessor::circuitStatusText() const
-{
-    const std::scoped_lock lock(circuitStatusMutex);
-    return juce::String::fromUTF8(circuitStatusDetail.c_str());
-}
-
 std::vector<nts::ecosystem::ProfileRecord> TubeForgeAudioProcessor::searchTonePackages(
     const nts::ecosystem::ProfileQuery& query) const
 {
@@ -1265,101 +1214,3 @@ juce::Result TubeForgeAudioProcessor::setTonePackageFavorite(const juce::String&
     return juce::Result::ok();
 }
 
-nts::circuit::SimpleControls TubeForgeAudioProcessor::currentCircuitControls() const noexcept
-{
-    nts::circuit::SimpleControls controls;
-    controls.tubeCharacter = std::clamp((parameterOf(Param::bias) + 0.8f) / 1.6f, 0.0f, 1.0f);
-    controls.headroom = std::clamp((parameterOf(Param::master) + 60.0f) / 72.0f, 0.0f, 1.0f);
-    controls.breakup = std::clamp(parameterOf(Param::gain) * 0.1f, 0.0f, 1.0f);
-    controls.tightness = std::clamp(parameterOf(Param::tightness) * 0.1f, 0.0f, 1.0f);
-    controls.sag = std::clamp(parameterOf(Param::sag) * 0.01f, 0.0f, 1.0f);
-    controls.powerSize = std::clamp((parameterOf(Param::resonance)
-                                     + parameterOf(Param::presence)) * 0.05f, 0.0f, 1.0f);
-    controls.feedback = std::clamp(parameterOf(Param::feedback) * 0.01f, 0.0f, 1.0f);
-    controls.cabinet = std::clamp(parameterOf(Param::cabinet) >= 0.5f
-                                      ? parameterOf(Param::treble) * 0.1f : 0.0f, 0.0f, 1.0f);
-    return controls;
-}
-
-nts::circuit::CircuitGraphDescription TubeForgeAudioProcessor::currentCircuitGraph() const
-{
-    auto graph = nts::circuit::makeSimpleCircuit(currentCircuitControls());
-    graph.id = "tubeforge.circuit.user";
-    graph.name = "TubeForge User Circuit";
-
-    const auto preampTube = std::clamp(static_cast<int>(valueOf(parameterState, ParameterIds::circuitPreampTube)), 0, 2);
-    const auto powerTube = std::clamp(static_cast<int>(valueOf(parameterState, ParameterIds::circuitPowerTube)), 0, 1);
-    const auto powerTopology = std::clamp(static_cast<int>(valueOf(parameterState, ParameterIds::circuitPowerTopology)), 0, 2);
-    const auto toneStyle = std::clamp(static_cast<int>(valueOf(parameterState, ParameterIds::circuitToneStack)), 0, 2);
-    const auto numerical = valueOf(parameterState, ParameterIds::circuitBackend) >= 0.5f;
-    const std::array preampIds { "tube.12au7.v1", "tube.12at7.v1", "tube.12ax7.v1" };
-    const std::array powerIds { "power.6v6.v1", "power.el34.v1" };
-    const std::array toneIds { "passive.fmv.vintage.v1", "passive.fmv.modern.v1", "passive.fmv.bass.v1" };
-
-    for (auto& node : graph.nodes)
-    {
-        if (node.type == nts::circuit::NodeType::filter)
-            setCircuitParameter(node, "cutoff-hz", valueOf(parameterState, ParameterIds::lowCut));
-        else if (node.type == nts::circuit::NodeType::triodeStage)
-        {
-            node.modelId = preampIds[static_cast<std::size_t>(preampTube)];
-            node.backend = numerical ? nts::circuit::ModelBackend::numerical : nts::circuit::ModelBackend::graybox;
-            const auto stageDrive = (valueOf(parameterState, ParameterIds::stage1) + 12.0f) / 54.0f;
-            setCircuitParameter(node, "drive", std::clamp(0.55f * stageDrive + 0.45f * valueOf(parameterState, ParameterIds::gain) * 0.1f, 0.0f, 1.0f));
-            setCircuitParameter(node, "bias", std::clamp((valueOf(parameterState, ParameterIds::bias) + 0.8f) / 1.6f, 0.0f, 1.0f));
-        }
-        else if (node.type == nts::circuit::NodeType::toneStack)
-        {
-            node.modelId = toneIds[static_cast<std::size_t>(toneStyle)];
-            setCircuitParameter(node, "bass", valueOf(parameterState, ParameterIds::bass) * 0.1f);
-            setCircuitParameter(node, "middle", valueOf(parameterState, ParameterIds::mid) * 0.1f);
-            setCircuitParameter(node, "treble", valueOf(parameterState, ParameterIds::treble) * 0.1f);
-            constexpr std::array slope { 100000.0f, 56000.0f, 100000.0f };
-            constexpr std::array bassCap { 22.0e-9f, 47.0e-9f, 100.0e-9f };
-            constexpr std::array midCap { 22.0e-9f, 22.0e-9f, 47.0e-9f };
-            constexpr std::array trebleCap { 250.0e-12f, 470.0e-12f, 330.0e-12f };
-            setCircuitParameter(node, "slope-resistance-ohm", slope[static_cast<std::size_t>(toneStyle)]);
-            setCircuitParameter(node, "bass-cap-f", bassCap[static_cast<std::size_t>(toneStyle)]);
-            setCircuitParameter(node, "mid-cap-f", midCap[static_cast<std::size_t>(toneStyle)]);
-            setCircuitParameter(node, "treble-cap-f", trebleCap[static_cast<std::size_t>(toneStyle)]);
-        }
-        else if (node.type == nts::circuit::NodeType::phaseInverter)
-            setCircuitParameter(node, "drive", std::clamp((valueOf(parameterState, ParameterIds::stage3) + 12.0f) / 54.0f, 0.0f, 1.0f));
-        else if (node.type == nts::circuit::NodeType::powerStage)
-        {
-            node.modelId = powerIds[static_cast<std::size_t>(powerTube)];
-            setCircuitParameter(node, "topology", static_cast<float>(powerTopology));
-            setCircuitParameter(node, "tube-count", powerTopology == 0 ? 1.0f : powerTopology == 1 ? 2.0f : 4.0f);
-            setCircuitParameter(node, "drive", std::clamp((valueOf(parameterState, ParameterIds::stage4) + 12.0f) / 54.0f, 0.0f, 1.0f));
-            setCircuitParameter(node, "sag", valueOf(parameterState, ParameterIds::sag) * 0.01f);
-            setCircuitParameter(node, "feedback", valueOf(parameterState, ParameterIds::feedback) * 0.0075f);
-        }
-        else if (node.type == nts::circuit::NodeType::feedback)
-        {
-            setCircuitParameter(node, "amount", valueOf(parameterState, ParameterIds::feedback) * 0.0075f);
-            setCircuitParameter(node, "presence", valueOf(parameterState, ParameterIds::presence) * 0.1f);
-        }
-    }
-
-    const auto triode = std::find_if(graph.nodes.begin(), graph.nodes.end(), [](const auto& node)
-    { return node.type == nts::circuit::NodeType::triodeStage; });
-    if (triode != graph.nodes.end())
-        graph.nodes.insert(std::next(triode), { "high-filter", nts::circuit::NodeType::filter, "rc.lowpass.v1",
-            nts::circuit::ModelBackend::graybox, {}, { { "cutoff-hz", valueOf(parameterState, ParameterIds::highCut) }, { "high-pass", 0.0f } } });
-    /* The circuit engine no longer carries a speaker of its own.
-
-       It used to synthesise a cabinet node here, with its own resonance/brightness pair and three
-       fixed model ids, while the impulse-response cabinet lived inside the traditional
-       amplifier -- so the two engines had different speakers and a loaded response did nothing on
-       this one. The cabinet is a stage after all three engines now, and leaving this node in
-       would put two cabinets in series, which is not a feature anybody asked for.
-
-       `circuitCabinetStyle` stays registered and saved but is no longer read. Removing the
-       parameter would shift every id after it in `ampControlIds` and silently corrupt every saved
-       project -- see the note at that list. An inert parameter is the cheap half of that trade. */
-    std::erase_if(graph.nodes, [](const auto& node) { return node.type == nts::circuit::NodeType::cabinet; });
-    graph.connections.clear();
-    for (std::size_t index = 1; index < graph.nodes.size(); ++index)
-        graph.connections.push_back({ graph.nodes[index - 1].id, 0, graph.nodes[index].id, 0, false });
-    return graph;
-}

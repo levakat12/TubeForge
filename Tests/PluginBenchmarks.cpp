@@ -63,7 +63,7 @@ void setParameter(TubeForgeAudioProcessor& processor, const char* id, float valu
 struct Scenario
 {
     const char* name;
-    int engineMode;      // 0 traditional, 1 neural, 2 physical circuit
+    int engineMode;      // 0 traditional, 1 neural
     int oversampling;    // index into the oversampling parameter
     bool editorOpen;
     bool effects;
@@ -133,10 +133,9 @@ int main()
         Scenario { "traditional_os4_closed_nofx",   0, 2, false, false },
         Scenario { "traditional_os1_closed_nofx",   0, 0, false, false },
         Scenario { "traditional_os8_closed_nofx",   0, 3, false, false },
-        // The neural and circuit engines with no model or graph loaded still cost their
-        // surrounding chain, which is what these two isolate.
+        // The neural engine with no model loaded still costs its surrounding chain, which is
+        // what this one isolates.
         Scenario { "neural_closed_nofx",            1, 2, false, false },
-        Scenario { "circuit_closed_nofx",           2, 2, false, false },
         // The tier comparison: the same request -- 8x oversampling, both cabinets, effects up,
         // editor open -- served at each of the three settings.
         Scenario { "tier_eco_worstcase",            0, 3, true,  true,  0 },

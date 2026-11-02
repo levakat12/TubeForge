@@ -30,3 +30,7 @@ Modelfile.txt
 # docs/nam-integration-plan.md.
 /amp_learning/
 /pedal_learning/
+
+# Local reference recordings for nts_song_probe. Commercial releases and tens of megabytes of
+# them: useful to test against, never something to commit. The probe skips cleanly when absent.
+test_songs/

@@ -21,10 +21,15 @@ class ModelManifest:
     sha256: str = ""
 
     def validate(self) -> None:
-        if self.model_format_version not in (1, 2, 3):
+        if self.model_format_version not in (1, 2, 3, 4):
             raise ValueError("Unsupported model format version")
+        # v4 is the production regressor, and it is the first entry here that is not an audio
+        # model: it maps a vector of already-measured analysis features to production amounts, so
+        # `input_channels` and `output_channels` are feature counts rather than audio channels and
+        # `sample_rate` is carried only because this manifest requires one.
         if self.architecture not in ("tiny_tanh_rnn", "conditioned_tanh_rnn", "conditioned_lstm",
-                                     "conditioned_gru", "causal_tcn", "wavenet"):
+                                     "conditioned_gru", "causal_tcn", "wavenet",
+                                     "production_regressor"):
             raise ValueError("Unsupported model architecture")
         if not 8_000 <= self.sample_rate <= 384_000:
             raise ValueError("Invalid model sample rate")

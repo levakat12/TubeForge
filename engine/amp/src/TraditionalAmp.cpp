@@ -1722,23 +1722,61 @@ void CabinetSection::process(float* const* channels, std::size_t channelCount, s
     // same arithmetic for both and costs nothing here.
     const auto gainA = parameters.slots[0].phaseInvert ? -slotGain[0] : slotGain[0];
     const auto gainB = parameters.slots[1].phaseInvert ? -slotGain[1] : slotGain[1];
-    for (std::size_t sample = 0; sample < processSamples; ++sample)
-        for (std::size_t channel = 0; channel < count; ++channel)
+    /* Channel-outer, and everything that does not move per sample lifted out of the loop.
+
+       Three costs came out of this, in rising order of size. The ring base pointers and the
+       position references were being re-derived for every sample of every channel. The two `%`
+       were integer divisions -- `delaySize` is 257, deliberately not a power of two -- at two per
+       channel per sample, which is the same cost the oversampler's note records as 20 to 40
+       cycles apiece and unpipelined on the older CPUs this has to run on; both operands are
+       already inside one period of the ring, so a conditional subtract is the identical result.
+       And the traversal order was sample-outer, which walks two delay rings, three buffers and
+       the output in lockstep across channels and evicts each channel's working set with the
+       other's on every sample.
+
+       Exactly output-preserving: each (channel, sample) result depends on nothing from the other
+       channel, the conditional subtracts give the same integers the modulo did, and the
+       arithmetic below is untouched -- including the order of the final multiply, which is
+       written the way it is so the seven original voicings keep their hashes.
+    */
+    // Block constants. Read through `parameters` inside the loop they had to be reloaded after
+    // every store to `channels`, which the compiler must assume may alias the parameter block.
+    const auto blend = parameters.blend;
+    const auto width = parameters.width;
+    const auto diBlend = parameters.bassDiBlend;
+    for (std::size_t channel = 0; channel < count; ++channel)
+    {
+        auto* const ringA = slotDelay[0].data() + channel * delaySize;
+        auto* const ringB = slotDelay[1].data() + channel * delaySize;
+        auto positionA = delayPosition[0][channel];
+        auto positionB = delayPosition[1][channel];
+        /* Only two placements exist, so anything past the second channel takes the first one --
+           which is what the fixed rule did, where every channel that was not channel 1 received
+           slot A. A surround bus is not a thing this stage models, and silently reading past the
+           pan table would be the wrong way to find that out. */
+        const auto placement = static_cast<std::size_t>(channel == 1 ? 1 : 0);
+        const auto panA = panGain[0][placement];
+        const auto panB = panGain[1][placement];
+        const auto* const firstChannel = firstPointers[channel];
+        const auto* const secondChannel = secondPointers[channel];
+        const auto* const dryChannel = dryBuffer.data() + channel * spec.maximumBlockSize;
+        auto* const output = channels[channel];
+
+        for (std::size_t sample = 0; sample < processSamples; ++sample)
         {
-            auto* ringA = slotDelay[0].data() + channel * delaySize;
-            auto* ringB = slotDelay[1].data() + channel * delaySize;
-            auto& positionA = delayPosition[0][channel];
-            auto& positionB = delayPosition[1][channel];
-            ringA[positionA] = firstPointers[channel][sample];
-            ringB[positionB] = secondPointers[channel][sample];
+            ringA[positionA] = firstChannel[sample];
+            ringB[positionB] = secondChannel[sample];
             // A slot at zero delay reads back the sample just written, so an unused ring is
             // transparent rather than merely short.
-            const auto firstSample = ringA[(positionA + delaySize - delayA) % delaySize] * gainA;
-            const auto secondSample = ringB[(positionB + delaySize - delayB) % delaySize] * gainB;
-            positionA = (positionA + 1) % delaySize;
-            positionB = (positionB + 1) % delaySize;
-            const auto summed = firstSample * (1.0f - parameters.blend)
-                              + secondSample * parameters.blend;
+            auto readA = positionA + delaySize - delayA;
+            if (readA >= delaySize) readA -= delaySize;
+            auto readB = positionB + delaySize - delayB;
+            if (readB >= delaySize) readB -= delaySize;
+            const auto firstSample = ringA[readA] * gainA;
+            const auto secondSample = ringB[readB] * gainB;
+            if (++positionA == delaySize) positionA = 0;
+            if (++positionB == delaySize) positionB = 0;
+            const auto summed = firstSample * (1.0f - blend) + secondSample * blend;
             /* Width interpolates away from the sum towards where the two slots are *placed*.
 
                That placement used to be the fixed rule "channel 0 takes A, channel 1 takes B";
@@ -1749,19 +1787,16 @@ void CabinetSection::process(float* const* channels, std::size_t channelCount, s
                of them, so the crossfade is close to level-matched, and with two deliberately
                different responses any correction would be guessing at which of them the user
                considers the reference. */
-            /* Only two placements exist, so anything past the second channel takes the first
-               one -- which is what the fixed rule did, where every channel that was not
-               channel 1 received slot A. A surround bus is not a thing this stage models, and
-               silently reading past the pan table would be the wrong way to find that out. */
-            const auto placement = static_cast<std::size_t>(channel == 1 ? 1 : 0);
-            const auto split = count > 1
-                ? firstSample * panGain[0][placement] + secondSample * panGain[1][placement]
-                : summed;
-            const auto cabinet = summed + (split - summed) * parameters.width;
-            const auto dry = dryBuffer[channel * spec.maximumBlockSize + sample];
-            channels[channel][sample] = (cabinet * (1.0f - parameters.bassDiBlend)
-                                         + dry * parameters.bassDiBlend) * outputTrimGain;
+            const auto split = count > 1 ? firstSample * panA + secondSample * panB : summed;
+            const auto cabinet = summed + (split - summed) * width;
+            // Written in exactly this order -- blend first, trim second -- because reassociating
+            // it into two premultiplied gains is a different rounding and moves the golden hashes.
+            output[sample] = (cabinet * (1.0f - diBlend) + dryChannel[sample] * diBlend)
+                           * outputTrimGain;
         }
+        delayPosition[0][channel] = positionA;
+        delayPosition[1][channel] = positionB;
+    }
     lowCut.process(channels, count, processSamples); highCut.process(channels, count, processSamples);
     measureMonoCompatibility(channels, count, processSamples);
 }
@@ -1776,6 +1811,19 @@ void AmpVoice::prepare(const dsp::ProcessSpec& newSpec)
     postLow.prepare(spec); postMid.prepare(spec); postHigh.prepare(spec);
     inputTrim.prepare(spec.sampleRate, 15.0, dsp::SmoothingMode::logarithmic);
     outputGain.prepare(spec.sampleRate, 20.0, dsp::SmoothingMode::logarithmic);
+    /* The loudness matcher's two rates, in milliseconds rather than in per-sample constants.
+
+       150 ms on the energies and 800 ms on the gain, against the 42 ms and 104 ms they replace.
+       The feature exists so that raising drive or master stops raising the volume -- it is a
+       compensation for a *setting*, and a setting does not change twice a bar. At the old rates it
+       tracked playing instead, and an amplifier compresses, so the ratio it applies rose exactly
+       when the player dug in. Measured in `nts_amp_tests`: a 12 dB dynamic step arrived 1.6 dB
+       larger than with the feature bypassed, and a note after silence swelled by 11 dB. */
+    const auto onePole = [rate = std::max(spec.sampleRate, 1.0)](double milliseconds)
+    { return 1.0 - std::exp(-1.0 / (rate * milliseconds * 0.001)); };
+    energySmoothing = onePole(150.0);
+    matchSmoothing = static_cast<float>(onePole(300.0));
+    matchSettleSamples = static_cast<std::uint32_t>(std::max(spec.sampleRate, 1.0) * 0.300);
     cleanBlend.prepare(spec.sampleRate, 25.0);
     dryMix.prepare(spec.sampleRate, 25.0);
     lowBuffer.assign(spec.maximumBlockSize * spec.channels, 0.0f);
@@ -1802,7 +1850,7 @@ void AmpVoice::reset() noexcept
     calibrator.reset(); gate.reset(); preEq.reset(); for (auto& stage : stages) stage.reset();
     toneStack.reset(); phaseInverter.reset(); powerAmp.reset(); cabinet.reset(); bassCrossover.reset();
     bassCompressor.reset(); postLow.reset(); postMid.reset(); postHigh.reset();
-    inputEnergy.fill(0.0); outputEnergy.fill(0.0); matchGain.fill(1.0f);
+    inputEnergy.fill(0.0); outputEnergy.fill(0.0); matchGain.fill(1.0f); matchSettleCount.fill(0);
     dryDelay.reset(); lowBandDelay.reset();
     inputTrim.reset(dsp::dbToLinear(parameters.manualInputTrimDb));
     outputGain.reset(dsp::dbToLinear(parameters.outputGainDb)); cleanBlend.reset(parameters.bass.cleanBlend);
@@ -1981,22 +2029,61 @@ void AmpVoice::process(float* const* channels, std::size_t channelCount, std::si
                                           + dryPointers[channel][sample] * mix;
         }
 
+    /* Below this, in mean square, neither energy says anything about the amplifier's gain
+       structure. -80 dBFS RMS: under anything musical, over the noise floor of a real interface.
+       The point is not efficiency -- it is that the ratio of two numbers this small is noise, and
+       acting on it is how a gain control ends up moving when nobody is playing. */
+    constexpr auto energyFloor = 1.0e-8;
+
     for (std::size_t sample = 0; sample < processSamples; ++sample)
     {
         const auto level = outputGain.next();
         for (std::size_t channel = 0; channel < count; ++channel)
         {
-            const auto dry = dryBuffer[channel * spec.maximumBlockSize + sample];
-            inputEnergy[channel] = dry * dry + 0.9995 * (inputEnergy[channel] - dry * dry);
+            /* The **latency-aligned** dry, not `dryBuffer`.
+
+               `dryBuffer` is the input as it entered the drive path; `channels` is the output of
+               a chain that reports `latencySamples()` of delay. Comparing them compares two
+               different moments, and at a note's attack those two moments are "signal" and
+               "silence" -- so the ratio ran away toward its 4x ceiling and the gain swelled into
+               the front of every note. Measured at 11 dB before this changed.
+
+               The comment that used to sit here said the matcher "does not care about a few
+               samples of skew". It does: the skew is a whole preamp plus a cabinet impulse, and it
+               is the difference between measuring a note and measuring the silence before it.
+               `dryPointers` has already been through `dryDelay`, which delays by exactly what the
+               drive path costs, so the two sides now describe the same instant. */
+            const auto dry = dryPointers[channel][sample];
+            inputEnergy[channel] += energySmoothing * (dry * dry - inputEnergy[channel]);
             const auto processed = channels[channel][sample];
-            outputEnergy[channel] = processed * processed + 0.9995 * (outputEnergy[channel] - processed * processed);
-            if (parameters.loudnessMatch && outputEnergy[channel] > 1.0e-9)
+            outputEnergy[channel] += energySmoothing * (processed * processed - outputEnergy[channel]);
+
+            /* Both followers have to have had signal for `matchSettleSamples` before the gain
+               may move. Reset the moment either falls silent, so a rest re-arms the wait and the
+               attack that follows it is not measured. */
+            if (inputEnergy[channel] > energyFloor && outputEnergy[channel] > energyFloor)
+            {
+                if (matchSettleCount[channel] < matchSettleSamples) ++matchSettleCount[channel];
+            }
+            else matchSettleCount[channel] = 0;
+
+            if (! parameters.loudnessMatch)
+                matchGain[channel] += matchSmoothing * (1.0f - matchGain[channel]);
+            else if (matchSettleCount[channel] >= matchSettleSamples)
             {
                 const auto target = std::clamp(static_cast<float>(std::sqrt(
                     inputEnergy[channel] / outputEnergy[channel])), 0.25f, 4.0f);
-                matchGain[channel] += 0.0002f * (target - matchGain[channel]);
+                matchGain[channel] += matchSmoothing * (target - matchGain[channel]);
             }
-            else matchGain[channel] += 0.0002f * (1.0f - matchGain[channel]);
+            /* Otherwise held, deliberately, rather than drifting back to unity.
+
+               Silence carries no evidence about the gain structure, so there is nothing to move
+               towards -- and drifting to unity would put the whole compensation back as a step at
+               the start of the next note, which is the same spike this is removing, arriving from
+               the other direction. Held, the first note of a phrase is compensated the way the
+               last one was. Unity is still reached when the feature is switched off, which is the
+               branch above. */
+
             channels[channel][sample] *= level * matchGain[channel];
         }
     }

@@ -3,7 +3,6 @@
 #include <nts/audio/CoreEngine.h>
 #include <nts/assistant/ToneAssistant.h>
 #include <nts/amp/TraditionalAmp.h>
-#include <nts/circuit/CircuitProcessor.h>
 #include <nts/diagnostics/DiagnosticsCollector.h>
 #include <nts/diagnostics/SpscRingBuffer.h>
 #include <nts/dsp/DelayLine.h>
@@ -55,9 +54,8 @@
     X(crossover) X(cleanBlend) X(dryBlend) X(panelSwitch)                                 \
     X(lowBandDrive) X(lowBandLevel) X(highBandLevel)                                      \
     X(cabinetAlignment) X(tightness) X(pickEmphasis)                                      \
-    X(engineMode) X(neuralMonitor) X(neuralCompensation) X(circuitPreampTube)             \
-    X(circuitPowerTube) X(circuitPowerTopology) X(circuitToneStack) X(circuitBackend)     \
-    X(circuitCabinetStyle) X(gateEnabled) X(gateThreshold) X(gateDepth) X(gateAttack)     \
+    X(engineMode) X(neuralMonitor) X(neuralCompensation)                                  \
+    X(gateEnabled) X(gateThreshold) X(gateDepth) X(gateAttack)                            \
     X(gateHold) X(gateRelease) X(loudnessMatch) X(cabinetWidth) X(tunerReference)          \
     X(delayMix) X(delayTime) X(delayFeedback) X(delayTone)                                 \
     X(reverbMix) X(reverbSize) X(reverbDamping) X(cabinetBlend) X(tunerMute)                \
@@ -243,9 +241,6 @@ public:
     [[nodiscard]] float cabinetMonoFoldDb() const noexcept
     { return cabinetStage.monoCompatibility(); }
     [[nodiscard]] juce::File cabinetIrFile(int slot) const;
-    /// The response currently sounding in a slot, for the page's own display.
-    [[nodiscard]] const nts::amp::CabinetMetadata& cabinetMetadata(int slot) const noexcept
-    { return slot == 0 ? cabinetStage.metadataA() : cabinetStage.metadataB(); }
 
     /** The delay that best lines slot B up behind slot A, in samples.
 
@@ -412,11 +407,6 @@ public:
     void setEditorActive(bool active) noexcept
     { editorActive.store(active, std::memory_order_relaxed); }
 
-    void refreshPhysicalCircuit();
-    [[nodiscard]] std::vector<nts::circuit::NodeTelemetry> circuitTelemetrySnapshot() const
-    { return physicalCircuit.telemetrySnapshot(); }
-    [[nodiscard]] nts::circuit::CircuitGraphDescription circuitGraphSnapshot() const;
-    [[nodiscard]] juce::String circuitStatusText() const;
     void requestToneAnalysis(const juce::File& audioFile);
     [[nodiscard]] juce::String toneAnalysisStatusText() const;
     [[nodiscard]] juce::String toneNearestProfileText() const;
@@ -437,12 +427,17 @@ public:
     [[nodiscard]] bool requestReconstructionRegion(std::size_t index);
     /** Puts a recovered rig on the amplifier.
 
-        `isolateChain` bypasses the pedals and closes the delay and reverb sends, which is
+        `ChainMode::bypass` bypasses the pedals and closes the delay and reverb sends, which is
         what makes the live sound comparable to the render the candidate was ranked from:
         neither was in the offline chain, and both are in front of or behind the amplifier
-        in a way that changes the tone rather than merely adding to it.
+        in a way that changes the tone rather than merely adding to it. `matchRecord` does the
+        opposite deliberately -- see `ChainMode`.
     */
-    [[nodiscard]] bool applyReconstructionCandidate(std::size_t index, bool isolateChain);
+    [[nodiscard]] bool applyReconstructionCandidate(std::size_t index, ChainMode mode);
+    /// What the last match measured the record as doing after the amplifier. See
+    /// `StudioServices::productionProfile`; invalid when nothing has been matched.
+    [[nodiscard]] nts::reconstruction::ProductionProfile reconstructionProduction() const
+    { return studio.productionProfile(); }
     /** What the live chain still does to the rig that was last applied, if anything.
 
         Answered from the parameters as they stand now rather than as they stood at the
@@ -509,9 +504,9 @@ public:
         override the user set two minutes ago.
     */
     void refreshAutoMatch();
-    /// Tells Auto Match whether a re-derivation should also isolate the chain. Pushed from the
-    /// Song Match page's own switch so the automatic apply matches what pressing Apply would do.
-    void setAutoMatchIsolatesChain(bool isolate) noexcept { autoMatchIsolatePreference = isolate; }
+    /// Tells Auto Match what a re-derivation should do with the chain. Pushed from the Tone Match
+    /// page's own control so the automatic apply matches what pressing Apply would do.
+    void setAutoMatchChainMode(ChainMode mode) noexcept { autoMatchChainPreference = mode; }
 
     /** Puts a rig on the amplifier the way a re-derivation does, keeping the user's overrides.
 
@@ -521,7 +516,8 @@ public:
         choosing a different candidate by hand *is* a new rig and the old overrides were about a
         different one.
     */
-    void applyAutoMatchRig(const nts::amp::AmpParameters& rig, bool isolateChain);
+    void applyAutoMatchRig(const nts::amp::AmpParameters& rig, ChainMode mode,
+                           const nts::reconstruction::ProductionProfile& profile);
 
     [[nodiscard]] bool autoMatchTracking() const noexcept;
     void setAutoMatchTracking(bool enabled);
@@ -545,7 +541,8 @@ public:
         by calling it. It is not a shortcut around `applyReconstructionCandidate`, which does the
         candidate bookkeeping this deliberately knows nothing about.
     */
-    void applyRecoveredRig(const nts::amp::AmpParameters& rig, bool isolateChain);
+    void applyRecoveredRig(const nts::amp::AmpParameters& rig, ChainMode mode = ChainMode::leaveAlone,
+                           const nts::reconstruction::ProductionProfile& profile = {});
     void refreshAssistant();
     void setAssistantGoal(nts::assistant::Goal goal);
     [[nodiscard]] std::vector<nts::assistant::Recommendation> assistantRecommendations() const;
@@ -649,6 +646,27 @@ public:
         int pedalCostBudget {};
     };
 
+    /** The tier table.
+
+        **Standard is the default, so Standard has to be a tier somebody would choose on purpose.**
+        It used to cap oversampling at 2x and run the approximate saturator, which made the
+        shipping default a degraded mode nobody had asked for: the voicings that specify 8x with a
+        `hardClip` stage -- Solid-State Bi-Amp and CMOS Modern -- were silently given 2x, and the
+        note on those voicings says in as many words that 8x is what makes a clamped curve survive
+        being sampled. A hard clipper at 2x folds its harmonics straight back into the audible
+        band, and that is not a saving, it is a different amplifier.
+
+        So Standard now reaches 4x and runs the exact curves. Eco keeps both compromises and is
+        where they belong: it is the tier a player selects when they would rather spend the
+        callback on staying up than on the top octave.
+
+        `approximateNonlinearities` is the one to watch if this is revisited. `dsp::fastTanh` is
+        bounded at 1e-4, which is inaudible downstream of a clipping stage -- the argument for
+        turning it off here is not that it is audible on its own, but that it was compounding with
+        the 2x cap, and that a default should not be spending accuracy it has not been asked to
+        spend. Making it unconditional and deleting the flag is a reasonable future call; capping
+        oversampling at 2x by default is not.
+    */
     [[nodiscard]] static constexpr TierLimits limitsFor(PerformanceTier tier) noexcept
     {
         switch (tier)
@@ -656,7 +674,7 @@ public:
             case PerformanceTier::eco:      return { 1, 256,  true,  true,  true,  false, 6 };
             case PerformanceTier::studio:   return { 8, 4096, false, false, false, true, 20 };
             case PerformanceTier::standard:
-            default:                        return { 2, 1024, false, true,  false, true, 12 };
+            default:                        return { 4, 1024, false, false, false, true, 12 };
         }
     }
 
@@ -707,8 +725,6 @@ private:
         checked by a static assertion at the definition rather than trusted.
     */
     [[nodiscard]] nts::pedals::PedalParameters currentPedalParameters(std::size_t slot) const noexcept;
-    [[nodiscard]] nts::circuit::SimpleControls currentCircuitControls() const noexcept;
-    [[nodiscard]] nts::circuit::CircuitGraphDescription currentCircuitGraph() const;
     void refreshProcessingLatency(bool notifyHostFromAudioThread) noexcept;
     void updateReportedLatency();
     void handleAsyncUpdate() override;
@@ -724,7 +740,6 @@ private:
     nts::audio::MeterState meters;
     nts::audio::CoreEngine engine;
     nts::amp::TraditionalAmpProcessor traditionalAmp;
-    nts::circuit::CircuitProcessor physicalCircuit;
     nts::ml::NeuralAmpProcessor neuralAmp;
     /// One entry per (instrument, topology) pair, indexed `instrument * topologyCount + topology`.
     /// See `factoryAmpIndex`, which is the only thing allowed to do that arithmetic.
@@ -743,8 +758,8 @@ private:
     // traditional amplifier applies it inside AmpVoice, where its calibrator measures the
     // untrimmed signal first; see the note at the call site in processBlock.
     nts::dsp::SmoothedParameter inputTrimGain;
-    /// Gate for the neural and circuit engines; the traditional path keeps its own. See
-    /// the note at the call site for why the two are not merged.
+    /// Gate for the neural engine; the traditional path keeps its own. See the note at the
+    /// call site for why the two are not merged.
     nts::dsp::NoiseGate sharedGate;
     /** The engine's input, kept so the gate can key off it while attenuating the output.
 
@@ -752,14 +767,13 @@ private:
         the detector and the attenuation have to be on opposite sides of the amplifier.
     */
     std::vector<float> gateSidechain;
-    /** The speaker, after whichever engine is selected and shared by all three.
+    /** The speaker, after whichever engine is selected and shared by both.
 
         **This is a stage, not a member of the amplifier, and the difference is audible.** While
         the cabinet lived inside `AmpVoice` only the traditional engine had one: a Neural Amp
         Modeler capture of a preamp or a pedal -- which is most of what people share -- played
         into the output with no speaker in front of it, and no control in the plug-in could put
-        one there. The physical circuit engine had a *different* cabinet, a graph node, so a
-        loaded impulse response did nothing on it at all.
+        one there.
 
         `AmpVoice` keeps its own instance for offline rendering, where the reconstruction needs a
         cabinet in the render and cannot be handed a live audio object; on the live path that
@@ -893,7 +907,24 @@ private:
     [[nodiscard]] bool autoMatchGuarding(int ownedIndex) const noexcept;
     /// Records what a matched rig just put on every owned control. Called from
     /// `applyRecoveredRig` once the writes are done.
-    void captureAutoMatchSnapshot(bool isolatedChain);
+    void captureAutoMatchSnapshot(ChainMode mode);
+    /** Writes the record's production onto the effects the plug-in already has.
+
+        Split out of `applyRecoveredRig` because it is a different kind of write: everything else
+        there is the amplifier the search actually ranked, and this is an estimate of what the mix
+        did afterwards, applied through controls the user can see and undo. Deterministic and
+        hand-written -- there is no model behind it, and P11 of the production-match plan is where
+        one would go if it ever earns its place.
+    */
+    void applyProductionProfile(const nts::reconstruction::ProductionProfile& profile);
+    /** Why the production layer's cabinet fit did not happen, or empty when it did.
+
+        Message thread only, like `appliedRecoveredRig` beside it, and cleared on every apply. A
+        string rather than a bool because the two ways it fails need different answers from the
+        user -- clearing slot A versus matching a different part -- and a warning that cannot say
+        which is a warning nobody can act on.
+    */
+    juce::String lastProductionCabinet;
     /** Stops holding, without touching a single parameter value.
 
         Called wherever something replaces the whole rig -- a project, a profile, a program
@@ -942,18 +973,36 @@ private:
     std::uint64_t autoMatchAppliedGeneration {};
     /// Whether the last auto-applied candidate took the effects chain with it. Follows the Song
     /// Match page's own switch, which is pushed in rather than read out of the interface.
-    bool autoMatchIsolatePreference { true };
+    /* Defaults to bypassing the chain, which is the setting that plays back the candidate that
+       was actually ranked. `matchRecord` is never the inherited value: it can double-process a
+       part that already carries its room, so it is a thing the user chooses. */
+    ChainMode autoMatchChainPreference { ChainMode::bypass };
     /// Loaded once at construction and written when it changes; see autoMatchWarningsSuppressed.
     bool autoMatchSuppressWarnings {};
     /// Rate limit for live tracking. A trim that moves at the tick rate would fill a host's
     /// automation lane with gestures and would read as a knob with a fault.
     std::chrono::steady_clock::time_point lastAutoMatchTracking {};
+    /** A slow ceiling on the observed input peak, so tracking follows the guitar and not the phrase.
+
+        `SignalObservation::inputPeak` is a peak-hold that decays about 8% per audio block -- a
+        tenth of a second or so. That is right for the assistant, which is answering "is this
+        clipping now", and wrong here: sampled twice a second it is a different number every time,
+        so the trim chased playing dynamics. Play quietly, the trim climbs; hit a chord, and the
+        chord arrives through the raised trim.
+
+        This falls at about 1 dB per second and rises instantly, so it settles on the loudest thing
+        played in the last several seconds. That is what "aim the peak at -6 dBFS" wants to know:
+        a hotter guitar raises it at once, a quiet passage does not lower it before the passage is
+        clearly over.
+    */
+    float autoMatchPeakEnvelope {};
     /// Follows the live signal within the bounds the match set. See `updateAutoMatchTracking`.
     void updateAutoMatchTracking();
     void loadAutoMatchPreferences();
     mutable std::mutex autoMatchMutex;
     std::string autoMatchSource;
-    bool autoMatchIsolatedChain {};
+    /// What the last apply did with the chain, so a save can record it and a reload can resume it.
+    ChainMode autoMatchChainMode { ChainMode::leaveAlone };
 
     /** The rig a Song Match candidate last put on the amplifier.
 
@@ -973,13 +1022,12 @@ private:
         user response for a slot that holds one.
 
         Message-thread work: it runs transforms and allocates. Reached from `handleAsyncUpdate`
-        when the audio thread notices any of those controls have moved, which is the same route
-        the physical circuit's recompile takes and for the same reason.
+        when the audio thread notices any of those controls have moved.
     */
     void refreshCabinetResponses();
     /** Hash of every control that decides what the two slots sound like -- the built-in model and
         the preparation of a loaded response -- so the audio thread can notice a change without
-        doing anything about it. Mirrors `physicalCircuitControlHash`. */
+        doing anything about it. */
     [[nodiscard]] std::uint64_t cabinetModelHash() const noexcept;
     std::atomic<std::uint64_t> renderedCabinetModelHash {};
     /// See `cabinetHoldState`. Written from the message thread, read from the editor's tick.
@@ -1033,11 +1081,30 @@ private:
     /// See setEditorActive. Read once per block from the audio thread.
     std::atomic<bool> editorActive {};
 
-    /** Automatic tier reduction when the machine cannot keep up.
+    /** Automatic tier reduction when the machine cannot keep up, and the way back up.
 
-        Steps **down** only. A user who chose Studio chose it, and silently putting their tone
-        back when a transient load passes would be worse than the dropout it avoided -- so
-        recovery is theirs to ask for.
+        **It used to step down only, and that was the wrong shape for the thing it writes into.**
+        The tier is a registered parameter, so a step down is saved in the project and recalled
+        next session. One busy afternoon -- a debug build, a dense session, another plug-in
+        misbehaving -- therefore left a rig permanently at Eco: 1x oversampling, a 256-tap
+        cabinet, one convolution, approximated curves. Nothing said so, nothing put it back, and
+        the symptom a player reports is "it sounds worse than it used to", which is a hard thing
+        to trace to a heuristic that ran once a fortnight ago.
+
+        So the reduction now carries a **ceiling**: where the user was standing when the first
+        step down happened. Sustained comfortable load with no dropouts walks back up towards it,
+        one step at a time, and never past it. `automaticTierCeiling` is -1 when nothing is owed.
+
+        Recovery is deliberately slower and stricter than reduction. A dropout is the failure and
+        counts immediately; getting back is a claim about the future, so it wants a long quiet
+        stretch (`recoveryChecksBeforeStepUp` at `automaticTierCheckBlocks` blocks apiece is on
+        the order of half a minute) and a load figure well clear of the threshold that triggered
+        the step down. The gap between the two is what stops a machine sitting exactly on the
+        boundary from oscillating between tiers, which would be audible in a way neither tier is.
+
+        A user who moves the control themselves takes it back: `lastAutomaticTierWritten` records
+        what this path last wrote, and a current value that disagrees with it means the choice is
+        theirs again, so the ceiling is dropped and no recovery is owed.
 
         Detected on the audio thread, applied on the message thread: changing a tier means
         touching parameter objects, which is not audio-thread work. The request crosses through
@@ -1046,12 +1113,22 @@ private:
         trouble is most likely one running with the window closed.
     */
     static constexpr int overloadChecksBeforeStepDown = 8;
+    static constexpr int recoveryChecksBeforeStepUp = 96;
     static constexpr int automaticTierCheckBlocks = 32;
     static constexpr double overloadLoadPercent = 75.0;
+    /// Well below `overloadLoadPercent` rather than just under it: the difference between the two
+    /// is the hysteresis, and a machine resting between them stays where it is.
+    static constexpr double recoveryLoadPercent = 45.0;
     std::atomic<int> automaticTierRequest { -1 };
+    /// Highest tier automatic recovery may restore, or -1 when nothing has been taken away.
+    /// Written by the audio thread, read on the message thread when a request is applied.
+    std::atomic<int> automaticTierCeiling { -1 };
+    /// What this path last wrote, so a value that disagrees identifies a change the user made.
+    std::atomic<int> lastAutomaticTierWritten { -1 };
     std::uint64_t lastSeenDropoutCount {};
     int automaticTierCheckCounter {};
     int overloadStreak {};
+    int recoveryStreak {};
     void considerAutomaticTierReduction() noexcept;
     /// Scratch for the tuner decimation's read pointers, so the loop does not re-derive them.
     std::array<const float*, nts::audio::MeterState::maximumChannels> tunerReadPointers {};
@@ -1086,13 +1163,6 @@ private:
     bool previousTransportPlaying {};
     bool standaloneApplicationMode {};
     std::jthread neuralLoader;
-    std::atomic<std::uint64_t> physicalCircuitControlHash {};
-    std::atomic<std::uint64_t> physicalCircuitRequestedHash {};
-    mutable std::mutex circuitStatusMutex;
-    std::string circuitStatusDetail { "Default physical circuit ready to compile" };
-    mutable std::mutex circuitGraphMutex;
-    nts::circuit::CircuitGraphDescription desiredCircuitGraph;
-    std::jthread circuitCompiler;
     StudioServices studio;
     nts::assistant::SummaryQueue assistantSummaryQueue;
     nts::assistant::SummaryAccumulator assistantSummaryAccumulator;

@@ -24,11 +24,6 @@ void TubeForgeAudioProcessor::refreshEffectParameters() noexcept
 
 void TubeForgeAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-    if (circuitCompiler.joinable())
-    {
-        circuitCompiler.request_stop();
-        circuitCompiler.join();
-    }
     currentSampleRate = sampleRate;
     currentBlockSize = samplesPerBlock;
     absoluteSamplePosition = 0;
@@ -77,7 +72,7 @@ void TubeForgeAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     engineSwitchGain.prepare(sampleRate, 5.0);
     engineSwitchGain.reset(1.0f);
     engineSwitchPhase = EngineSwitch::idle;
-    activeEngineMode = std::clamp(static_cast<int>(std::lround(parameterOf(Param::engineMode))), 0, 2);
+    activeEngineMode = std::clamp(static_cast<int>(std::lround(parameterOf(Param::engineMode))), 0, 1);
     engine.prepare(sampleRate,
                    static_cast<std::size_t>(samplesPerBlock),
                    static_cast<std::size_t>(getTotalNumInputChannels()),
@@ -93,11 +88,6 @@ void TubeForgeAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     // prepare() reinstates the built-in responses, so any user response has to go back in --
     // and re-prepared against the new rate, which is the reason the decoded audio is kept.
     for (int slot = 0; slot < 2; ++slot) applyCabinetIr(slot);
-    physicalCircuit.prepare({ sampleRate, static_cast<std::size_t>(samplesPerBlock),
-                              static_cast<std::size_t>(getTotalNumOutputChannels()) });
-    physicalCircuitControlHash.store(0, std::memory_order_relaxed);
-    physicalCircuitRequestedHash.store(0, std::memory_order_relaxed);
-    refreshPhysicalCircuit();
     neuralAmp.prepare(sampleRate, static_cast<std::size_t>(samplesPerBlock),
                       static_cast<std::size_t>(getTotalNumOutputChannels()));
     diagnostics.prepare(sampleRate, static_cast<std::uint32_t>(samplesPerBlock));
@@ -115,16 +105,10 @@ void TubeForgeAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
 
 void TubeForgeAudioProcessor::releaseResources()
 {
-    if (circuitCompiler.joinable())
-    {
-        circuitCompiler.request_stop();
-        circuitCompiler.join();
-    }
     cancelPendingUpdate();
     engine.reset();
     traditionalAmp.reset();
     cabinetStage.reset();
-    physicalCircuit.reset();
     neuralAmp.reset();
     pedalBoard.reset();
 }
@@ -235,18 +219,17 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     }
 
     // A mode change mutes, switches at the block boundary, and unmutes. The alternative --
-    // crossfading the outgoing and incoming engines -- cannot work here: the three report
+    // crossfading the outgoing and incoming engines -- cannot work here: the two report
     // different latencies, so overlapping them comb-filters the transition instead of
     // blending it. Ten milliseconds of silence when someone deliberately changes amplifier
     // engine is imperceptible, and it costs neither latency nor transient smearing.
     const auto requestedEngineMode = std::clamp(
-        static_cast<int>(std::lround(parameterOf(Param::engineMode))), 0, 2);
+        static_cast<int>(std::lround(parameterOf(Param::engineMode))), 0, 1);
     if (engineSwitchPhase == EngineSwitch::idle && requestedEngineMode != activeEngineMode)
     {
         engineSwitchPhase = EngineSwitch::fadingOut;
         engineSwitchGain.setTarget(0.0f);
     }
-    if (activeEngineMode != 2) physicalCircuit.publishPendingWithoutCrossfade();
 
     // Always processed, even while bypassed. The bypass crossfade needs a live wet signal
     // to fade away from, and an engine that had been parked would fade back in on state
@@ -255,7 +238,7 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         // The shared front end: one input trim ahead of whichever engine is selected.
         //
         // The traditional amplifier's own trim is zeroed in currentAmpParameters so this is
-        // the only one, which makes the Input control behave identically in all three modes.
+        // the only one, which makes the Input control behave identically in both modes.
         // Hoisting it is exactly output-preserving for the traditional path because AmpVoice
         // applies its trim before capturing the dry reference: trimming here and passing unity
         // through leaves that reference holding the same samples it always did.
@@ -278,8 +261,8 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         // ahead of the gate, so the gate is deciding about the noise the pedals actually
         // produce rather than the noise they were given.
         //
-        // Every engine shares it, because pedals belong to the rig rather than to one of the
-        // three ways of making the distortion -- the same reason the delay and reverb are
+        // Both engines share it, because pedals belong to the rig rather than to one of the
+        // two ways of making the distortion -- the same reason the delay and reverb are
         // shared at the other end of the chain.
         for (std::size_t slot = 0; slot < nts::pedals::slotCount; ++slot)
             pedalBoard.setParameters(slot, currentPedalParameters(slot));
@@ -292,17 +275,16 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
            is amplified afterwards, including the gate's own decay -- the chopped-sustain
            complaint. Keying off the output means the threshold has to clear the *amplified* noise
            floor, which a quiet passage easily exceeds, so the gate never closes and removes
-           nothing; that is what a purely post-engine gate did, and it is why the circuit engine
-           stopped gating a -46 dBFS input at a -30 dB threshold. Detector on the input and
-           attenuation on the output is what real high-gain noise gates do, and it is the only
-           arrangement where the threshold is set in terms the player recognises and the noise
-           actually goes away.
+           nothing; that is what a purely post-engine gate did, and it is why a -46 dBFS input at a
+           -30 dB threshold went ungated. Detector on the input and attenuation on the output is
+           what real high-gain noise gates do, and it is the only arrangement where the threshold
+           is set in terms the player recognises and the noise actually goes away.
 
            Deliberately not hoisted out of the traditional path as well, even though that would be
            tidier. AmpVoice captures its dry reference between the trim and the gate, and feeds it
            to the loudness match; gating upstream would lower the input energy that match tracks
-           during gated passages and quietly push its gain up. The neural and circuit engines have
-           no such reference. */
+           during gated passages and quietly push its gain up. The neural engine has no such
+           reference. */
         const auto gateActive = activeEngineMode != 0 && parameterOf(Param::gateEnabled) >= 0.5f;
         if (gateActive)
             for (int channel = 0; channel < outputCount; ++channel)
@@ -357,11 +339,6 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
             neuralAmp.process(outputs.data(), static_cast<std::size_t>(outputCount),
                               static_cast<std::size_t>(buffer.getNumSamples()));
         }
-        else if (activeEngineMode == 2)
-        {
-            physicalCircuit.process(outputs.data(), static_cast<std::size_t>(outputCount),
-                                    static_cast<std::size_t>(buffer.getNumSamples()));
-        }
         else
         {
             traditionalAmp.setParameters(liveAmpParameters());
@@ -374,7 +351,7 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         // requires.
         runSharedGate();
 
-        /* The speaker, shared by all three engines.
+        /* The speaker, shared by both engines.
 
            After the gate rather than before it, which is both what a real rig does -- a gate sits
            in front of the power section, not in front of the microphone -- and the only order
@@ -388,8 +365,7 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         /* Noticing that the built-in model has moved, and doing nothing about it here.
 
            Rendering it means two transforms and an allocation, which is not audio-thread work, so
-           the callback compares a hash and asks the message thread. Same arrangement as the
-           physical circuit's recompile, and for the same reason. The comparison itself is nine
+           the callback compares a hash and asks the message thread. The comparison itself is nine
            parameter reads and a multiply each -- cheaper than the string lookup it replaces. */
         if (cabinetModelHash() != renderedCabinetModelHash.load(std::memory_order_acquire))
             triggerAsyncUpdate();
@@ -465,12 +441,8 @@ void TubeForgeAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     if (engineSwitchPhase == EngineSwitch::fadingOut && ! engineSwitchGain.isSmoothing())
     {
         activeEngineMode = requestedEngineMode;
-        switch (activeEngineMode)
-        {
-            case 1: neuralAmp.reset(); break;
-            case 2: physicalCircuit.reset(); break;
-            default: traditionalAmp.reset(); break;
-        }
+        if (activeEngineMode == 1) neuralAmp.reset();
+        else traditionalAmp.reset();
         engineSwitchPhase = EngineSwitch::fadingIn;
         engineSwitchGain.setTarget(1.0f);
     }
@@ -520,9 +492,9 @@ double TubeForgeAudioProcessor::getTailLengthSeconds() const
     // The effects outlast the cabinet by a wide margin -- a long reverb is seconds where the
     // cabinet is milliseconds -- so they set the tail whenever they are engaged.
     // The cabinet is added to whichever engine is longest rather than compared against them: it
-    // sits after all three, so its decay runs on past whatever reaches it.
-    const auto tail = std::max({ traditionalAmp.tailSamples(), physicalCircuit.tailSamples(),
-                                 delayEffect.tailSamples() + reverbEffect.tailSamples() })
+    // sits after both, so its decay runs on past whatever reaches it.
+    const auto tail = std::max(traditionalAmp.tailSamples(),
+                               delayEffect.tailSamples() + reverbEffect.tailSamples())
                     + cabinetStage.tailSamples();
     const auto latency = static_cast<std::size_t>(
         std::max(0, pendingOversamplingLatencySamples.load(std::memory_order_relaxed)));
@@ -589,6 +561,21 @@ void TubeForgeAudioProcessor::considerAutomaticTierReduction() noexcept
     const auto droppedSinceLastCheck = snapshot.dropoutCount > lastSeenDropoutCount;
     lastSeenDropoutCount = snapshot.dropoutCount;
 
+    const auto current = static_cast<int>(performanceTier());
+    /* The user moved the control, so the tier is theirs again and nothing is owed back.
+
+       Compared against what this path last wrote rather than tracked through a listener: the
+       automatic write goes through the same `setParameterValue` a host or a preset uses, so there
+       is no other way to tell the two apart from here. A user who happens to select exactly the
+       tier the heuristic had chosen is indistinguishable and does not matter -- the result either
+       way is that the ceiling is where they left it. */
+    if (current != lastAutomaticTierWritten.load(std::memory_order_relaxed))
+    {
+        automaticTierCeiling.store(-1, std::memory_order_relaxed);
+        lastAutomaticTierWritten.store(current, std::memory_order_relaxed);
+        recoveryStreak = 0;
+    }
+
     // A dropout is not a warning, it is the failure -- so it counts immediately rather than
     // having to persist. Sustained high load is the case worth waiting out, because a single
     // busy callback happens for reasons that have nothing to do with this plug-in.
@@ -596,14 +583,35 @@ void TubeForgeAudioProcessor::considerAutomaticTierReduction() noexcept
     else if (snapshot.cpuLoadPercent > overloadLoadPercent) ++overloadStreak;
     else overloadStreak = 0;
 
-    if (overloadStreak < overloadChecksBeforeStepDown) return;
-    overloadStreak = 0;
+    if (overloadStreak >= overloadChecksBeforeStepDown)
+    {
+        overloadStreak = 0;
+        recoveryStreak = 0;
+        if (current <= static_cast<int>(PerformanceTier::eco)) return;
+        // Remembered on the first step down only, so a rig that walks Studio -> Standard -> Eco
+        // still climbs all the way back to Studio rather than stopping where the last step began.
+        if (automaticTierCeiling.load(std::memory_order_relaxed) < 0)
+            automaticTierCeiling.store(current, std::memory_order_relaxed);
+        // One step at a time, so a machine that is briefly in trouble does not end up at Eco.
+        automaticTierRequest.store(current - 1, std::memory_order_relaxed);
+        triggerAsyncUpdate();
+        return;
+    }
 
-    const auto current = static_cast<int>(performanceTier());
-    if (current <= static_cast<int>(PerformanceTier::eco)) return;
-    // Only ever downward, and only one step at a time, so a machine that is briefly in trouble
-    // does not end up at Eco because of it.
-    automaticTierRequest.store(current - 1, std::memory_order_relaxed);
+    /* The way back. Only ever towards a tier this path took away, never past it.
+
+       Anything at all disqualifies the interval -- a dropout, or a load figure above the recovery
+       threshold -- and resets the count rather than decrementing it. Restoring a tier the machine
+       cannot carry costs a dropout to discover, so the evidence has to be one long quiet stretch
+       and not an average over a noisy one. */
+    const auto ceiling = automaticTierCeiling.load(std::memory_order_relaxed);
+    if (ceiling <= current) { recoveryStreak = 0; return; }
+    if (droppedSinceLastCheck || snapshot.cpuLoadPercent > recoveryLoadPercent)
+    { recoveryStreak = 0; return; }
+
+    if (++recoveryStreak < recoveryChecksBeforeStepUp) return;
+    recoveryStreak = 0;
+    automaticTierRequest.store(current + 1, std::memory_order_relaxed);
     triggerAsyncUpdate();
 }
 
@@ -814,8 +822,7 @@ void TubeForgeAudioProcessor::refreshProcessingLatency(bool notifyHostFromAudioT
     // mode change the two differ for the length of the fade, and reporting the incoming
     // engine's latency early would misalign the dry path against the outgoing audio.
     const auto mode = activeEngineMode;
-    const auto engineLatency = mode == 0 ? static_cast<int>(traditionalAmp.latencySamples())
-                                         : mode == 2 ? static_cast<int>(physicalCircuit.latencySamples()) : 0;
+    const auto engineLatency = mode == 0 ? static_cast<int>(traditionalAmp.latencySamples()) : 0;
     /* The cabinet's own buffering, added to every engine rather than only the traditional one.
 
        It is zero until a response long enough to want the partitioned FFT path is loaded, and one
@@ -875,14 +882,35 @@ void TubeForgeAudioProcessor::handleAsyncUpdate()
 
     if (const auto tier = automaticTierRequest.exchange(-1, std::memory_order_relaxed); tier >= 0)
     {
-        // Re-read rather than trusting the request: the user may have moved the control between
-        // the audio thread asking and this running, and their choice wins over a stale request.
-        if (const auto current = static_cast<int>(performanceTier()); tier < current)
+        /* Re-read rather than trusting the request: the user may have moved the control between
+           the audio thread asking and this running, and their choice wins over a stale request.
+
+           A step up is additionally held to the ceiling, which is the tier the user was on when
+           the first reduction happened. Checked here as well as on the audio thread because the
+           two reads are a block apart and the control is theirs to move in between -- and the
+           failure this prevents is the one nobody would report as a bug: a rig quietly ending up
+           one tier *above* where its owner put it. */
+        const auto current = static_cast<int>(performanceTier());
+        const auto ceiling = automaticTierCeiling.load(std::memory_order_relaxed);
+        const auto steppingDown = tier < current;
+        const auto steppingUp = tier > current && ceiling >= 0 && tier <= ceiling;
+        if (steppingDown || steppingUp)
         {
             setParameterValue(parameterState, ParameterIds::performanceTier, static_cast<float>(tier));
-            logger.log({ std::chrono::system_clock::now(), nts::diagnostics::LogSeverity::warning,
-                         "audio", "performanceTierReduced",
-                         "Performance tier lowered automatically after sustained overload",
+            // Recorded so the audio thread can tell this write apart from one the user made.
+            lastAutomaticTierWritten.store(tier, std::memory_order_relaxed);
+            // Nothing left owed once the ceiling is reached, so a later manual step down is not
+            // undone by a recovery that was still counting from before it.
+            if (steppingUp && tier >= ceiling)
+                automaticTierCeiling.store(-1, std::memory_order_relaxed);
+            logger.log({ std::chrono::system_clock::now(),
+                         steppingDown ? nts::diagnostics::LogSeverity::warning
+                                      : nts::diagnostics::LogSeverity::info,
+                         "audio",
+                         steppingDown ? "performanceTierReduced" : "performanceTierRestored",
+                         steppingDown
+                             ? "Performance tier lowered automatically after sustained overload"
+                             : "Performance tier restored automatically after sustained headroom",
                          "tier=" + std::to_string(tier) });
             updateHostDisplay();
         }

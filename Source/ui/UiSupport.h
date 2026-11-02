@@ -4,7 +4,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 /// Small pieces every module page builds from. Kept here rather than duplicated per page so
-/// a caption on the Circuit page can never drift out of step with one on the Amp page.
+/// a caption on the Cabinet page can never drift out of step with one on the Amp page.
 namespace tf::ui
 {
 void configureLabel(juce::Label& label, const juce::String& text, float height, bool bold,

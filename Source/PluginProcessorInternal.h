@@ -69,12 +69,6 @@ constexpr auto pickEmphasis = "pickEmphasis";
 constexpr auto engineMode = "engineMode";
 constexpr auto neuralMonitor = "neuralMonitor";
 constexpr auto neuralCompensation = "neuralCompensation";
-constexpr auto circuitPreampTube = "circuitPreampTube";
-constexpr auto circuitPowerTube = "circuitPowerTube";
-constexpr auto circuitPowerTopology = "circuitPowerTopology";
-constexpr auto circuitToneStack = "circuitToneStack";
-constexpr auto circuitBackend = "circuitBackend";
-constexpr auto circuitCabinetStyle = "circuitCabinetStyle";
 constexpr auto gateEnabled = "gateEnabled";
 constexpr auto gateThreshold = "gateThreshold";
 constexpr auto gateDepth = "gateDepth";
@@ -105,7 +99,7 @@ constexpr auto autoMatchTracking = "autoMatchTracking";
    Named `cab*` rather than `cabinet*` to keep them visibly separate from the four that predate
    them -- `cabinet`, `cabinetBlend`, `cabinetWidth` and `cabinetAlignment` live in
    `ampControlIds` and cannot move, whereas everything here is saved through `cabinetControlIds`
-   and `nts::state::CabinetState`. That split is not cosmetic: `ampControlIds` holds 58 of the 64
+   and `nts::state::CabinetState`. That split is not cosmetic: `ampControlIds` holds 52 of the 64
    entries `ProjectState::validate` accepts, and overrunning it makes every saved project fail to
    load. See the note at that list. */
 constexpr auto cabLevelA = "cabLevelA";
@@ -194,9 +188,13 @@ constexpr std::array ampControlIds {
     ParameterIds::crossover, ParameterIds::cleanBlend, ParameterIds::cabinetAlignment,
     ParameterIds::tightness, ParameterIds::pickEmphasis, ParameterIds::engineMode,
     ParameterIds::neuralMonitor, ParameterIds::neuralCompensation,
-    ParameterIds::circuitPreampTube, ParameterIds::circuitPowerTube,
-    ParameterIds::circuitPowerTopology, ParameterIds::circuitToneStack,
-    ParameterIds::circuitBackend, ParameterIds::circuitCabinetStyle,
+    /* Six physical-circuit selectors used to sit here, at indices 28 to 33.
+
+       Removing them from the middle of this positional table is exactly the corruption the note
+       below `dryBlend` describes, so it is not done silently: the project format went to schema 7
+       and `migrateV6ToV7` splices those six values out of an older project's `ampControls` before
+       it is read against this list. Do not "restore compatibility" by padding here -- the
+       migration is the compatibility, and a pad would double-count it. */
     // Appended so existing saved projects, which hold fewer entries, still map
     // positionally onto the ids ahead of these.
     ParameterIds::gateEnabled, ParameterIds::gateThreshold, ParameterIds::gateDepth,
@@ -250,7 +248,7 @@ static_assert(ampControlIds.size() <= nts::state::maximumAmpControls,
 
 /** The cabinet stage's controls, saved through `nts::state::CabinetState` at schema 6.
 
-    **A separate list, and that is the whole point.** `ampControlIds` above holds 58 of the 64
+    **A separate list, and that is the whole point.** `ampControlIds` above holds 52 of the 64
     entries `ProjectState::validate` accepts, and the cabinet alone wants thirteen. Appending
     them there would leave five slots for everything this plug-in ever grows, and the failure
     mode when that runs out is not a truncated save -- it is every saved project refusing to
@@ -298,22 +296,6 @@ constexpr std::array<std::array<const char*, TubeForgeAudioProcessor::pedalParam
     { ParameterIds::pedal4Kind, ParameterIds::pedal4Bypass, ParameterIds::pedal4Drive,
       ParameterIds::pedal4Tone, ParameterIds::pedal4Level, ParameterIds::pedal4Mix,
       ParameterIds::pedal4AuxA, ParameterIds::pedal4AuxB } } };
-
-void setCircuitParameter(nts::circuit::NodeSpec& node, std::string_view id, float value)
-{
-    const auto found = std::find_if(node.parameters.begin(), node.parameters.end(), [id](const auto& parameter)
-    { return parameter.id == id; });
-    if (found != node.parameters.end()) found->value = value;
-    else node.parameters.push_back({ std::string(id), value });
-}
-
-std::uint64_t circuitHash(const nts::circuit::CircuitGraphDescription& graph)
-{
-    const auto json = nts::circuit::serializeCircuit(graph);
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (const auto byte : json) { hash ^= static_cast<unsigned char>(byte); hash *= 1099511628211ULL; }
-    return hash;
-}
 
 std::filesystem::path logPath()
 {

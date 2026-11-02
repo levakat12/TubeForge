@@ -77,6 +77,22 @@ juce::Path buildGlyph(Glyph glyph)
             path.addEllipse(10.6f, 12.6f, 2.8f, 2.8f);
             break;
 
+        case Glyph::tuner:
+            /* A tuning fork: down one prong, round the yoke, up the other, then the stem.
+
+               It had no glyph of its own and so fell through to `Glyph{}` -- which is
+               `amplifier`, because a value-initialised enum is zero and zero is the first
+               enumerator. Two identical amp heads in one row is the sort of thing that survives
+               review by being invisible in a diff and obvious in a screenshot. */
+            path.startNewSubPath(8.2f, 3.5f);
+            path.lineTo(8.2f, 11.5f);
+            path.quadraticTo(8.2f, 15.2f, 12.0f, 15.2f);
+            path.quadraticTo(15.8f, 15.2f, 15.8f, 11.5f);
+            path.lineTo(15.8f, 3.5f);
+            path.startNewSubPath(12.0f, 15.2f);
+            path.lineTo(12.0f, 20.5f);
+            break;
+
         case Glyph::neuralCapture:
             // A chip. The node-graph version of this read as a pair of scissors once it was
             // scaled down to the size the toolbar actually uses it at.
@@ -119,42 +135,15 @@ juce::Path buildGlyph(Glyph glyph)
             path.addRoundedRectangle(13.1f, 13.1f, 7.4f, 7.4f, 1.6f);
             break;
 
-        case Glyph::circuit:
-            path.addRoundedRectangle(7.0f, 2.5f, 10.0f, 14.5f, 5.0f);
-            path.addRoundedRectangle(7.8f, 15.2f, 8.4f, 3.8f, 1.0f);
-            for (const auto x : { 9.8f, 12.0f, 14.2f })
-            {
-                path.startNewSubPath(x, 19.0f);
-                path.lineTo(x, 21.5f);
-            }
-            path.startNewSubPath(10.0f, 11.5f);
-            path.lineTo(12.0f, 7.0f);
-            path.lineTo(14.0f, 11.5f);
-            break;
-
-        case Glyph::toneAnalyzer:
+        case Glyph::toneMatch:
+            // The analyzer's lens with the song-match note set inside it: one page, both jobs.
             path.addEllipse(3.5f, 3.5f, 13.0f, 13.0f);
             path.startNewSubPath(15.6f, 15.6f);
             path.lineTo(20.5f, 20.5f);
-            path.startNewSubPath(7.6f, 12.2f);
-            path.lineTo(7.6f, 7.8f);
-            path.startNewSubPath(10.0f, 14.0f);
-            path.lineTo(10.0f, 6.0f);
-            path.startNewSubPath(12.4f, 12.6f);
-            path.lineTo(12.4f, 7.4f);
-            break;
-
-        case Glyph::songMatch:
-            path.addEllipse(3.6f, 15.0f, 5.6f, 4.6f);
-            path.addEllipse(14.4f, 12.8f, 5.6f, 4.6f);
-            path.startNewSubPath(9.2f, 17.3f);
-            path.lineTo(9.2f, 5.2f);
-            path.startNewSubPath(20.0f, 15.1f);
-            path.lineTo(20.0f, 3.0f);
-            path.startNewSubPath(9.2f, 5.2f);
-            path.lineTo(20.0f, 3.0f);
-            path.startNewSubPath(9.2f, 8.4f);
-            path.lineTo(20.0f, 6.2f);
+            path.addEllipse(7.2f, 11.6f, 3.6f, 2.9f);
+            path.startNewSubPath(10.6f, 12.9f);
+            path.lineTo(10.6f, 6.2f);
+            path.lineTo(13.2f, 7.4f);
             break;
 
         case Glyph::save:
@@ -289,18 +278,11 @@ void IconButton::paintButton(juce::Graphics& graphics, bool isMouseOver, bool is
     }
 }
 
-void StudioSignalChain::setEngineMode(int mode)
-{
-    if (activeEngineMode == mode) return;
-    activeEngineMode = mode;
-    repaint();
-}
-
 void StudioSignalChain::paint(juce::Graphics& graphics)
 {
     constexpr std::array stages { "INPUT", "PEDALS", "GATE", "PREAMP", "TONE", "POWER",
                                   "CABINET", "OUTPUT" };
-    // The three stages in the middle are the ones the engine mode actually swaps out.
+    // The stages in the middle are the ones the engine mode actually swaps out.
     constexpr int firstCoreStage = 3;
     constexpr int lastCoreStage = 5;
     constexpr float tracking = 1.4f;

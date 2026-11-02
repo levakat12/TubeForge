@@ -7,10 +7,11 @@ a local profile browser, signed-update policy, privacy-safe diagnostics, install
 compatibility/release documentation.
 
 The active `0.10.0` codebase implements the Phase 1 runtime, Phase 2 DSP foundation, Phase 3 traditional
-guitar/bass amplifier, Phase 4 ML platform, Phase 5 neural capture workflow, and Phase 6 physical/hybrid
-circuit runtime, Phase 7 tone analysis, Phase 8 source reconstruction, Phase 9 intelligent assistant, and
-Phase 10 Windows release ecosystem. Traditional, physical, and deterministic tone-analysis modes
-work without ML assets; learned neural components activate only after a validated model is loaded.
+guitar/bass amplifier, Phase 4 ML platform, Phase 5 neural capture workflow, Phase 7 tone analysis,
+Phase 8 source reconstruction, Phase 9 intelligent assistant, and Phase 10 Windows release ecosystem.
+The Phase 6 physical/hybrid circuit runtime has since been removed; see below. Traditional and
+deterministic tone-analysis modes work without ML assets; learned neural components activate only
+after a validated model is loaded.
 
 **Status: pre-release, not shipped.** The per-phase coverage documents are the authoritative record of what
 is actually delivered, and each names its own gaps: Phase 6 at 91%, Phase 7 at 90%, Phase 8 at 95%, Phase 9
@@ -104,22 +105,17 @@ the [dataset and corpus-audit guide](docs/phase-04-dataset-guide.md).
 See [Phase 5 coverage](docs/phase-05-coverage.md), [architecture](docs/phase-05-architecture.md), and the
 [capture guide](docs/phase-05-capture-guide.md).
 
-## Phase 6 physical and hybrid circuit modelling
+## Phase 6 physical and hybrid circuit modelling -- removed
 
-- Stable typed graph IDs for input, filter, triode, tone stack, phase inverter, power, feedback,
-  transformer, cabinet, and output nodes, with validated ports and parameter schemas.
-- Worker-compiled immutable mono runtimes (one per channel), preallocated buffers, latency calculation,
-  block-boundary publication, and a 2048-sample graph crossfade.
-- Electrical 12AX7/12AT7/12AU7/6V6/EL34 definitions and static, stateful gray-box, bounded numerical,
-  and packed-neural nonlinear backends behind one component interface.
-- Component-value-derived passive tone controls, stateful supply sag, local delayed feedback,
-  phase-inverter, power-topology, output-transformer, and reactive cabinet approximations.
-- A Physical Circuit engine mode, macro-controlled simple view, engineering schematic/response view,
-  copied per-stage telemetry, validity warnings, stable JSON round-trip, and v0-to-v1 migration.
+The typed component-graph engine that once shipped as a third "Physical circuit" engine mode has
+been removed. It carried its own graph runtime, tube library, schematic page and six host
+parameters to serve one engine mode, and the traditional amplifier and neural capture cover what it
+was for. `docs/phase-06-coverage.md` and `docs/phase-06-architecture.md` are kept as a record of
+what it did.
 
-These are bounded virtual approximations. Tube choices and voltage values are not electrical safety advice
-and do not imply that equivalent substitutions are safe in physical hardware. See
-[Phase 6 coverage](docs/phase-06-coverage.md) and [architecture](docs/phase-06-architecture.md).
+Projects saved while it existed still open: the format is at schema 7, and `migrateV6ToV7` splices
+the six retired controls out of the saved control list and puts a project that was on the circuit
+engine back on Traditional.
 
 ## Phase 7 tone analysis and embedding
 
@@ -132,8 +128,8 @@ and do not imply that equivalent substitutions are safe in physical hardware. Se
   domain-distance confidence, calibration, OOD, retrieval, robustness, and ablation evaluation tools.
 - Guitar/bass-aware hybrid similarity, JSON tone reports with descriptor uncertainty, and searchable
   profiles carrying source, quality, tags, model version, and licensing metadata.
-- A Tone Analyzer studio page for loading clips, reviewing descriptors and warnings, and finding the
-  closest profile in the current session.
+- Clip analysis on the Tone Match page for loading clips, reviewing descriptors and warnings, and finding
+  the closest profile in the current session.
 
 See [Phase 7 coverage](docs/phase-07-coverage.md) and [architecture](docs/phase-07-architecture.md).
 
@@ -151,8 +147,10 @@ See [Phase 7 coverage](docs/phase-07-coverage.md) and [architecture](docs/phase-
   reduces a broad room-tail estimate.
 - Staged coarse classification, plausible rig generation, real traditional-amp rendering, Phase 7 comparison,
   complexity-aware ranking, separate tone/recording scores, and several editable playable candidates.
-- A Song Reconstruction page with target/stereo and detected-part selection, progress/cancellation, candidate
-  comparison, live preset application, and parameter-only safe export.
+- Song rebuilding on the Tone Match page with target/stereo and detected-part selection,
+  progress/cancellation, candidate comparison, live preset application, and parameter-only safe export.
+  It shares the page with the Phase 7 clip analysis: both take a local file and run the same offline
+  analysis, and the only difference is that a song is separated and searched for rigs afterwards.
 
 See [Phase 8 coverage](docs/phase-08-coverage.md) and [architecture](docs/phase-08-architecture.md).
 
@@ -257,7 +255,6 @@ The standalone window embeds JUCE's device selector in its **Audio settings** ta
 | `nts_audio_core` | JUCE-independent processing contract and neutral engine |
 | `nts_dsp` | Reusable filters, dynamics, nonlinear, oversampling, convolution, analysis, metering, and regression DSP |
 | `nts_amp` | Traditional guitar/bass preamp, tone stack, power amp, cabinet, presets, and offline graph |
-| `nts_circuit` | Typed physical/hybrid component graph, validation, worker compilation, telemetry, and graph serialization |
 | `nts_tone_analysis` | Offline tone features, confidence/reporting, versioned embeddings, similarity, and profile search |
 | `nts_reconstruction` | Stem separation, region confidence, reference normalization, rig search, and safe result export |
 | `nts_assistant` | Live signal summaries, diagnostic rules, musical goals, validated actions, explanations, and local preferences |
@@ -278,7 +275,6 @@ The standalone window embeds JUCE's device selector in its **Audio settings** ta
 | `nts_ml_runtime_tests` | Packed-model validation and reset behavior |
 | `nts_nam_tests` | Capture parsing, named refusals for unsupported constructs, packed-header layout, and archive import |
 | `nts_pedal_tests` | Pedalboard transparency when absent, bypassed or at zero mix, drive response, and stability at extremes |
-| `nts_circuit_tests` | Circuit components, graph validation/migration/swap, hybrid runtime, telemetry, and real-time allocation tests |
 | `nts_tone_analysis_tests` | Phase 7 analysis, invariance, confidence, serialization, comparison, and search tests |
 | `nts_reconstruction_tests` | Phase 8 separation consistency, cache/cancellation, regions, stereo, reconstruction, and safe-export tests |
 | `nts_assistant_tests` | Phase 9 labelled diagnostics, false positives, action safety, rollback, preferences, goals, and summary-queue tests |

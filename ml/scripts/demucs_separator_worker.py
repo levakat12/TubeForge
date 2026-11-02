@@ -19,6 +19,59 @@ def write_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def yield_the_machine(thread_budget: int) -> int:
+    """Keep the separator off the cores the audio callback needs.
+
+    Separation runs while TubeForge is still playing. Torch defaults to one worker per logical
+    core, so a four-minute song used to put every core at 100% for the whole run -- and the
+    plug-in's audio thread, which has a two-millisecond deadline and no way to ask for the CPU
+    back, missed it. What the player heard was crackling, and on top of that the host's overload
+    heuristic reads sustained dropouts as "this machine cannot carry the current settings" and
+    steps the quality tier down. So a slow separation was also quietly degrading the sound.
+
+    Two changes, and the priority one matters more than the count. Leaving cores unclaimed does
+    nothing if the scheduler still treats this process as equal to the audio thread, and dropping
+    to below-normal costs the separation almost nothing on an otherwise idle machine because
+    nothing else wants the time.
+
+    Returns the thread count actually applied, for the manifest.
+    """
+    try:
+        import torch
+    except Exception:
+        return 0
+
+    available = os.cpu_count() or 1
+    if thread_budget > 0:
+        threads = max(1, min(thread_budget, available))
+    else:
+        # Two cores held back rather than one: on a four-core machine one is not enough headroom
+        # for the audio thread plus the host's own work, and on anything larger two is noise.
+        threads = max(1, available - 2)
+    try:
+        torch.set_num_threads(threads)
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            # BELOW_NORMAL_PRIORITY_CLASS. Deliberately not IDLE: idle-priority work can be starved
+            # indefinitely by any background task, and a separation that never finishes is worse
+            # than one that competes politely.
+            ctypes.windll.kernel32.SetPriorityClass(
+                ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
+        except Exception:
+            pass
+    else:
+        try:
+            os.nice(10)
+        except Exception:
+            pass
+    return threads
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="TubeForge local ML stem-separation worker")
     parser.add_argument("--input", required=True, type=Path)
@@ -26,6 +79,9 @@ def main() -> int:
     parser.add_argument("--model", default="htdemucs_6s")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--check", action="store_true")
+    # 0 means "decide from the core count"; see yield_the_machine. Exposed so a user separating
+    # while nothing else is running can hand the whole machine over and get the old speed back.
+    parser.add_argument("--threads", type=int, default=0)
     args = parser.parse_args()
 
     try:
@@ -52,6 +108,9 @@ def main() -> int:
     selected_device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
     if selected_device == "auto":
         selected_device = "cpu"
+    # Only on the CPU path. A CUDA run barely touches the host cores, so throttling it there would
+    # slow the separation down and buy the audio thread nothing it did not already have.
+    applied_threads = yield_the_machine(args.threads) if selected_device == "cpu" else 0
 
     def progress(update: dict) -> None:
         audio_length = max(1, int(update.get("audio_length", 1)))
@@ -115,6 +174,7 @@ def main() -> int:
         "sampleRate": separator.samplerate,
         "stems": written,
         "reconstructionError": residual_ratio,
+        "cpuThreads": applied_threads,
     }
     write_json(args.output / "manifest.json", manifest)
     write_json(progress_path, {"fraction": 1.0, "stage": "Neural separation complete"})

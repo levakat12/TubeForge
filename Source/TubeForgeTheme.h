@@ -7,7 +7,7 @@
 /// The whole window is built from four flat tones -- chrome, panel, stage, and a single
 /// hairline -- plus near-white text. There are no gradients, bevels or glows: depth comes
 /// from one-pixel rules and from how much light a surface reflects, the way a studio
-/// front panel does. Anything drawn by hand (meters, plots, schematics) pulls its colours
+/// front panel does. Anything drawn by hand (meters, plots, response curves) pulls its colours
 /// from here rather than inventing another near-identical grey.
 namespace tf::theme
 {

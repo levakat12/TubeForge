@@ -22,7 +22,7 @@ class ProfileLibraryPage;
 /// is: construct it, give it bounds, show or hide it, and call refresh() while it is showing.
 ///
 /// The layout is three fixed-height horizontal bands with the page stage filling whatever is
-/// left. Nothing floats and nothing overlaps, which is what keeps a window with nine modules
+/// left. Nothing floats and nothing overlaps, which is what keeps a window with ten modules
 /// in it from reading as a pile of panels.
 class TubeForgeAudioProcessorEditor final : public juce::AudioProcessorEditor,
                                             private juce::Timer
@@ -34,11 +34,28 @@ public:
     void paint(juce::Graphics& graphics) override;
     void resized() override;
 
-    static constexpr int moduleCount = 12;
+    static constexpr int moduleCount = 10;
     /// Modules from this index on are engineering surfaces, hidden until PRO is switched on.
     static constexpr int firstProModule = 9;
     /// The page the header's preset controls talk to.
     static constexpr int libraryModule = 8;
+    /** The page the editor opens on, and the one leaving PRO falls back to.
+
+        Deliberately named rather than left as index 0. The first navigation group is ordered by
+        signal flow -- pedals, amplifier, tone shaping, cabinet -- so index 0 is the pedalboard,
+        and opening a guitar amplifier onto an empty pedal rack is not where a session starts.
+        Where a page *sits* in the chain and which page you *land* on are two different questions,
+        and this is the second one.
+    */
+    static constexpr int homeModule = 1;
+    /** The pages carrying controls that applying a matched rig overwrites.
+
+        Named, because these were three bare literals in two places and they were correct only by
+        accident: the signal-order rearrangement happened to leave the same three pages at indices
+        0, 1 and 2. The next reorder will not be so lucky, and the failure is silent -- the veil
+        and the Auto Match badge would simply appear on the wrong pages.
+    */
+    static constexpr std::array<std::size_t, 3> matchedModules { 0, 1, 2 };
 
 private:
     void timerCallback() override;

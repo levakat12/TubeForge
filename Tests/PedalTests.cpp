@@ -1,4 +1,4 @@
-// The pedalboard that sits in front of the amplifier.
+﻿// The pedalboard that sits in front of the amplifier.
 //
 // The cases that matter here are the ones about *absence*: a slot set to None, a slot at zero
 // mix and a bypassed slot all have to be exactly transparent, because the rig they leave
@@ -15,6 +15,8 @@
 #include <cmath>
 #include <numbers>
 #include <string_view>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 namespace
@@ -483,6 +485,142 @@ void testEveryKindStaysFiniteAtExtremes(TestHarness& harness)
 }
 } // namespace
 
+/** A biased clipper has to keep swinging both ways, whatever the drive is set to.
+
+    **The bug this exists for made every fuzz in the table silent most of the time.** The DC term
+    that cancels a biased curve's offset was evaluated at `bias * driveGain`, and a fuzz runs 20 to
+    56 dB of drive -- so the curve was asked for its value at 70-odd, returned the rail, and got
+    subtracted from a signal that was also sitting on the rail. What came out was a one-sided pulse
+    train: no positive excursion at all, and 70% of samples exactly zero.
+
+    Two measurements, because either alone can be satisfied by something broken. **Duty** catches
+    the pathology directly -- a clipper whose output is zero most of the time is not clipping, it
+    is gating. **Symmetry** catches the one-sidedness: a biased curve is *supposed* to be uneven,
+    which is the whole point of the field, but "uneven" is not "never goes positive". Bounds are
+    loose enough that a genuinely asymmetric fuzz passes comfortably and only a rail-locked one
+    fails.
+*/
+void testBiasedClippersSwingBothWays(TestHarness& tests)
+{
+    using namespace nts::pedals;
+    for (int model = 0; model < static_cast<int>(modelCount()); ++model)
+    {
+        const auto& description = pedalModel(model);
+        if (description.engine != PedalEngine::shaper || description.shaper.bias == 0.0f) continue;
+
+        for (const auto drive : { 2.0f, 5.0f, 10.0f })
+        {
+            PedalBoard board;
+            board.prepare(testSpec());
+            PedalParameters parameters;
+            parameters.model = model;
+            parameters.drive = drive;
+            parameters.mix = 100.0f;
+            board.setParameters(0, parameters);
+
+            const auto rendered = render(board, makeTone(1024, 220.0, 0.30f), 24);
+            // The first blocks carry the input filter's settling, which is not what this measures.
+            const auto from = rendered.size() / 3;
+
+            std::size_t nearZero {}, positive {}, negative {}, counted {};
+            auto peak = 0.0f;
+            for (std::size_t index = from; index < rendered.size(); ++index)
+            {
+                const auto value = rendered[index];
+                peak = std::max(peak, std::abs(value));
+                ++counted;
+            }
+            for (std::size_t index = from; index < rendered.size(); ++index)
+            {
+                const auto value = rendered[index];
+                if (std::abs(value) < peak * 0.02f) ++nearZero;
+                else if (value > 0.0f) ++positive;
+                else ++negative;
+            }
+            if (counted == 0 || peak <= 0.0f) { tests.expect(false, "biased model produced nothing"); continue; }
+
+            const auto name = std::string { description.name } + " at drive "
+                            + std::to_string(static_cast<int>(drive));
+            /* Thresholds taken from measurement, not guessed, and the margin is wide.
+
+               Broken, the three worst models sat at 12.3%, 15.3% and 16.2% of samples pinned
+               within 2% of zero -- the flat top of a rail-locked curve cancelling against its own
+               DC term. Fixed, the whole table is between 0.2% and 1.2%. Six percent sits an order
+               of magnitude clear of both ends.
+
+               The share test catches the other half, which the zero count alone can miss: the
+               broken path drove Violet Djent to 30/57 and White Rail to 35/50, because the curve
+               was reaching one rail long before the other. A biased clipper is *supposed* to be
+               uneven -- that is the entire purpose of the field -- so this only has to exclude
+               genuinely one-sided output, and 35% does that while leaving every real voicing
+               (worst measured: 48/51) comfortable. */
+            const auto zeroFraction = static_cast<double>(nearZero) / static_cast<double>(counted);
+            tests.expect(zeroFraction < 0.06,
+                         name + ": a biased clipper clips rather than gates ("
+                             + std::to_string(zeroFraction * 100.0) + "% near zero)");
+            const auto positiveShare = static_cast<double>(positive) / static_cast<double>(counted);
+            const auto negativeShare = static_cast<double>(negative) / static_cast<double>(counted);
+            tests.expect(positiveShare > 0.35 && negativeShare > 0.35,
+                         name + ": swings both ways (+" + std::to_string(positiveShare * 100.0)
+                             + "% / -" + std::to_string(negativeShare * 100.0) + "%)");
+        }
+    }
+}
+
+/** Chorus and flanger are interference effects, so the dry path has to survive them.
+
+    A swept delay on its own is a vibrato: it moves the pitch and nothing cancels. The shimmer of a
+    chorus and the whole sound of a flanger are the comb that forms where the delayed copy meets
+    the undelayed one, which means the output cannot be the wet signal alone -- and it was.
+
+    Measured as the thing that separates the two: a comb makes the output level *move* as the sweep
+    walks the notches through the signal's spectrum, while a pure delayed copy holds a steady level
+    because delaying a tone changes nothing about its amplitude. Envelope variation over a few LFO
+    cycles therefore tells the two apart without asserting anything about a particular voicing.
+*/
+void testModulationCombsAgainstDry(TestHarness& tests)
+{
+    using namespace nts::pedals;
+    for (int model = 0; model < static_cast<int>(modelCount()); ++model)
+    {
+        const auto& description = pedalModel(model);
+        if (description.engine != PedalEngine::modulation) continue;
+        if (description.modulation.topology == ModulationTopology::phaser) continue;
+
+        PedalBoard board;
+        board.prepare(testSpec());
+        PedalParameters parameters;
+        parameters.model = model;
+        parameters.drive = 8.0f;    // rate, up so a few cycles fit in the render
+        parameters.tone = 8.0f;     // depth
+        parameters.mix = 100.0f;
+        board.setParameters(0, parameters);
+
+        const auto rendered = render(board, makeTone(1024, 440.0, 0.30f), 200);
+        const auto from = rendered.size() / 4;
+
+        // Peak per short window, then how far those peaks travel across the sweep.
+        constexpr std::size_t window = 512;
+        auto lowest = 1.0e9f;
+        auto highest = 0.0f;
+        for (std::size_t start = from; start + window <= rendered.size(); start += window)
+        {
+            auto peak = 0.0f;
+            for (std::size_t index = start; index < start + window; ++index)
+                peak = std::max(peak, std::abs(rendered[index]));
+            lowest = std::min(lowest, peak);
+            highest = std::max(highest, peak);
+        }
+        const auto name = std::string { description.name };
+        tests.expect(highest > 1.0e-4f, name + ": modulation produces output");
+        // A comb moves the level; a bare delayed copy does not. 6% is well under what any real
+        // chorus does and well over the float noise a pure delay leaves behind.
+        tests.expect(highest > 0.0f && (highest - lowest) / highest > 0.06,
+                     name + ": the sweep combs against the dry path rather than merely detuning it"
+                         + " (depth " + std::to_string((highest - lowest) / highest * 100.0) + "%)");
+    }
+}
+
 int main()
 {
     TestHarness harness;
@@ -497,5 +635,8 @@ int main()
     testModulationSweeps(harness);
     testCrushQuantises(harness);
     testPitchShifts(harness);
+    testBiasedClippersSwingBothWays(harness);
+    testModulationCombsAgainstDry(harness);
     return harness.result();
 }
+

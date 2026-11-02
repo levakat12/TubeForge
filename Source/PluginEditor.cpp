@@ -7,12 +7,10 @@
 #include "ui/CabinetPage.h"
 #include "ui/CapturesPage.h"
 #include "ui/TunerPage.h"
-#include "ui/CircuitPage.h"
 #include "ui/NeuralCapturePage.h"
 #include "ui/PedalboardPage.h"
 #include "ui/ProfileLibraryPage.h"
-#include "ui/SongMatchPage.h"
-#include "ui/ToneAnalyzerPage.h"
+#include "ui/ToneMatchPage.h"
 #include "ui/ToneAssistantPage.h"
 #include "ui/ToneShapingPage.h"
 #include "ui/UiSupport.h"
@@ -36,21 +34,34 @@ struct ModuleDescriptor
 };
 
 constexpr std::array<ModuleDescriptor, TubeForgeAudioProcessorEditor::moduleCount> moduleTable { {
-    { "Amplifier", "Core tone",
-      "Set the sound here: drive, EQ and level. Everything else in TubeForge refines what you dial in on this page.",
-      0, tf::ui::Glyph::amplifier },
+    /* The first group is ordered by signal flow: pedals, amplifier, tone shaping, cabinet.
+
+       That is the order the audio actually runs in -- `processBlock` is trim, pedals, amp, gate,
+       cabinet -- and having the navigation disagree with it meant the two things a player has to
+       hold in their head, "where is this control" and "where does this sit in the sound", pulled
+       in opposite directions. Tone Shaping stays beside Amplifier because it *is* the amplifier's
+       own fine control rather than a stage of its own.
+
+       The tuner is last in the group and is deliberately not in signal order, because it is not
+       in the signal path: it reads the input ahead of everything and changes nothing. Putting it
+       between the amp and the cabinet, where it used to sit, implied a place in the chain it does
+       not have. */
     { "Pedals", "In front of the amp",
       "Up to four pedals ahead of the amplifier: built-in drives and a compressor, or a Neural "
       "Amp Modeler pedal capture. Leave every slot on None for amp and cabinet alone.",
       0, tf::ui::Glyph::pedalboard },
+    { "Amplifier", "Core tone",
+      "Set the sound here: drive, EQ and level. Everything else in TubeForge refines what you dial in on this page.",
+      0, tf::ui::Glyph::amplifier },
     { "Tone Shaping", "Fine control",
       "Per-stage gain, filtering, feel, power-section behaviour and the noise gate. Reach for these once the amp is close.",
       0, tf::ui::Glyph::toneShaping },
-    { "Tuner", "Get in tune",
-      "Tune up before anything else. Reads the input ahead of the amplifier, so gain and cabinet do not affect it.", 0 },
     { "Cabinet", "Speaker response",
       "Load your own impulse responses, or keep the built-in cabinets. Responses fade in, so you can swap one while playing.",
       0, tf::ui::Glyph::cabinet },
+    { "Tuner", "Get in tune",
+      "Tune up before anything else. Reads the input ahead of the amplifier, so gain and cabinet do not affect it.",
+      0, tf::ui::Glyph::tuner },
     { "Neural Capture", "Amp models",
       "Play through a captured amp. Load a model folder exported by the capture wizard, then choose what you monitor.",
       1, tf::ui::Glyph::neuralCapture },
@@ -64,15 +75,10 @@ constexpr std::array<ModuleDescriptor, TubeForgeAudioProcessorEditor::moduleCoun
     { "Profile Library", "Rigs & sharing",
       "Browse, load and share .ntone rig profiles. Imports are validated before anything can reach the audio engine.",
       1, tf::ui::Glyph::profileLibrary },
-    { "Circuit", "Build the amp",
-      "Choose real components: tubes, power topology, tone stack. Changes compile off the audio thread and crossfade in.",
-      2, tf::ui::Glyph::circuit },
-    { "Tone Analyzer", "Measure a clip",
-      "Analyse an isolated guitar or bass clip offline and read back its tonal fingerprint and how sure the analysis is.",
-      2, tf::ui::Glyph::toneAnalyzer },
-    { "Song Match", "Rebuild a tone",
-      "Import a song you own, pick the part you want, and get editable rigs that get close to it.",
-      2, tf::ui::Glyph::songMatch } } };
+    { "Tone Match", "Measure and rebuild",
+      "Import a song you own and get editable rigs that get close to it, or point it at an isolated "
+      "clip to read back that tone's fingerprint. Both run offline, off the playback thread.",
+      2, tf::ui::Glyph::toneMatch } } };
 
 // Fixed heights for the three chrome bands. The page stage takes whatever is left over.
 constexpr int navBarHeight = 54;
@@ -182,8 +188,8 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
     saveProject.setTooltip("Save the whole session as a .tforge project");
     openProject.setTooltip("Open a .tforge project");
     audioSettings.setTooltip("Audio device settings");
-    engineModeSelector.setTooltip("Which engine renders the amp: the traditional model, a loaded "
-                                  "neural capture, or the physical circuit solver.");
+    engineModeSelector.setTooltip("Which engine renders the amp: the traditional model or a "
+                                  "loaded neural capture.");
 
     buildPages();
     buildNavigation();
@@ -229,7 +235,7 @@ TubeForgeAudioProcessorEditor::TubeForgeAudioProcessorEditor(TubeForgeAudioProce
         presetName.setText("Voicing default", juce::dontSendNotification);
     };
 
-    setActiveModule(0);
+    setActiveModule(homeModule);
     applyProModeVisibility();
     applyPerformanceTierVisibility();
 
@@ -250,20 +256,18 @@ TubeForgeAudioProcessorEditor::~TubeForgeAudioProcessorEditor()
 void TubeForgeAudioProcessorEditor::buildPages()
 {
     // Order must match moduleTable.
-    pages[0] = std::make_unique<AmplifierPage>(processor);
-    pages[1] = std::make_unique<PedalboardPage>(processor);
+    pages[0] = std::make_unique<PedalboardPage>(processor);
+    pages[1] = std::make_unique<AmplifierPage>(processor);
     pages[2] = std::make_unique<ToneShapingPage>(processor);
-    pages[3] = std::make_unique<TunerPage>(processor);
-    pages[4] = std::make_unique<CabinetPage>(processor);
+    pages[3] = std::make_unique<CabinetPage>(processor);
+    pages[4] = std::make_unique<TunerPage>(processor);
     pages[5] = std::make_unique<NeuralCapturePage>(processor);
     pages[6] = std::make_unique<CapturesPage>(processor);
     pages[7] = std::make_unique<ToneAssistantPage>(processor);
     auto profileLibrary = std::make_unique<ProfileLibraryPage>(processor);
     library = profileLibrary.get();
     pages[libraryModule] = std::move(profileLibrary);
-    pages[9] = std::make_unique<CircuitPage>(processor);
-    pages[10] = std::make_unique<ToneAnalyzerPage>(processor);
-    pages[11] = std::make_unique<SongMatchPage>(processor);
+    pages[9] = std::make_unique<ToneMatchPage>(processor);
 
     // The library is the only page with anything to say to the shell.
     library->onRigLoaded = [this](juce::String name)
@@ -315,7 +319,7 @@ void TubeForgeAudioProcessorEditor::applyProModeVisibility()
         navIcons[static_cast<std::size_t>(index)]->setVisible(pro);
     diagnosticsText.setVisible(pro);
     if (! pro && activeModule >= firstProModule)
-        setActiveModule(0);
+        setActiveModule(homeModule);
     resized();
     repaint();
 }
@@ -519,10 +523,8 @@ void TubeForgeAudioProcessorEditor::layOutRail()
 
 void TubeForgeAudioProcessorEditor::timerCallback()
 {
-    // Engine work that has to happen whether or not its page is showing: recompiling the
-    // physical circuit feeds the audio path, and the assistant refresh drains a queue the
-    // audio thread writes into. Neither can be gated on page visibility.
-    processor.refreshPhysicalCircuit();
+    // Engine work that has to happen whether or not its page is showing: the assistant refresh
+    // drains a queue the audio thread writes into, so it cannot be gated on page visibility.
     processor.refreshNonRealtimeDiagnostics();
     processor.refreshAssistant();
     // Applies a match the moment one finishes, when Auto Match is on. Beside the assistant
@@ -536,8 +538,6 @@ void TubeForgeAudioProcessorEditor::timerCallback()
     const auto& meters = processor.meterState();
     inputMeter.setLevel(std::max(meters.inputPeak(0), meters.inputPeak(1)));
     outputMeter.setLevel(std::max(meters.outputPeak(0), meters.outputPeak(1)));
-    signalChain.setEngineMode(static_cast<int>(std::lround(
-        processor.getParameters().getRawParameterValue("engineMode")->load(std::memory_order_relaxed))));
 
     /* Veil the tone-editing pages while a song match runs.
 
@@ -546,11 +546,11 @@ void TubeForgeAudioProcessorEditor::timerCallback()
        would otherwise appear un-veiled until the following tick. Setting it is a no-op when
        nothing has changed, so this costs a comparison.
 
-       Amplifier, Pedals and Tone Shaping specifically -- these are the pages whose settings
+       `matchedModules` -- Pedals, Amplifier and Tone Shaping -- are the pages whose settings
        applying a candidate overwrites. The cabinet and the tuner are left alone: a match does not
        touch the loaded impulse responses, and tuning up while one renders is entirely reasonable. */
     const auto matching = processor.songMatchInProgress();
-    for (const auto index : { std::size_t { 0 }, std::size_t { 1 }, std::size_t { 2 } })
+    for (const auto index : matchedModules)
         pages[index]->setSongMatchVeil(matching,
             "Applying one of the matched rigs will replace the drive, EQ and pedal settings on "
             "these pages. You can still change them -- nothing here affects the match itself -- "
@@ -594,7 +594,7 @@ void TubeForgeAudioProcessorEditor::refreshAutoMatchMarking()
 
     // Amplifier, Pedals and Tone Shaping: the pages a matched rig actually writes, and the same
     // three the song-match veil covers for the same reason.
-    for (const auto index : { std::size_t { 0 }, std::size_t { 1 }, std::size_t { 2 } })
+    for (const auto index : matchedModules)
         pages[index]->setAutoMatchBadge(badge);
 
     /* A control the host moved is handed back without a dialog -- see the guard -- so this is

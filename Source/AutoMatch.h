@@ -56,7 +56,7 @@ struct OwnedParameter
     Deliberately **not** here, and each for a reason: `output` and `bypass` are level and
     monitoring rather than tone; `performanceTier` is a statement about the machine, not about
     the sound; `tunerMute`, `tunerReference`, the pedal voicing controls other than bypass, and
-    everything on the Circuit and Neural pages are outside what the reconstruction search fits.
+    and everything on the Neural page are outside what the reconstruction search fits.
     Auto Match must never guard a control it did not compute.
 */
 inline constexpr std::array owned {
@@ -137,6 +137,31 @@ inline constexpr std::array owned {
     OwnedParameter { "cabLowCut", "Cabinet" },
     OwnedParameter { "cabHighCut", "Cabinet" },
     OwnedParameter { "cabDiBlend", "Cabinet" },
+    /* The controls "Match the record" writes from a `ProductionProfile`.
+
+       Owned because they are written, which is the only rule this table has. `delayMix` and
+       `reverbMix` were already here because isolating the chain closes them; these are the rest
+       of the two sends plus the cabinet placement that a doubled, widened part needs, and none of
+       them had a reason to be written until production could be re-applied.
+
+       Marked `chainOnly` alongside the two mixes: they are untouched when the chain is left
+       alone, and `maskFor` reads that flag to decide how much of the table a hold covers -- which
+       is now "not left alone" rather than "isolated", because bypassing the chain and matching
+       the record both write it.
+
+       **Appended, per the note above.** The cost is that a project saved by an earlier build has
+       a `heldValues` array eight entries short, and `restoreAutoMatchProjectState` declines a
+       hold whose length disagrees. That project loads with its rig and its parameters intact and
+       simply stops guarding them, which is the safe direction: the alternative is mapping a
+       stale array onto a table it no longer matches and guarding the wrong controls. */
+    OwnedParameter { "delayTime", "Chain", true },
+    OwnedParameter { "delayFeedback", "Chain", true },
+    OwnedParameter { "delayTone", "Chain", true },
+    OwnedParameter { "reverbSize", "Chain", true },
+    OwnedParameter { "reverbDamping", "Chain", true },
+    OwnedParameter { "cabPanA", "Chain", true },
+    OwnedParameter { "cabPanB", "Chain", true },
+    OwnedParameter { "cabDelayA", "Chain", true },
 };
 
 inline constexpr std::size_t ownedCount = owned.size();
@@ -169,12 +194,17 @@ static_assert(indexOf("output") < 0, "output is a level control and is deliberat
     return std::uint64_t { 1 } << index;
 }
 
-/// Every owned parameter, or only the amplifier ones when the chain was left alone.
-[[nodiscard]] constexpr std::uint64_t maskFor(bool isolatedChain) noexcept
+/** Every owned parameter, or only the amplifier ones when the chain was left alone.
+
+    `wroteChain` rather than `isolatedChain`: bypassing the board and writing the record's
+    production are different intentions that both put values on the chain controls, and a hold has
+    to cover what was written either way. Only "leave mine alone" writes nothing there.
+*/
+[[nodiscard]] constexpr std::uint64_t maskFor(bool wroteChain) noexcept
 {
     std::uint64_t mask {};
     for (std::size_t index = 0; index < owned.size(); ++index)
-        if (isolatedChain || ! owned[index].chainOnly) mask |= bit(index);
+        if (wroteChain || ! owned[index].chainOnly) mask |= bit(index);
     return mask;
 }
 } // namespace tf::automatch

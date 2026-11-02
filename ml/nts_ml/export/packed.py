@@ -8,7 +8,13 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-from ..models import ConditionedLstm, RandomFeatureGru, RandomFeatureTcn, TinyTanhRnn
+from ..models import (
+    ConditionedLstm,
+    ProductionRegressor,
+    RandomFeatureGru,
+    RandomFeatureTcn,
+    TinyTanhRnn,
+)
 from ..schemas.model import ModelManifest
 
 PACKED_HEADER = struct.Struct("<4s6I")
@@ -19,12 +25,42 @@ PACKED_HEADER_V2 = struct.Struct("<4s11I")
 # layerCount, flags, headKernel, reserved.
 PACKED_HEADER_V3 = struct.Struct("<4s11I")
 WAVENET_ARCHITECTURE = 5
+# v4 is a feed-forward regressor over feature vectors rather than a per-sample audio model, so it
+# gets a header of its own instead of borrowing v2's: reusing v2 would mean `inputChannels` meaning
+# audio channels in one file and a feature count in the next, and a loader that guessed which from
+# the architecture code. Fields: version, architecture, inputCount, hiddenCount, outputCount.
+PACKED_HEADER_V4 = struct.Struct("<4s5I")
+REGRESSOR_ARCHITECTURE = 6
+MAXIMUM_REGRESSOR_INPUTS = 512
+MAXIMUM_REGRESSOR_HIDDEN = 256
 MAXIMUM_WAVENET_LAYERS = 64
 MAXIMUM_WAVENET_KERNEL = 64
 MAXIMUM_WAVENET_DILATION = 4096
 
 
+def pack_regressor(model: ProductionRegressor) -> bytes:
+    """The dense regressor as NTSM v4.
+
+    Standardisation is packed with the weights rather than left in `normalization.json`, because a
+    runtime that loaded the weights and skipped the standardisation would not fail -- it would
+    produce confident nonsense, and the hash covers only what is in this payload.
+    """
+    if not 1 <= model.input_count <= MAXIMUM_REGRESSOR_INPUTS:
+        raise ValueError(f"Regressor inputs must be 1..{MAXIMUM_REGRESSOR_INPUTS}")
+    if not 1 <= model.hidden_count <= MAXIMUM_REGRESSOR_HIDDEN:
+        raise ValueError(f"Regressor hidden units must be 1..{MAXIMUM_REGRESSOR_HIDDEN}")
+    if model.output_count < 1:
+        raise ValueError("A regressor needs at least one output")
+    header = PACKED_HEADER_V4.pack(b"NTSM", 4, REGRESSOR_ARCHITECTURE, model.input_count,
+                                   model.hidden_count, model.output_count)
+    payload = b"".join(np.asarray(parameter, dtype="<f4").tobytes(order="C")
+                       for parameter in model.parameters().values())
+    return header + payload
+
+
 def pack_model(model) -> bytes:
+    if isinstance(model, ProductionRegressor):
+        return pack_regressor(model)
     if isinstance(model, TinyTanhRnn):
         header = PACKED_HEADER.pack(b"NTSM", 1, 1, model.sample_rate, 1, model.state_size, 1)
         parameters = model.parameters().values()
@@ -190,6 +226,67 @@ def export_model(model, destination: Path,
     return manifest
 
 
+def export_regressor(model: ProductionRegressor, destination: Path,
+                     test_features: NDArray[np.floating] | None = None,
+                     license_text: str = "Trained from synthetic production chains; see docs/production-match-plan.md.\n",
+                     ) -> ModelManifest:
+    """Writes the regressor as the same artifact directory everything else here produces.
+
+    Same shape deliberately: `validate_artifact` then covers it, the sha256 in the manifest is a
+    real gate on the weights, and the test vectors are what hold the C++ evaluator to this one. The
+    only thing that differs is that a vector row is `input_count` features wide rather than one
+    sample, and the paired output row is `output_count` wide -- which is why `validate_artifact`
+    checks row counts rather than element counts.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    vectors = destination / "test-vectors"
+    vectors.mkdir(exist_ok=True)
+    packed = pack_regressor(model)
+    (destination / "model.bin").write_bytes(packed)
+
+    if test_features is None:
+        # Spread well outside the training distribution on purpose. A vector drawn from the middle
+        # of the corpus would be matched by a loader that got the standardisation wrong, because
+        # near the mean the standardisation barely does anything.
+        random = np.random.default_rng(911)
+        test_features = random.normal(0.0, 3.0, (16, model.input_count))
+    features = np.asarray(test_features, dtype="<f4").reshape(-1, model.input_count)
+    expected = model.predict(features).astype("<f4")
+    features.tofile(vectors / "input.f32")
+    expected.tofile(vectors / "output.f32")
+    (vectors / "metadata.json").write_text(json.dumps({
+        "rows": int(features.shape[0]),
+        "inputCount": model.input_count,
+        "outputCount": model.output_count,
+        "maximumAbsoluteErrorTolerance": 1.0e-5,
+        "rmsErrorTolerance": 2.0e-6,
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    manifest = ModelManifest(
+        model_format_version=4,
+        architecture=model.architecture,
+        sample_rate=model.sample_rate,
+        input_channels=model.input_count,
+        output_channels=model.output_count,
+        state_size=model.hidden_count,
+        latency_samples=0,
+        expected_input_rms_db=-21.0,
+        parameter_schema=[],
+        sha256=hashlib.sha256(packed).hexdigest(),
+    )
+    manifest.save(destination / "manifest.json")
+    (destination / "normalization.json").write_text(json.dumps({
+        # Present because the artifact shape requires it, and neutral because this model carries
+        # its own standardisation in the weights. Nothing should apply both.
+        "inputRmsDb": -21.0,
+        "inputScale": 1.0,
+        "outputScale": 1.0,
+        "dcOffset": 0.0,
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (destination / "license.txt").write_text(license_text, encoding="utf-8")
+    return manifest
+
+
 def validate_artifact(path: Path) -> ModelManifest:
     required = ("model.bin", "manifest.json", "normalization.json", "test-vectors/input.f32",
                 "test-vectors/output.f32", "test-vectors/metadata.json", "license.txt")
@@ -205,6 +302,14 @@ def validate_artifact(path: Path) -> ModelManifest:
         raise ValueError("normalization.json is incomplete")
     inputs = np.fromfile(path / "test-vectors" / "input.f32", dtype="<f4")
     outputs = np.fromfile(path / "test-vectors" / "output.f32", dtype="<f4")
-    if inputs.size == 0 or inputs.size != outputs.size:
+    # Paired by *row*, not by element. For every audio model here a row is one sample and both
+    # counts are 1, so this is the rule it always was; for the production regressor a row is 57
+    # features against 4 predictions and an element-count comparison would reject a correct
+    # artifact. What has to match is how many examples each side describes.
+    if inputs.size == 0 or outputs.size == 0:
+        raise ValueError("Test vectors must be nonempty and paired")
+    if inputs.size % manifest.input_channels or outputs.size % manifest.output_channels:
+        raise ValueError("Test vectors are not a whole number of rows")
+    if inputs.size // manifest.input_channels != outputs.size // manifest.output_channels:
         raise ValueError("Test vectors must be nonempty and paired")
     return manifest

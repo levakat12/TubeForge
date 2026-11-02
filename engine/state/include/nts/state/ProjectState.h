@@ -9,7 +9,7 @@
 
 namespace nts::state
 {
-inline constexpr int currentSchemaVersion = 6;
+inline constexpr int currentSchemaVersion = 7;
 inline constexpr std::string_view currentApplicationVersion = "0.10.0";
 /** Slots the pedalboard has.
 
@@ -54,11 +54,20 @@ struct DeviceState
     bool operator==(const DeviceState&) const = default;
 };
 
+/** What the processing chain reported when the project was saved.
+
+    Recorded rather than applied: latency is re-derived from the live rate, block size and loaded
+    responses on every `prepareToPlay`, so restoring a saved number would be restoring a stale
+    one. It is here so a project can be read and understood on its own, which is worth a single
+    integer.
+
+    It carried an `enabled` flag until schema 7. Nothing ever read it -- it was written, parsed and
+    compared, and no code path consulted it -- and it was the last of the switchable-graph idea
+    that the removed circuit engine took with it.
+*/
 struct GraphState
 {
     int latencySamples {};
-    bool enabled { true };
-    std::string physicalCircuitJson;
 
     bool operator==(const GraphState&) const = default;
 };
@@ -174,6 +183,20 @@ struct AutoMatchState
         rig owned a board it never touched.
     */
     bool isolatedChain {};
+    /** Whether the match also wrote the record's production back onto the effects.
+
+        **A second flag rather than a widening of `isolatedChain`**, which is what makes this a
+        no-op for every project written before it. The apply path is three-way -- bypass the
+        chain, leave it alone, or write it from the match's `ProductionProfile` -- and the obvious
+        encoding of three states is one enumeration where the bool used to be. That would change
+        the meaning of a field already sitting in saved files, so a project written last week
+        would load as whichever state happened to land on 0 or 1.
+
+        The pair encodes the three states instead: this flag set is "match the record" whatever
+        `isolatedChain` says, and clear falls back to the two states that field always meant. An
+        old project has it absent, reads false, and keeps the behaviour it had.
+    */
+    bool matchProduction {};
     /// One value per owned control, in the plug-in's own table order.
     std::vector<float> heldValues;
     /// Positions in that table the user had taken back before saving.

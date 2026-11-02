@@ -802,20 +802,44 @@ void PedalSlot::renderShaped(float* const* channels, std::size_t count, std::siz
     {
         inputFilter.process(channels, count, samples);
         const auto bias = voicing.bias;
+        /* Cancels the DC that a biased curve sits on. Only a model that actually uses bias pays
+           for the second evaluation -- and it is deliberately the plain curve rather than the
+           integrated one: this is a constant, so its "average across the sample" is itself, and
+           running it through the stateful shaper would corrupt the history the real signal
+           depends on.
+
+           **Evaluated at unity gain, and that is the whole fix.** This used to read
+           `shapeSample(bias, shape, gain)` with the drive gain, and `driven + bias` went into the
+           curve so the drive amplified the bias as well as the signal. A fuzz runs 20 to 56 dB of
+           drive: at the built-in Fuzz's 0.18 bias and 52 dB, the curve was being asked for
+           `0.18 * 398 = 71.7`, which is the rail, so the DC term was exactly 1.0 -- and the signal
+           was *also* pinned at the rail for every input above -0.18. The two cancelled to zero.
+
+           What came out was not a quiet fuzz, it was a one-sided pulse train: measured on a
+           220 Hz tone at 0.3, **70% of samples were exactly zero** and the output never went
+           positive at all, ranging [-1.60, 0]. That reads as "almost non-sounding", and because
+           narrow one-sided pulses are the most alias-generating waveform there is, it was also a
+           large part of the fizz. `bias * gain` exceeds 1 even at *minimum* drive for all six
+           fuzzes, so none of them has ever worked.
+
+           A bias is a fixed operating point at the device, not something the gain control
+           amplifies, so it belongs on the far side of the drive gain. Dividing it out here is the
+           minimal way to say that through a `shapeSample` whose contract is `curve(input * gain)`:
+           `curve((driven + bias/gain) * gain)` is `curve(driven * gain + bias)`. Same tone
+           control, same curve, and the duty-cycle asymmetry the field was always documented as
+           providing -- the measured output becomes [-0.79, +0.81] with 0.1% of samples at zero. */
+        const auto offset = bias == 0.0f ? 0.0f : dsp::shapeSample(bias, voicing.shape, 1.0f);
         for (std::size_t sample = 0; sample < samples; ++sample)
         {
             const auto gain = driveGain.next();
-            /* Cancels the DC that a biased curve sits on. Only a model that actually uses bias
-               pays for the second evaluation -- and it is deliberately the plain curve rather
-               than the integrated one: this is a constant, so its "average across the sample"
-               is itself, and running it through the stateful shaper would corrupt the history
-               the real signal depends on. */
-            const auto offset = bias == 0.0f ? 0.0f : dsp::shapeSample(bias, voicing.shape, gain);
+            // Guarded because a model may reach unity or below, and the division is only
+            // meaningful while there is a gain to divide by.
+            const auto biasAtInput = gain > 1.0e-6f ? bias / gain : 0.0f;
             for (std::size_t channel = 0; channel < count; ++channel)
             {
                 auto driven = channels[channel][sample];
                 if (slewing) driven = slewLimiter.process(driven, channel);
-                channels[channel][sample] = shape(driven + bias, gain, channel) - offset;
+                channels[channel][sample] = shape(driven + biasAtInput, gain, channel) - offset;
             }
         }
     }
@@ -886,11 +910,27 @@ void PedalSlot::renderModulation(float* const* channels, std::size_t count, std:
                 const auto angle = 2.0 * std::numbers::pi * (phase + offset);
                 const auto delay = centre + swing * static_cast<float>(std::sin(angle));
 
-                const auto driven = channels[channel][sample]
-                                  + regeneration * modulationFeedback[channel];
+                const auto dry = channels[channel][sample];
+                const auto driven = dry + regeneration * modulationFeedback[channel];
                 const auto wet = modulationLine.processSample(driven, delay, channel);
                 modulationFeedback[channel] = std::isfinite(wet) ? wet : 0.0f;
-                channels[channel][sample] = wet;
+                /* Summed with the dry path, exactly as the phaser branch above does.
+
+                   **Without this a chorus is a vibrato and a flanger is nothing at all.** Both of
+                   these topologies are interference effects: the chorus's shimmer is the beating
+                   between a steady copy and a slowly detuned one, and the flanger's whole sound is
+                   the comb that appears where a swept short delay cancels against the dry signal.
+                   Returning the delayed copy alone gives neither -- it gives a pitch-wobbling
+                   duplicate of the input, which is what a vibrato pedal is and what these were
+                   doing.
+
+                   The slot's Mix control is not a substitute, and that is why this belongs here
+                   rather than in the preset defaults. `PedalParameters::mix` defaults to 100%, so
+                   the shipped state of every chorus and flanger was fully wet; and even turned
+                   down, Mix blends the *slot* against the board's dry path, which is not the same
+                   signal the comb has to form against once regeneration is running. The phaser
+                   branch has always summed internally for this reason -- these two now agree. */
+                channels[channel][sample] = 0.5f * (dry + wet);
             }
         }
     }

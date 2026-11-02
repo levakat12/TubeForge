@@ -87,7 +87,6 @@ struct FormatVersions
     int tonePackage { tonePackageFormatVersion };
     int packedModelMinimum { 1 };
     int packedModelCurrent { 2 };
-    int circuitGraph { 1 };
     int datasetSession { 1 };
     int toneAnalysis { 1 };
     int sourceSeparation { 1 };

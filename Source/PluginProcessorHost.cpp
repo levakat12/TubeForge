@@ -168,14 +168,15 @@ void TubeForgeAudioProcessor::loadVoicingDefaults()
     */
     const auto instrument = static_cast<int>(std::lround(parameterOf(Param::instrument)));
     const auto topology = static_cast<int>(std::lround(parameterOf(Param::topology)));
-    applyRecoveredRig(factoryAmpParameters[factoryAmpIndex(instrument, topology)], false);
+    applyRecoveredRig(factoryAmpParameters[factoryAmpIndex(instrument, topology)],
+                      ChainMode::leaveAlone);
     // The voicing has no opinion on these, so they go to the positions a fresh instance has.
     setParameterValue(parameterState, ParameterIds::panelSwitch, 0.0f);
     setParameterValue(parameterState, ParameterIds::output, -6.0f);
 }
 
-void TubeForgeAudioProcessor::applyRecoveredRig(const nts::amp::AmpParameters& p,
-                                                bool isolateChain)
+void TubeForgeAudioProcessor::applyRecoveredRig(const nts::amp::AmpParameters& p, ChainMode mode,
+                                                const nts::reconstruction::ProductionProfile& profile)
 {
     // Reached through a callback from StudioServices rather than called by it directly, so the
     // dependency runs one way: the processor knows about the studio, not the reverse.
@@ -268,10 +269,18 @@ void TubeForgeAudioProcessor::applyRecoveredRig(const nts::amp::AmpParameters& p
     setParameterValue(parameterState, ParameterIds::cabHighCut, p.cabinet.highCutHz);
     setParameterValue(parameterState, ParameterIds::cabDiBlend, p.cabinet.bassDiBlend * 100.0f);
 
-    // Everything the offline render did not contain. Opt-in rather than automatic: a board
-    // and a reverb are the player's own work, and silently discarding them to win a tone
-    // comparison is not a trade this should make on its own.
-    if (isolateChain)
+    // Cleared before the mode branch, so a note left by a previous apply cannot outlive the
+    // rig it was about and warn about a cabinet fit that is no longer part of this result.
+    lastProductionCabinet.clear();
+
+    /* Everything the offline render did not contain. Opt-in rather than automatic: a board
+       and a reverb are the player's own work, and silently discarding them to win a tone
+       comparison is not a trade this should make on its own.
+
+       Three-way rather than two, and the third is the opposite of the first: `bypass` takes the
+       chain out of the way so what plays is the candidate that was ranked, and `matchRecord`
+       fills it with what the record did that the ranking deliberately never saw. */
+    if (mode == ChainMode::bypass)
     {
         for (std::size_t slot = 0; slot < nts::pedals::slotCount; ++slot)
             setParameterValue(parameterState, pedalParameterId(slot, PedalControl::bypass), 1.0f);
@@ -280,11 +289,156 @@ void TubeForgeAudioProcessor::applyRecoveredRig(const nts::amp::AmpParameters& p
         setParameterValue(parameterState, ParameterIds::delayMix, 0.0f);
         setParameterValue(parameterState, ParameterIds::reverbMix, 0.0f);
     }
+    else if (mode == ChainMode::matchRecord)
+        applyProductionProfile(profile);
 
     appliedRecoveredRig = p;
     // What was actually written, recorded while it is still true. `appliedRecoveredRig` holds
     // engine parameters; "keep the matched value" needs the host parameter the user just moved.
-    captureAutoMatchSnapshot(isolateChain);
+    captureAutoMatchSnapshot(mode);
+}
+
+void TubeForgeAudioProcessor::applyProductionProfile(const nts::reconstruction::ProductionProfile& profile)
+{
+    /* Refused rather than approximated. An invalid profile is a match that could not measure the
+       record, and writing a chain from its default-constructed fields would say "no room, no
+       doubling, no compression" -- a confident claim about a mix nothing looked at. The caller
+       already downgrades to `bypass` in this case; this is the second lock on the same door,
+       because this method is reachable from `applyAutoMatchRig` as well. */
+    if (! profile.valid) return;
+
+    const auto clamp01 = [](float value) { return std::clamp(value, 0.0f, 1.0f); };
+
+    /* The level the guitar sat at in the record, on the plug-in's Output rather than folded into
+       the amplifier's own output gain. That gain is a property of the voicing -- the amp models
+       are levelled against each other with it -- and overwriting it would make every matched rig
+       of a loud part clip and every quiet one disappear.
+
+       Output is deliberately not an Auto Match owned control (see the static_assert in
+       AutoMatch.h), so this writes it and then leaves the user free to move it without being
+       told they have overridden the match. That is the right relationship for a level. */
+    setParameterValue(parameterState, ParameterIds::output,
+                      std::clamp(profile.levelOffsetDb, -24.0f, 24.0f));
+
+    /* The room. Capped well below the parameter's own range: reverb mixes in real guitar mixes
+       sit under about a third, and `roomReverbEstimate` reads high on any part with a long decay
+       whether or not that decay is a room. Erring short is recoverable by ear; erring long
+       buries the part and reads as the feature being broken. */
+    const auto room = clamp01(profile.roomAmount);
+    setParameterValue(parameterState, ParameterIds::reverbMix, room * 35.0f);
+    setParameterValue(parameterState, ParameterIds::reverbSize, 30.0f + room * 45.0f);
+    // A bigger estimated room damps less, which is what makes a big room sound big rather than
+    // merely long.
+    setParameterValue(parameterState, ParameterIds::reverbDamping, 65.0f - room * 30.0f);
+
+    /* The delay. `delayPresence` says something repeats, not how long it waits, and nothing in
+       the analysis recovers the time -- so this is a short, low-feedback slap that adds the
+       thickening a repeat gives without inventing a rhythmic figure the record may not have.
+       A wrong tempo would be far more audible than a conservative one. */
+    const auto delay = clamp01(profile.delayAmount);
+    setParameterValue(parameterState, ParameterIds::delayMix, delay * 28.0f);
+    setParameterValue(parameterState, ParameterIds::delayTime, 90.0f + delay * 190.0f);
+    setParameterValue(parameterState, ParameterIds::delayFeedback, 8.0f + delay * 22.0f);
+    setParameterValue(parameterState, ParameterIds::delayTone, 4500.0f);
+
+    /* Doubling and width, through the cabinet stage's two slots.
+
+       This is an approximation and the interface says so: a record with four tracked rhythm parts
+       is not one rig with a doubling delay, and no amount of width here makes it one. What it can
+       reproduce is the *placement* -- two slots panned apart with a few milliseconds between them
+       is what a double-tracked part does to a stereo image, and it is what these controls are.
+
+       `cabDelayA` is in samples over a fixed 0..256 range, which at 48 kHz is up to about 5 ms --
+       squarely the micro-delay range a double sits in, and short enough that the worst case is a
+       comb rather than an audible repeat. */
+    const auto doubling = clamp01(profile.doubling);
+    auto width = std::max(clamp01(profile.stereoWidth), doubling);
+
+    /* **A bass is not widened, whatever the estimate says.**
+
+       The measurement is not wrong -- a bass stem really can read as wide, because a separator
+       leaks a stereo mix into it and because plenty of records put a chorus or a stereo DI on the
+       instrument. Reproducing it is what is wrong. Spreading two cabinet slots apart and putting a
+       few milliseconds between them comb-filters the sum, and the sum is where a bass lives: it is
+       the one instrument in the mix that has to survive a mono fold intact, on a phone speaker, on
+       a club rig, on vinyl. A guitar that loses a little on mono fold is a texture; a bass that
+       does is a missing bass.
+
+       The doubling estimate is still carried and still exported -- it is a true statement about
+       the record. It just does not reach the pan controls on this target. */
+    if (studio.reconstructionTarget() == nts::reconstruction::TargetInstrument::bass) width = 0.0f;
+
+    setParameterValue(parameterState, ParameterIds::cabinetWidth, width * 100.0f);
+    const auto spread = 40.0f + width * 60.0f;
+    setParameterValue(parameterState, ParameterIds::cabPanA, -spread);
+    setParameterValue(parameterState, ParameterIds::cabPanB, spread);
+    setParameterValue(parameterState, ParameterIds::cabDelayA,
+                      width > 0.0f ? std::round(doubling * 190.0f) : 0.0f);
+
+    /* The mix compressor, and only into a slot that is empty.
+
+       Never over a loaded capture or a pedal the player put there: a neural capture is a file
+       they chose and possibly paid for, and silently replacing it with a compressor because a
+       stem measured as compressed is the single most annoying thing this feature could do. If
+       every slot is taken, the compression estimate goes unapplied -- which is the correct
+       outcome, not a failure. */
+    if (clamp01(profile.compression) > 0.35f)
+    {
+        auto compressorModel = -1;
+        for (std::size_t model = 0; model < nts::pedals::modelCount(); ++model)
+            if (nts::pedals::pedalModel(static_cast<int>(model)).engine == nts::pedals::PedalEngine::compressor)
+            { compressorModel = static_cast<int>(model); break; }
+
+        for (std::size_t slot = 0; compressorModel >= 0 && slot < nts::pedals::slotCount; ++slot)
+        {
+            // A slot counts as taken if its kind is anything but the empty archetype at index 0,
+            // or if a capture file is sitting in it -- the second is not a parameter, so reading
+            // only the first would happily overwrite a loaded model.
+            auto occupied = valueOf(parameterState, pedalParameterId(slot, PedalControl::kind)) > 0.5f;
+            {
+                const std::scoped_lock lock(pedalModelMutex);
+                occupied = occupied || pedalModelSlots[slot].file != juce::File {};
+            }
+            if (occupied) continue;
+            setParameterValue(parameterState, pedalParameterId(slot, PedalControl::kind),
+                              static_cast<float>(compressorModel));
+            setParameterValue(parameterState, pedalParameterId(slot, PedalControl::bypass), 0.0f);
+            setParameterValue(parameterState, pedalParameterId(slot, PedalControl::drive),
+                              3.0f + clamp01(profile.compression) * 5.0f);
+            setParameterValue(parameterState, pedalParameterId(slot, PedalControl::tone), 5.0f);
+            setParameterValue(parameterState, pedalParameterId(slot, PedalControl::level), 0.0f);
+            setParameterValue(parameterState, pedalParameterId(slot, PedalControl::mix), 100.0f);
+            break;
+        }
+    }
+
+    /* The spectral balance the mix imposed, through the cabinet stage.
+
+       **Reached by calling `matchCabinetToReference` rather than by writing an impulse here**, and
+       that is the whole design of this row. `synthesizeMatchedCabinet` turns a residual into a
+       *complete* speaker response rather than an EQ to stack on one, so it belongs in a cabinet
+       slot -- and everything that makes putting it there safe already lives in that method: the
+       slot-A precondition that refuses to overwrite a response the user loaded, the hold
+       semantics `releaseCabinetHold` undoes, and the honest warning that a curve fitted to one
+       mix is a corrective filter and not a claim about the speaker on the record. A second path
+       to the same write, here, would have none of those.
+
+       It re-measures rather than applying `profile.spectralResidualDb` directly. That looks like
+       duplicated work and is not: the profile's residual was measured against the *winning
+       candidate* at match time, and what is on the amplifier right now is the candidate the user
+       actually applied, which may be a different one from the list. Measuring against what is
+       playing is the only version of this that is correct for both cases. The profile keeps its
+       copy because the export records what was measured, and because Track E trains on it.
+
+       Full depth, deliberately. `confidence` is carried so the interface can *say* how much to
+       believe -- scaling the correction by it would invent a curve nothing has measured, and the
+       Cabinet page's own depth control is where backing off belongs. A profile whose residual
+       never measured is skipped rather than fitted from nothing. */
+    if (! profile.spectralResidualDb.empty())
+    {
+        const auto outcome = matchCabinetToReference(1.0f);
+        lastProductionCabinet = outcome.applied ? juce::String() : outcome.error;
+    }
 }
 
 juce::StringArray TubeForgeAudioProcessor::reconstructionApplyWarnings() const
@@ -293,6 +447,17 @@ juce::StringArray TubeForgeAudioProcessor::reconstructionApplyWarnings() const
     const auto& p = *appliedRecoveredRig;
 
     juce::StringArray warnings;
+
+    /* Why the cabinet half of "match the record" is reported here rather than left silent.
+
+       Every other thing the production layer writes is a parameter, so the user can see it on a
+       control and this list can be answered from live values. The matched cabinet is not: it is
+       an impulse response in a slot, and if it could not be built -- slot A was holding a loaded
+       response, or the two signals were not comparable -- nothing on any page would say so and
+       the mix EQ would simply be missing from a result that claimed to match the record. */
+    if (lastProductionCabinet.isNotEmpty())
+        warnings.add("The record's tone balance was not applied to the cabinet: "
+                     + lastProductionCabinet);
 
     for (std::size_t slot = 0; slot < nts::pedals::slotCount; ++slot)
     {
@@ -442,23 +607,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout TubeForgeAudioProcessor::cre
     layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::panelSwitch, 1 },
                                         "Panel switch", panelSwitchNames, 0));
     layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::engineMode, 1 }, "Engine mode",
-                                        juce::StringArray { "Traditional", "Neural capture", "Physical circuit" }, 0));
+                                        juce::StringArray { "Traditional", "Neural capture" }, 0));
     layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::neuralMonitor, 1 }, "Neural monitor",
                                         juce::StringArray { "Model", "Bypass DI", "Loudness matched" }, 0));
     layout.add(std::make_unique<Bool>(juce::ParameterID { ParameterIds::neuralCompensation, 1 },
                                       "Neural input compensation", false));
-    layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::circuitPreampTube, 1 }, "Circuit preamp tube",
-                                        juce::StringArray { "12AU7", "12AT7", "12AX7" }, 2));
-    layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::circuitPowerTube, 1 }, "Circuit power tube",
-                                        juce::StringArray { "6V6", "EL34" }, 1));
-    layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::circuitPowerTopology, 1 }, "Circuit power topology",
-                                        juce::StringArray { "Single-ended", "Push-pull Class A", "Push-pull Class AB" }, 2));
-    layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::circuitToneStack, 1 }, "Circuit tone stack",
-                                        juce::StringArray { "Vintage FMV", "Modern", "Bass" }, 0));
-    layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::circuitBackend, 1 }, "Circuit solver",
-                                        juce::StringArray { "Gray-box", "Numerical" }, 0));
-    layout.add(std::make_unique<Choice>(juce::ParameterID { ParameterIds::circuitCabinetStyle, 1 }, "Circuit cabinet",
-                                        juce::StringArray { "Reactive", "Open back", "Bass sealed" }, 0));
     addFloat(ParameterIds::stage1, "Stage 1 gain", Range { -12.0f, 42.0f, 0.1f }, 11.0f, "dB");
     addFloat(ParameterIds::stage2, "Stage 2 gain", Range { -12.0f, 42.0f, 0.1f }, 13.5f, "dB");
     addFloat(ParameterIds::stage3, "Stage 3 gain", Range { -12.0f, 42.0f, 0.1f }, 16.0f, "dB");
@@ -739,7 +892,6 @@ nts::state::ProjectState TubeForgeAudioProcessor::makeProjectState() const
     state.device.sampleRate = currentSampleRate;
     state.device.bufferSize = currentBlockSize;
     state.graph.latencySamples = latencyBudget.processingSamples();
-    state.graph.physicalCircuitJson = nts::circuit::serializeCircuit(circuitGraphSnapshot());
     {
         const std::scoped_lock lock(cabinetIrMutex);
         state.assets.cabinetIrPathA = cabinetIrSlots[0].file.getFullPathName().toStdString();
@@ -820,23 +972,6 @@ bool TubeForgeAudioProcessor::applyProjectState(const nts::state::ProjectState& 
         const auto legacy = static_cast<float>(nts::ir::CabinetKind::legacy);
         setParameterValue(parameterState, ParameterIds::cabModelA, legacy);
         setParameterValue(parameterState, ParameterIds::cabModelB, legacy);
-    }
-    if (! state.graph.physicalCircuitJson.empty())
-    {
-        nts::circuit::CircuitGraphDescription restored;
-        std::string error;
-        if (! nts::circuit::deserializeCircuit(state.graph.physicalCircuitJson, restored, error)) return false;
-        {
-            const std::scoped_lock lock(circuitGraphMutex);
-            desiredCircuitGraph = restored;
-        }
-        physicalCircuitControlHash.store(circuitHash(restored), std::memory_order_release);
-        physicalCircuitRequestedHash.store(0, std::memory_order_release);
-        if (currentBlockSize > 0)
-        {
-            const auto report = physicalCircuit.stageGraph(restored);
-            if (! report.isValid()) return false;
-        }
     }
     restoreCabinetIrPaths(state.assets.cabinetIrPathA, state.assets.cabinetIrPathB,
                           state.assets.cabinetIrHashA, state.assets.cabinetIrHashB);

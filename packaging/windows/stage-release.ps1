@@ -38,18 +38,33 @@ $symbolDirectory = Join-Path $output 'Symbols'
 if (Test-Path -LiteralPath $symbolDirectory) { Remove-Item -LiteralPath $symbolDirectory -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $symbolDirectory | Out-Null
 $buildUri = [Uri]($build.TrimEnd('\') + '\')
-# The output directory normally sits *inside* the build directory, so a plain recursive scan for
-# PDBs finds the ones a previous run already copied into Symbols and copies them in again, one level
-# deeper each time. Three runs had produced a 3.3 GB bundle of which 2.1 GB was the bundle itself,
-# nested inside its own Symbols folder. Excluding the output path is what stops that.
-$outputPrefix = $output.TrimEnd('\') + '\'
-foreach ($symbol in (Get-ChildItem -LiteralPath $build -Filter '*.pdb' -File -Recurse |
-        Where-Object { $_.FullName -match "\\$Configuration\\" -and
-                       -not $_.FullName.StartsWith($outputPrefix, [StringComparison]::OrdinalIgnoreCase) })) {
-    $relativeSymbol = [Uri]::UnescapeDataString($buildUri.MakeRelativeUri([Uri]$symbol.FullName).ToString()).Replace('/','\')
+# Only the symbols for the two binaries this bundle actually ships.
+#
+# This used to be a recursive scan of the whole build tree for PDBs, and the result was a 1.4 GB
+# Symbols folder against 30 MB of shipped binaries. What filled it was test and benchmark
+# executables -- 157 MB of nts_wrapper_tests, 91 MB of nts_plugin_benchmarks, 78 MB of
+# nts_vst3_host_tests -- none of which is in the bundle and none of which anybody can symbolicate a
+# crash report against, because users never run them.
+#
+# Worse on a developer machine than on CI: an incremental build directory keeps object files for
+# targets that no longer exist, so the scan happily staged nts_circuit.pdb and
+# nts_circuit_tests.pdb for an engine that had been deleted from the tree. Clearing the destination
+# above cannot fix that -- the staleness is in the source.
+#
+# Named explicitly rather than filtered, so adding a shipped binary is a deliberate edit here and a
+# new test target cannot quietly add a hundred megabytes to a release.
+$shippedSymbols = @(
+    (Join-Path $build "TubeForge_artefacts\$Configuration\VST3\TubeForge.pdb"),
+    (Join-Path $build "nts_standalone_app_artefacts\$Configuration\TubeForge.pdb")
+)
+foreach ($symbol in $shippedSymbols) {
+    # A bundle whose symbols are missing is worse than one with none, because it looks complete and
+    # then cannot symbolicate the one crash it was kept for. Fail rather than ship that.
+    if (-not (Test-Path -LiteralPath $symbol -PathType Leaf)) { throw "Shipped symbol is missing: $symbol" }
+    $relativeSymbol = [Uri]::UnescapeDataString($buildUri.MakeRelativeUri([Uri]$symbol).ToString()).Replace('/','\')
     $symbolDestination = Join-Path $symbolDirectory $relativeSymbol
     New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($symbolDestination)) | Out-Null
-    Copy-Item -LiteralPath $symbol.FullName -Destination $symbolDestination -Force
+    Copy-Item -LiteralPath $symbol -Destination $symbolDestination -Force
 }
 
 $baseUri = [Uri]($output.TrimEnd('\') + '\')

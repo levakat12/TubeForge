@@ -24,6 +24,39 @@ enum class OversamplingFactor : std::size_t { x1 = 1, x2 = 2, x4 = 4, x8 = 8 };
     not improve that figure, while the benchmark cost of oversampler4x rose from
     0.35 to 0.62, 0.96, and 1.21. The residual is not bounded by this filter's
     stopband, so spending taps on it buys nothing.
+
+    **Re-measured on an instrument that works, and the conclusion holds for a better reason.**
+    Two probes have since been thrown away for having floors of their own -- the last one leaked a
+    0.7-amplitude fundamental across every bin and bottomed out at -37 dB, which made oversampling
+    look as though it stopped paying past 2x. `worstFoldbackDb` in AmpTests now places every probe
+    on an exact DFT bin, so there is no floor above the arithmetic. What this stage actually does
+    at 30 dB drive:
+
+        curve      ADAA    1x      2x      4x      8x
+        tanh       off   -22.0   -34.7   -52.4   -57.9
+        tanh       on    -31.5   -44.6   -56.2   -57.9
+        hardClip   off   -21.3   -32.2   -48.5   -56.3
+        hardClip   on    -31.0   -43.0   -55.1   -56.3
+
+    So the factor is worth about **12 dB per doubling up to 4x**, which is a great deal more than
+    the earlier numbers claimed, and this filter is not what bounds it.
+
+    A three-stage halfband cascade -- 61/25/17 taps, roughly 80 dB of stopband against this
+    design's ~30 -- was built and measured against the *previous* probe. It moved fold-back by
+    less than 1.5 dB, and at 2x, where that probe was above its floor and the comparison was
+    sound, it was no better at all. It cost about 1.6x the filter work and four times the
+    round-trip latency, so it is not here. The 4x comparison was taken at the floor and proved
+    nothing either way; anyone revisiting it now has an instrument that could answer properly.
+
+    The reason a better filter buys so little: a saturator driven at 30 dB puts harmonics above the
+    **oversampled** Nyquist as well, and those fold inside the high-rate domain before the
+    decimator exists to stop them. The anti-alias pair only ever governs the band between the base
+    Nyquist and the oversampled one, and that is not where the residual lives.
+
+    The two levers that do work are the factor itself, and
+    `PreampStageConfig::antialiasedSaturation` -- which is worth **9 to 11 dB at 1x and 2x**,
+    because it band-limits the harmonics as the curve generates them instead of resampling to
+    outrun them afterwards. `4x + ADAA` lands within 2 dB of plain `8x` for half the work.
 */
 inline constexpr std::size_t antiAliasTapsPerPhase = 8;
 

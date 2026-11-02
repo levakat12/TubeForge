@@ -68,13 +68,13 @@ jobs:
         if: matrix.configuration == 'Release'
         run: ctest --test-dir build-asio -C Release -R nts_asio_tests --output-on-failure
       - name: Upload test report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TubeForge-${{ matrix.configuration }}-Test-Report
           path: build/test-results
       - name: Upload Debug binaries
         if: matrix.configuration == 'Debug'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TubeForge-Windows-Debug
           path: |
@@ -83,13 +83,13 @@ jobs:
             build/**/*.pdb
       - name: Upload staged Release and symbols
         if: matrix.configuration == 'Release'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TubeForge-Windows-Release-Bundle
           path: build/release/TubeForge-0.10.0-Windows-x64
       - name: Upload unsigned CI installer
         if: matrix.configuration == 'Release'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TubeForge-Windows-Unsigned-CI-Installer
           path: build/release/installer/TubeForge-0.10.0-Windows-x64.exe

@@ -11,7 +11,7 @@
 //      touches the interface.
 //   3. The queries the editor asks: what is held, what was released, what to say about it.
 //
-// See docs/auto-match-plan.md for the design and Source/AutoMatch.h for the owned set.
+// See Source/AutoMatch.h for the owned set.
 
 #include "PluginProcessorInternal.h"
 

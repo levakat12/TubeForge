@@ -7,8 +7,8 @@
 
 /** Auto Match: the song analyzer holds the rig, and warns before the user fights it.
 
-    See `docs/auto-match-plan.md` for the whole design. This header is the one place the *owned
-    set* is written down -- the controls a matched rig actually sets, and therefore the controls
+    This header is the one place the *owned set* is written down -- the controls a matched rig
+    actually sets, and therefore the controls
     a manual edit has to be warned about. It is deliberately separate from `ParameterIds` in
     `PluginProcessorInternal.h`, which is private to the processor translation units: the editor
     pages have to mark their own controls as owned, so this list has to be reachable from them.

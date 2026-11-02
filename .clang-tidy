@@ -25,8 +25,7 @@ Checks: >
 
 HeaderFilterRegex: 'engine[/\\].*'
 
-# Advisory for now. Promote to a blocking CI job once the initial findings are triaged;
-# see item B3 in docs/improvement-plan.md.
+# Advisory for now. Promote to a blocking CI job once the initial findings are triaged.
 WarningsAsErrors: ''
 
 CheckOptions:

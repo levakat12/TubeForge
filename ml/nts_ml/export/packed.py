@@ -228,7 +228,7 @@ def export_model(model, destination: Path,
 
 def export_regressor(model: ProductionRegressor, destination: Path,
                      test_features: NDArray[np.floating] | None = None,
-                     license_text: str = "Trained from synthetic production chains; see docs/production-match-plan.md.\n",
+                     license_text: str = "Trained from synthetic production chains.\n",
                      ) -> ModelManifest:
     """Writes the regressor as the same artifact directory everything else here produces.
 

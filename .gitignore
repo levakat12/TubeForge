@@ -26,11 +26,17 @@ __pycache__/
 Modelfile.txt
 
 # Third-party NAM capture corpora used as training and conversion input. These are other
-# people's captures, they are large, and they are not ours to redistribute -- see
-# docs/nam-integration-plan.md.
+# people's captures, they are large, and they are not ours to redistribute.
 /amp_learning/
 /pedal_learning/
 
 # Local reference recordings for nts_song_probe. Commercial releases and tens of megabytes of
 # them: useful to test against, never something to commit. The probe skips cleanly when absent.
 test_songs/
+
+# Working plans and specs for assistant-driven development. Local only, never published: real
+# documentation lives directly in docs/. The last two rules catch a plan written to the
+# superpowers default location or dropped straight into docs/.
+/docs/claude-plans/
+/docs/superpowers/
+/docs/*-plan.md

@@ -1,6 +1,6 @@
 # Editor conventions only: indentation, line endings, encoding, trailing whitespace.
-# Deliberately does not set max_line_length or otherwise reflow code -- see item B2 in
-# docs/improvement-plan.md for why automatic C++ formatting is not enabled here.
+# Deliberately does not set max_line_length or otherwise reflow code: automatic C++ formatting
+# is not enabled here.
 root = true
 
 [*]

@@ -286,8 +286,8 @@ public:
     [[nodiscard]] static float cabinetResponseFrequency(std::size_t index) noexcept;
     // ---- Cabinet Match ----------------------------------------------------------------
     //
-    // Fitting the cabinet to the song the rig was matched from. See docs/cabinet-plan.md, Track F,
-    // and nts/ir/CabinetMatch.h for why this is a filter fit rather than a search.
+    // Fitting the cabinet to the song the rig was matched from. See nts/ir/CabinetMatch.h for why
+    // this is a filter fit rather than a search.
 
     struct CabinetMatchOutcome
     {
@@ -449,8 +449,8 @@ public:
 
     // ---- Auto Match -------------------------------------------------------------------
     //
-    // The analyzer holds the rig. See docs/auto-match-plan.md for the design, and
-    // Source/AutoMatch.h for the set of controls a matched rig owns.
+    // The analyzer holds the rig. See Source/AutoMatch.h for the set of controls a matched rig
+    // owns.
 
     void setAutoMatchEnabled(bool enabled);
     [[nodiscard]] bool autoMatchEnabled() const noexcept;

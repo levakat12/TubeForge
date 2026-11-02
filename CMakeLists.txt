@@ -559,6 +559,11 @@ if(TUBEFORGE_BUILD_TESTS)
     target_link_libraries(nts_pedal_tests PRIVATE nts_pedals)
     add_test(NAME nts_pedal_tests COMMAND nts_pedal_tests)
 
+    # The measurements nts_pedal_compare (below) rests on, checked on signals with known answers.
+    add_executable(nts_pedal_measure_tests Tests/PedalMeasureTests.cpp)
+    target_include_directories(nts_pedal_measure_tests PRIVATE Tests)
+    add_test(NAME nts_pedal_measure_tests COMMAND nts_pedal_measure_tests)
+
     add_executable(nts_nam_tests Tests/NamTests.cpp)
     target_include_directories(nts_nam_tests PRIVATE Tests)
     target_link_libraries(nts_nam_tests PRIVATE nts_nam)
@@ -607,6 +612,17 @@ if(TUBEFORGE_BUILD_TESTS)
     target_link_libraries(nts_song_probe PRIVATE
         nts_reconstruction nts_tone_analysis nts_amp juce::juce_audio_formats)
 
+    # A tool rather than a test, like the probe above: it needs a folder of captures that cannot
+    # be committed, and what it prints is a baseline to compare against, not a threshold to pass.
+    juce_add_console_app(nts_pedal_compare PRODUCT_NAME "nts_pedal_compare")
+    target_sources(nts_pedal_compare PRIVATE Tests/PedalCompare.cpp)
+    target_include_directories(nts_pedal_compare PRIVATE Tests)
+    target_compile_definitions(nts_pedal_compare PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_STANDALONE_APPLICATION=1)
+    target_link_libraries(nts_pedal_compare PRIVATE nts_pedals nts_nam juce::juce_audio_formats)
+
     add_executable(nts_tone_analysis_tests Tests/ToneAnalysisTests.cpp)
     target_include_directories(nts_tone_analysis_tests PRIVATE Tests)
     target_link_libraries(nts_tone_analysis_tests PRIVATE nts_tone_analysis)
@@ -632,7 +648,7 @@ if(TUBEFORGE_BUILD_TESTS)
     # compile JUCE's vendored codec C (libvorbis and friends), which does not build
     # warning-clean and is not ours to fix.
     foreach(target nts_ml_runtime_tests nts_ml_runtime_cli nts_ml_runtime_benchmarks
-                   nts_pedal_tests nts_nam_tests nts_nam_cli
+                   nts_pedal_tests nts_pedal_measure_tests nts_nam_tests nts_nam_cli
                    nts_tone_analysis_tests nts_reconstruction_tests nts_assistant_tests
                    nts_ecosystem_tests)
         tubeforge_set_warning_policy(${target})

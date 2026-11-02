@@ -34,9 +34,6 @@ Modelfile.txt
 # them: useful to test against, never something to commit. The probe skips cleanly when absent.
 test_songs/
 
-# Working plans and specs for assistant-driven development. Local only, never published: real
-# documentation lives directly in docs/. The last two rules catch a plan written to the
-# superpowers default location or dropped straight into docs/.
-/docs/claude-plans/
-/docs/superpowers/
-/docs/*-plan.md
+# Plans, specs and internal reference notes. Local only, never published: what the public needs
+# is in README.md and USER_GUIDE.md.
+/docs/

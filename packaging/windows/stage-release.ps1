@@ -26,7 +26,7 @@ foreach ($document in @('README.md','PRIVACY.md','SECURITY.md','THIRD_PARTY_NOTI
     $source = Join-Path $repo $document
     if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination $docsDirectory -Force }
 }
-Copy-Item -LiteralPath (Join-Path $repo 'docs\user-guide.md') -Destination $docsDirectory -Force
+Copy-Item -LiteralPath (Join-Path $repo 'USER_GUIDE.md') -Destination $docsDirectory -Force
 Copy-Item -LiteralPath (Join-Path $repo 'packaging\windows\collect-diagnostics.ps1') -Destination $output -Force
 Copy-Item -LiteralPath (Join-Path $repo 'scripts\setup-ml-separator.ps1') -Destination $toolsDirectory -Force
 Copy-Item -LiteralPath (Join-Path $repo 'ml\scripts\demucs_separator_worker.py') -Destination $toolsDirectory -Force
